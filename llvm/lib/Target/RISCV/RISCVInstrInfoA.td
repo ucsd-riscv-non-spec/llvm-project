@@ -289,7 +289,7 @@ class PseudoMaskedAMOMinMaxPat<Intrinsic intrin, Pseudo AMOInst>
 
 let Predicates = [HasStdExtA] in {
 
-let Size = 20 in
+let Size = !add(20, 12) in
 def PseudoAtomicLoadNand32 : PseudoAMO;
 // Ordering constants must be kept in sync with the AtomicOrdering enum in
 // AtomicOrdering.h.
@@ -304,35 +304,35 @@ def : Pat<(XLenVT (atomic_load_nand_i32_acq_rel GPR:$addr, GPR:$incr)),
 def : Pat<(XLenVT (atomic_load_nand_i32_seq_cst GPR:$addr, GPR:$incr)),
           (PseudoAtomicLoadNand32 GPR:$addr, GPR:$incr, 7)>;
 
-let Size = 28 in
+let Size = !add(28, 12) in
 def PseudoMaskedAtomicSwap32 : PseudoMaskedAMO;
 def : PseudoMaskedAMOPat<int_riscv_masked_atomicrmw_xchg_i32,
                          PseudoMaskedAtomicSwap32>;
-let Size = 28 in
+let Size = !add(28, 12) in
 def PseudoMaskedAtomicLoadAdd32 : PseudoMaskedAMO;
 def : PseudoMaskedAMOPat<int_riscv_masked_atomicrmw_add_i32,
                          PseudoMaskedAtomicLoadAdd32>;
-let Size = 28 in
+let Size = !add(28, 12) in
 def PseudoMaskedAtomicLoadSub32 : PseudoMaskedAMO;
 def : PseudoMaskedAMOPat<int_riscv_masked_atomicrmw_sub_i32,
                          PseudoMaskedAtomicLoadSub32>;
-let Size = 32 in
+let Size = !add(32, 12) in
 def PseudoMaskedAtomicLoadNand32 : PseudoMaskedAMO;
 def : PseudoMaskedAMOPat<int_riscv_masked_atomicrmw_nand_i32,
                          PseudoMaskedAtomicLoadNand32>;
-let Size = 44 in
+let Size = !add(44, 24) in
 def PseudoMaskedAtomicLoadMax32 : PseudoMaskedAMOMinMax;
 def : PseudoMaskedAMOMinMaxPat<int_riscv_masked_atomicrmw_max_i32,
                                PseudoMaskedAtomicLoadMax32>;
-let Size = 44 in
+let Size = !add(44, 24) in
 def PseudoMaskedAtomicLoadMin32 : PseudoMaskedAMOMinMax;
 def : PseudoMaskedAMOMinMaxPat<int_riscv_masked_atomicrmw_min_i32,
                                PseudoMaskedAtomicLoadMin32>;
-let Size = 36 in
+let Size = !add(36, 24) in
 def PseudoMaskedAtomicLoadUMax32 : PseudoMaskedAMOUMinUMax;
 def : PseudoMaskedAMOPat<int_riscv_masked_atomicrmw_umax_i32,
                          PseudoMaskedAtomicLoadUMax32>;
-let Size = 36 in
+let Size = !add(36, 24) in
 def PseudoMaskedAtomicLoadUMin32 : PseudoMaskedAMOUMinUMax;
 def : PseudoMaskedAMOPat<int_riscv_masked_atomicrmw_umin_i32,
                          PseudoMaskedAtomicLoadUMin32>;
@@ -340,7 +340,7 @@ def : PseudoMaskedAMOPat<int_riscv_masked_atomicrmw_umin_i32,
 
 let Predicates = [HasStdExtA, IsRV64] in {
 
-let Size = 20 in
+let Size = !add(20, 12) in
 def PseudoAtomicLoadNand64 : PseudoAMO;
 // Ordering constants must be kept in sync with the AtomicOrdering enum in
 // AtomicOrdering.h.
@@ -383,7 +383,7 @@ class PseudoCmpXchg
   let mayLoad = 1;
   let mayStore = 1;
   let hasSideEffects = 0;
-  let Size = !add(24, 16);
+  let Size = !add(16, 24);
 }
 
 // Ordering constants must be kept in sync with the AtomicOrdering enum in
@@ -421,7 +421,7 @@ def PseudoMaskedCmpXchg32
   let mayLoad = 1;
   let mayStore = 1;
   let hasSideEffects = 0;
-  let Size = !add(24, 32);
+  let Size = !add(32, 24);
 }
 
 def : Pat<(int_riscv_masked_cmpxchg_i32

@@ -28,6 +28,12 @@ using namespace llvm;
 #define RISCV_EXPAND_ATOMIC_PSEUDO_NAME                                        \
   "RISC-V atomic pseudo instruction expansion pass"
 
+// NOTE(mitch): Making this be dynamic would require setting the number of
+//              bytes per atomic instruction dynamically at runtime instead of
+//              a fixed value in the tablegen. Or maybe other workarounds can
+//              be made, but it's simpler to just keep this false.
+static constexpr bool DisableNonSpecAtomicExpansion = false;
+
 namespace {
 
 class RISCVExpandAtomicPseudo : public MachineFunctionPass {
@@ -268,8 +274,8 @@ static void doAtomicBinOpExpansion(const RISCVInstrInfo *TII, MachineInstr &MI,
   Register IncrReg = MI.getOperand(3).getReg();
   AtomicOrdering Ordering =
       static_cast<AtomicOrdering>(MI.getOperand(4).getImm());
+  MCContext &Context = ThisMBB->getParent()->getContext();
 
-  llvm_unreachable("TODO [non-spec]: replace this");
   // .loop:
   //   lr.[w|d] dest, (addr)
   //   binop scratch, dest, val
@@ -292,10 +298,27 @@ static void doAtomicBinOpExpansion(const RISCVInstrInfo *TII, MachineInstr &MI,
   BuildMI(LoopMBB, DL, TII->get(getSCForRMW(Ordering, Width, STI)), ScratchReg)
       .addReg(AddrReg)
       .addReg(ScratchReg);
-  BuildMI(LoopMBB, DL, TII->get(RISCV::BNE))
-      .addReg(ScratchReg)
-      .addReg(RISCV::X0)
+  if (DisableNonSpecAtomicExpansion) {
+    BuildMI(LoopMBB, DL, TII->get(RISCV::BNE))
+        .addReg(ScratchReg)
+        .addReg(RISCV::X0)
+        .addMBB(LoopMBB);
+  }
+  else {
+    BuildMI(LoopMBB, DL, TII->get(RISCV::BMOVS_J))
+      .addReg(RISCV::B0)
+      .addSym(Context.createTempSymbol("ns_atomic_bin_op_bne_"));
+    BuildMI(LoopMBB, DL, TII->get(RISCV::BMOVT_J))
+      .addReg(RISCV::B0)
       .addMBB(LoopMBB);
+    BuildMI(LoopMBB, DL, TII->get(RISCV::BMOVC_BNE))
+      .addReg(RISCV::B0)
+      .addReg(ScratchReg)
+      .addReg(RISCV::X0);
+    BuildMI(LoopMBB, DL, TII->get(RISCV::PseudoPBC))
+      .addReg(RISCV::B0)
+      .addMBB(LoopMBB);
+  }
 }
 
 static void insertMaskedMerge(const RISCVInstrInfo *TII, DebugLoc DL,
@@ -335,8 +358,8 @@ static void doMaskedAtomicBinOpExpansion(const RISCVInstrInfo *TII,
   Register MaskReg = MI.getOperand(4).getReg();
   AtomicOrdering Ordering =
       static_cast<AtomicOrdering>(MI.getOperand(5).getImm());
+  MCContext &Context = ThisMBB->getParent()->getContext();
 
-  llvm_unreachable("TODO [non-spec]: replace this");
   // .loop:
   //   lr.w destreg, (alignedaddr)
   //   binop scratch, destreg, incr
@@ -381,10 +404,28 @@ static void doMaskedAtomicBinOpExpansion(const RISCVInstrInfo *TII,
   BuildMI(LoopMBB, DL, TII->get(getSCForRMW32(Ordering, STI)), ScratchReg)
       .addReg(AddrReg)
       .addReg(ScratchReg);
-  BuildMI(LoopMBB, DL, TII->get(RISCV::BNE))
-      .addReg(ScratchReg)
-      .addReg(RISCV::X0)
+
+  if (DisableNonSpecAtomicExpansion) {
+    BuildMI(LoopMBB, DL, TII->get(RISCV::BNE))
+        .addReg(ScratchReg)
+        .addReg(RISCV::X0)
+        .addMBB(LoopMBB);
+  }
+  else {
+    BuildMI(LoopMBB, DL, TII->get(RISCV::BMOVS_J))
+      .addReg(RISCV::B0)
+      .addSym(Context.createTempSymbol("ns_masked_atomic_bin_op_bne_"));
+    BuildMI(LoopMBB, DL, TII->get(RISCV::BMOVT_J))
+      .addReg(RISCV::B0)
       .addMBB(LoopMBB);
+    BuildMI(LoopMBB, DL, TII->get(RISCV::BMOVC_BNE))
+      .addReg(RISCV::B0)
+      .addReg(ScratchReg)
+      .addReg(RISCV::X0);
+    BuildMI(LoopMBB, DL, TII->get(RISCV::PseudoPBC))
+      .addReg(RISCV::B0)
+      .addMBB(LoopMBB);
+  }
 }
 
 bool RISCVExpandAtomicPseudo::expandAtomicBinOp(
@@ -478,8 +519,8 @@ bool RISCVExpandAtomicPseudo::expandAtomicMinMaxOp(
   bool IsSigned = BinOp == AtomicRMWInst::Min || BinOp == AtomicRMWInst::Max;
   AtomicOrdering Ordering =
       static_cast<AtomicOrdering>(MI.getOperand(IsSigned ? 7 : 6).getImm());
+  MCContext &Context = LoopTailMBB->getParent()->getContext();
 
-  llvm_unreachable("TODO [non-spec]: replace this");
   //
   // .loophead:
   //   lr.w destreg, (alignedaddr)
@@ -496,37 +537,75 @@ bool RISCVExpandAtomicPseudo::expandAtomicMinMaxOp(
       .addReg(DestReg)
       .addImm(0);
 
+  if (!DisableNonSpecAtomicExpansion) {
+    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVS_J))
+      .addReg(RISCV::B0)
+      .addSym(Context.createTempSymbol("ns_atomic_min_max_op_bxx"));
+    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVT_J))
+      .addReg(RISCV::B0)
+      .addMBB(LoopTailMBB);
+  }
   switch (BinOp) {
   default:
     llvm_unreachable("Unexpected AtomicRMW BinOp");
   case AtomicRMWInst::Max: {
     insertSext(TII, DL, LoopHeadMBB, Scratch2Reg, MI.getOperand(6).getReg());
-    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BGE))
+    if (DisableNonSpecAtomicExpansion)
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BGE))
+          .addReg(Scratch2Reg)
+          .addReg(IncrReg)
+          .addMBB(LoopTailMBB);
+    else
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BGE))
+        .addReg(RISCV::B0)
         .addReg(Scratch2Reg)
-        .addReg(IncrReg)
-        .addMBB(LoopTailMBB);
+        .addReg(IncrReg);
     break;
   }
   case AtomicRMWInst::Min: {
     insertSext(TII, DL, LoopHeadMBB, Scratch2Reg, MI.getOperand(6).getReg());
-    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BGE))
+
+    if (DisableNonSpecAtomicExpansion)
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BGE))
+          .addReg(IncrReg)
+          .addReg(Scratch2Reg)
+          .addMBB(LoopTailMBB);
+    else
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BGE))
+        .addReg(RISCV::B0)
         .addReg(IncrReg)
-        .addReg(Scratch2Reg)
-        .addMBB(LoopTailMBB);
+        .addReg(Scratch2Reg);
     break;
   }
   case AtomicRMWInst::UMax:
+    if (DisableNonSpecAtomicExpansion)
     BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BGEU))
         .addReg(Scratch2Reg)
         .addReg(IncrReg)
         .addMBB(LoopTailMBB);
+    else
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BGEU))
+        .addReg(RISCV::B0)
+        .addReg(Scratch2Reg)
+        .addReg(IncrReg);
     break;
   case AtomicRMWInst::UMin:
+    if (DisableNonSpecAtomicExpansion)
     BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BGEU))
         .addReg(IncrReg)
         .addReg(Scratch2Reg)
         .addMBB(LoopTailMBB);
+    else
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BGEU))
+        .addReg(RISCV::B0)
+        .addReg(IncrReg)
+        .addReg(Scratch2Reg);
     break;
+  }
+  if (!DisableNonSpecAtomicExpansion) {
+    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::PseudoPBC))
+      .addReg(RISCV::B0)
+      .addMBB(LoopTailMBB);
   }
 
   // .loopifbody:
@@ -542,10 +621,27 @@ bool RISCVExpandAtomicPseudo::expandAtomicMinMaxOp(
   BuildMI(LoopTailMBB, DL, TII->get(getSCForRMW32(Ordering, STI)), Scratch1Reg)
       .addReg(AddrReg)
       .addReg(Scratch1Reg);
-  BuildMI(LoopTailMBB, DL, TII->get(RISCV::BNE))
-      .addReg(Scratch1Reg)
-      .addReg(RISCV::X0)
+  if (DisableNonSpecAtomicExpansion) {
+    BuildMI(LoopTailMBB, DL, TII->get(RISCV::BNE))
+        .addReg(Scratch1Reg)
+        .addReg(RISCV::X0)
+        .addMBB(LoopHeadMBB);
+  }
+  else {
+    BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVS_J))
+      .addReg(RISCV::B0)
+      .addSym(Context.createTempSymbol("ns_atomic_min_max_op_bnez_"));
+    BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVT_J))
+      .addReg(RISCV::B0)
       .addMBB(LoopHeadMBB);
+    BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVC_BNE))
+      .addReg(RISCV::B0)
+      .addReg(Scratch1Reg)
+      .addReg(RISCV::X0);
+    BuildMI(LoopTailMBB, DL, TII->get(RISCV::PseudoPBC))
+      .addReg(RISCV::B0)
+      .addMBB(LoopHeadMBB);
+  }
 
   NextMBBI = MBB.end();
   MI.eraseFromParent();
@@ -662,132 +758,127 @@ bool RISCVExpandAtomicPseudo::expandAtomicCmpXchg(
 
   AtomicOrdering Ordering =
       static_cast<AtomicOrdering>(MI.getOperand(IsMasked ? 6 : 5).getImm());
-
-  MCSymbol* LoopHeadSym = MF->getContext().createTempSymbol("ns_cmpxchg_loophead_");
-  MCSymbol* LoopTailSym = MF->getContext().createTempSymbol("ns_cmpxchg_looptail_");
-
-  // TODO(non-spec): Find registers to use, rather than picking randomly
-  Register LoopHeadBR = RISCV::B30;
-  Register LoopTailBR = RISCV::B31;
-
-  // bmovs b30, .ns_cmpxchg_loophead
-  // bmovs b31, .ns_cmpxchg_looptail
-  // bmovt b30, .done
-  // bmovt b31, .loophead
-#if 0
-  BuildMI(&MBB, DL, TII->get(RISCV::BMOVS_J))
-      .addDef(LoopHeadBR)
-      .addSym(LoopHeadSym);
-  BuildMI(&MBB, DL, TII->get(RISCV::BMOVT_J))
-      .addDef(LoopHeadBR)
-      .addMBB(LoopHeadBNETarget);
-  BuildMI(&MBB, DL, TII->get(RISCV::BMOVS_J))
-      .addDef(LoopTailBR)
-      .addSym(LoopTailSym);
-  BuildMI(&MBB, DL, TII->get(RISCV::BMOVT_J))
-      .addDef(LoopTailBR)
-      .addMBB(LoopHeadMBB);
-#endif
+  MCContext &Context = LoopHeadMBB->getParent()->getContext();
 
   if (!IsMasked) {
     // .loophead:
     //   lr.[w|d] dest, (addr)
-    //   bmovc_bne loopheadbr, dest, cmpval
-    //   pb loopheadbr
-    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVS_J))
-        .addDef(LoopHeadBR)
-        .addSym(LoopHeadSym);
-    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVT_J))
-        .addDef(LoopHeadBR)
-        .addMBB(LoopHeadBNETarget);
+    //   bne dest, cmpval, done
     BuildMI(LoopHeadMBB, DL, TII->get(getLRForRMW(Ordering, Width, STI)),
             DestReg)
         .addReg(AddrReg);
-    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BNE))
-        .addReg(LoopHeadBR)
+    if (DisableNonSpecAtomicExpansion)
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BNE))
+          .addReg(DestReg)
+          .addReg(CmpValReg)
+          .addMBB(LoopHeadBNETarget);
+    else {
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVS_J))
+        .addReg(RISCV::B0)
+        .addSym(Context.createTempSymbol("ns_atomic_cmpxchg_bne_"));
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVT_J))
+        .addReg(RISCV::B0)
+        .addMBB(LoopHeadBNETarget);
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BNE))
+        .addReg(RISCV::B0)
         .addReg(DestReg)
         .addReg(CmpValReg);
-    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::PseudoPBC))
-        .addReg(LoopHeadBR)
-        .addSym(LoopHeadSym)
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::PseudoPBC))
+        .addReg(RISCV::B0)
         .addMBB(LoopHeadBNETarget);
+    }
     // .looptail:
     //   sc.[w|d] scratch, newval, (addr)
-    //   bmovc_bne looptailbr, scratch, zero
-    //   pb looptailbr
-    BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVS_J))
-        .addDef(LoopTailBR)
-        .addSym(LoopTailSym);
-    BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVT_J))
-        .addDef(LoopTailBR)
-        .addMBB(LoopHeadMBB);
+    //   bnez scratch, loophead
     BuildMI(LoopTailMBB, DL, TII->get(getSCForRMW(Ordering, Width, STI)),
             ScratchReg)
         .addReg(AddrReg)
         .addReg(NewValReg);
-    BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVC_BNE))
-        .addReg(LoopTailBR)
+    if (DisableNonSpecAtomicExpansion)
+      BuildMI(LoopTailMBB, DL, TII->get(RISCV::BNE))
+          .addReg(ScratchReg)
+          .addReg(RISCV::X0)
+          .addMBB(LoopHeadMBB);
+    else {
+      BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVS_J))
+        .addReg(RISCV::B0)
+        .addSym(Context.createTempSymbol("ns_atomic_cmpxchg_bnez_"));
+      BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVT_J))
+        .addReg(RISCV::B0)
+        .addMBB(LoopHeadMBB);
+      BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVC_BNE))
+        .addReg(RISCV::B0)
         .addReg(ScratchReg)
         .addReg(RISCV::X0);
-    BuildMI(LoopTailMBB, DL, TII->get(RISCV::PseudoPBC))
-        .addReg(LoopTailBR)
-        .addSym(LoopTailSym)
+      BuildMI(LoopTailMBB, DL, TII->get(RISCV::PseudoPBC))
+        .addReg(RISCV::B0)
         .addMBB(LoopHeadMBB);
+    }
   } else {
     // .loophead:
     //   lr.w dest, (addr)
     //   and scratch, dest, mask
-    //   bmovc_bne loopheadbr, scratch, cmpval
-    //   pb loopheadbr
+    //   bne scratch, cmpval, done
     Register MaskReg = MI.getOperand(5).getReg();
-    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVS_J))
-        .addDef(LoopHeadBR)
-        .addSym(LoopHeadSym);
-    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVT_J))
-        .addDef(LoopHeadBR)
-        .addMBB(LoopHeadBNETarget);
     BuildMI(LoopHeadMBB, DL, TII->get(getLRForRMW(Ordering, Width, STI)),
             DestReg)
         .addReg(AddrReg);
     BuildMI(LoopHeadMBB, DL, TII->get(RISCV::AND), ScratchReg)
         .addReg(DestReg)
         .addReg(MaskReg);
-    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BNE))
-        .addReg(LoopHeadBR)
+    if (DisableNonSpecAtomicExpansion)
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BNE))
+          .addReg(ScratchReg)
+          .addReg(CmpValReg)
+          .addMBB(LoopHeadBNETarget);
+    else {
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVS_J))
+        .addReg(RISCV::B0)
+        .addSym(Context.createTempSymbol("ns_atomic_cmpxchg_bne_"));
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVT_J))
+        .addReg(RISCV::B0)
+        .addMBB(LoopHeadBNETarget);
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BNE))
+        .addReg(RISCV::B0)
         .addReg(ScratchReg)
         .addReg(CmpValReg);
-    BuildMI(LoopHeadMBB, DL, TII->get(RISCV::PseudoPBC))
-        .addReg(LoopHeadBR)
-        .addSym(LoopHeadSym)
+      BuildMI(LoopHeadMBB, DL, TII->get(RISCV::PseudoPBC))
+        .addReg(RISCV::B0)
         .addMBB(LoopHeadBNETarget);
+    }
 
     // .looptail:
     //   xor scratch, dest, newval
     //   and scratch, scratch, mask
     //   xor scratch, dest, scratch
     //   sc.w scratch, scratch, (adrr)
-    //   bmovc_bne looptailbr scratch, zero
-    //   pb looptailbr
-    BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVS_J))
-        .addDef(LoopTailBR)
-        .addSym(LoopTailSym);
-    BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVT_J))
-        .addDef(LoopTailBR)
-        .addMBB(LoopHeadMBB);
+    //   bnez scratch, loophead
     insertMaskedMerge(TII, DL, LoopTailMBB, ScratchReg, DestReg, NewValReg,
                       MaskReg, ScratchReg);
     BuildMI(LoopTailMBB, DL, TII->get(getSCForRMW(Ordering, Width, STI)),
             ScratchReg)
         .addReg(AddrReg)
         .addReg(ScratchReg);
-    BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVC_BNE))
-        .addReg(LoopTailBR)
+    if (DisableNonSpecAtomicExpansion)
+      BuildMI(LoopTailMBB, DL, TII->get(RISCV::BNE))
+          .addReg(ScratchReg)
+          .addReg(RISCV::X0)
+          .addMBB(LoopHeadMBB);
+    else {
+      BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVS_J))
+        .addReg(RISCV::B0)
+        .addSym(Context.createTempSymbol("ns_atomic_bin_op_bnez_"));
+      BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVT_J))
+        .addReg(RISCV::B0)
+        .addMBB(LoopHeadMBB);
+      BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVC_BNE))
+        .addReg(RISCV::B0)
         .addReg(ScratchReg)
         .addReg(RISCV::X0);
-    BuildMI(LoopTailMBB, DL, TII->get(RISCV::PseudoPBC))
-        .addReg(LoopTailBR)
-        .addSym(LoopTailSym)
+      BuildMI(LoopTailMBB, DL, TII->get(RISCV::PseudoPBC))
+        .addReg(RISCV::B0)
         .addMBB(LoopHeadMBB);
+    }
   }
 
   NextMBBI = MBB.end();
