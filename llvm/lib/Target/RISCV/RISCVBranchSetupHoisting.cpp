@@ -29,6 +29,11 @@ static cl::opt<bool> DisableBranchSetupHoisting("disable-branch-setup-hoisting",
                                                 cl::desc("Disable " PASS_NAME),
                                                 cl::init(false));
 
+static cl::opt<bool>
+    DisableCrossBBHoisting("disable-cross-bb-hoisting", cl::Hidden,
+                           cl::desc("Disable Cross BB Hoisting"),
+                           cl::init(false));
+
 STATISTIC(NumBMOVHoisted, "Number of BMOV instructions able to be hoisted");
 
 namespace {
@@ -55,8 +60,14 @@ public:
 
   StringRef getPassName() const override { return PASS_NAME; }
 
-  bool scheduleBranchSetup(MachineInstr *S, MachineInstr *T, MachineInstr *C);
-  MachineBasicBlock::iterator findEarliestSafePoint(MachineInstr &SetupMI);
+  bool scheduleBranchSetup(MachineInstr *MI, MachineInstr *S, MachineInstr *T,
+                           MachineInstr *C);
+  /// Returns the block to hoist \p SetupMI into and the insertion point
+  /// within it. The iterator may be that block's end(), so it must not be
+  /// dereferenced to recover the block.
+  std::pair<MachineBasicBlock *, MachineBasicBlock::iterator>
+  findEarliestSafePoint(MachineInstr &SetupMI,
+                        SmallSet<MachineInstr *, 4> Setup);
   bool isSafeToHoistTo(const MachineInstr &SetupMI, MachineBasicBlock &DestBB,
                        MachineBasicBlock::const_iterator InsertPt) const;
 };
@@ -137,31 +148,25 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
     Register NewReg = Register(RISCV::B0 + static_cast<unsigned>(BranchIdx));
     Register OldReg = W.S->getOperand(0).getReg();
 
-    auto rewriteDef = [&](MachineInstr *SetupMI) {
+    auto Rewrite = [&](MachineInstr *SetupMI) {
       if (!SetupMI)
         return;
-      MachineOperand &Def = SetupMI->getOperand(0);
-      //assert(Def.isReg() && Def.isDef() && "expected setup register def");
-      if (Def.getReg() != NewReg) {
-        Def.setReg(NewReg);
-        Changed = true;
-      }
+      MachineOperand &Reg = SetupMI->getOperand(0);
+      if (Reg.getReg() == NewReg)
+        return;
+      Reg.setReg(NewReg);
+      Changed = true;
     };
 
-    rewriteDef(W.S);
-    rewriteDef(W.C);
-    rewriteDef(W.T);
-
-    for (MachineOperand &MO : W.MI->uses()) {
-      if (MO.isReg() && MO.getReg() == OldReg && MO.getReg() != NewReg) {
-        MO.setReg(NewReg);
-        Changed = true;
-      }
-    }
+    Rewrite(W.S);
+    Rewrite(W.C);
+    Rewrite(W.T);
+    Rewrite(W.MI);
   }
 
-  for (BranchWork &W : WorkList)
-    Changed |= scheduleBranchSetup(W.S, W.T, W.C);
+  for (BranchWork &W : llvm::reverse(WorkList)) {
+    Changed |= scheduleBranchSetup(W.MI, W.S, W.T, W.C);
+  }
 
   LLVM_DEBUG(printMachineCFG(MF));
 
@@ -170,12 +175,25 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
 
 } // end of anonymous namespace
 
-bool RISCVBranchSetupHoisting::scheduleBranchSetup(MachineInstr *S,
+static bool isHoistBarrier(const MachineInstr &MI) {
+  if (MI.isBMOV())
+    return false;
+  // isBarrier() means that control cannot fall through; it is not a generic
+  // instruction-motion barrier. Calls, inline asm, and unmodelled effects are
+  // the boundaries relevant to these branch-setup register writes.
+  return MI.isCall() || MI.isIndirectBranch() || MI.isInlineAsm() ||
+         MI.hasUnmodeledSideEffects();
+}
+
+bool RISCVBranchSetupHoisting::scheduleBranchSetup(MachineInstr *MI,
+                                                   MachineInstr *S,
                                                    MachineInstr *T,
                                                    MachineInstr *C) {
   assert(S && "Branch must have BMOVS");
   assert(T && "Branch must have BMOVT");
   bool Changed = false;
+
+  SmallSet<MachineInstr *, 4> Setups{{MI, S, T, C}};
 
   // Keep architectural setup order. The dependency checks also prevent a
   // later setup from being moved across an earlier setup of the same B-reg.
@@ -183,9 +201,11 @@ bool RISCVBranchSetupHoisting::scheduleBranchSetup(MachineInstr *S,
     if (!SetupMI)
       continue;
 
-    MachineBasicBlock::iterator InsertPt = findEarliestSafePoint(*SetupMI);
+    LLVM_DEBUG(dbgs() << "Hoisting: " << *SetupMI);
+
+    auto [DestBB, InsertPt] = findEarliestSafePoint(*SetupMI, Setups);
     if (InsertPt != SetupMI->getIterator()) {
-      InsertPt->getParent()->splice(InsertPt, SetupMI->getParent(), SetupMI);
+      DestBB->splice(InsertPt, SetupMI->getParent(), SetupMI);
       ++NumBMOVHoisted;
       Changed = true;
     }
@@ -211,13 +231,6 @@ static bool hasRegisterDependency(const MachineInstr &MI,
   }
 
   return false;
-}
-
-static bool isHoistBarrier(const MachineInstr &MI) {
-  // isBarrier() means that control cannot fall through; it is not a generic
-  // instruction-motion barrier. Calls, inline asm, and unmodelled effects are
-  // the boundaries relevant to these branch-setup register writes.
-  return MI.isCall() || MI.isInlineAsm() || MI.hasUnmodeledSideEffects();
 }
 
 static bool isHoistHazard(const MachineInstr &MI, const MachineInstr &SetupMI,
@@ -246,6 +259,14 @@ scanBlockBackward(MachineBasicBlock *BB,
 
     if (isHoistHazard(CurrMI, SetupMI, TRI)) {
       LLVM_DEBUG(dbgs() << "  [Hazard] Cannot cross: " << CurrMI);
+      LLVM_DEBUG(if (CurrMI.isCall()) dbgs() << "    - reason: Call");
+      LLVM_DEBUG(if (CurrMI.isIndirectBranch()) dbgs()
+                 << "    - reason: Indirect Branch");
+      LLVM_DEBUG(if (CurrMI.isInlineAsm()) dbgs()
+                 << "    - reason: Inline Assembly");
+      LLVM_DEBUG(if (CurrMI.hasUnmodeledSideEffects()) dbgs()
+                 << "    - reason: Has Side Effects");
+      LLVM_DEBUG(dbgs() << " ; Cannot cross: " << CurrMI);
       HazardFound = true;
       return std::next(CurrMI.getIterator());
     }
@@ -307,8 +328,35 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
   return ReachedDest;
 }
 
-MachineBasicBlock::iterator
-RISCVBranchSetupHoisting::findEarliestSafePoint(MachineInstr &SetupMI) {
+static bool loopHasHazard(const MachineLoop &L, const MachineInstr &SetupMI,
+                          const TargetRegisterInfo &TRI,
+                          SmallSet<MachineInstr *, 4> Setup) {
+  Register BR = SetupMI.getOperand(0).getReg();
+  for (MachineBasicBlock *MBB : L.getBlocks()) {
+    for (const MachineInstr &MI : *MBB) {
+      if (MI.isBMOV()) {
+        if (MI.getOperand(0).getReg() == BR)
+          continue;
+      }
+      // if (Setup.contains(&MI)) {
+      //   dbgs() << "  Skipping MI: " << MI;
+      //   continue;
+      // }
+      bool IsHazard = isHoistHazard(MI, SetupMI, TRI);
+      LLVM_DEBUG(dbgs() << "  Checking loop MI (isHazard=" << IsHazard << "): " << MI);
+      if (IsHazard) {
+        return true;
+      }
+    }
+    LLVM_DEBUG(dbgs() << "  No loop hazard in BB#" << MBB->getNumber() << "\n");
+  }
+
+  return false;
+}
+
+std::pair<MachineBasicBlock *, MachineBasicBlock::iterator>
+RISCVBranchSetupHoisting::findEarliestSafePoint(
+    MachineInstr &SetupMI, SmallSet<MachineInstr *, 4> Setup) {
 
   MachineBasicBlock *CurBB = SetupMI.getParent();
   MachineBasicBlock::iterator SafePoint = SetupMI.getIterator();
@@ -323,7 +371,7 @@ RISCVBranchSetupHoisting::findEarliestSafePoint(MachineInstr &SetupMI) {
     SafePoint = CurBB->getFirstNonPHI();
 
   if (HazardFound)
-    return SafePoint;
+    return {CurBB, SafePoint};
 
   MachineLoop *SetupLoop = MLI->getLoopFor(CurBB);
   MachineBasicBlock *BB = CurBB;
@@ -338,16 +386,18 @@ RISCVBranchSetupHoisting::findEarliestSafePoint(MachineInstr &SetupMI) {
       break;
 
     MachineBasicBlock *IDom = IDomNode->getBlock();
-    if (!IDom)
+    if (!IDom || DisableCrossBBHoisting)
       break;
 
     // Don't hoist across loop boundaries.
+#if 0
     MachineLoop *IDomLoop = MLI->getLoopFor(IDom);
     if (IDomLoop != SetupLoop) {
       LLVM_DEBUG(dbgs() << "  [Stop] Loop boundary at BB#" << IDom->getNumber()
                         << "\n");
       break;
     }
+#endif
 
     MachineBasicBlock::reverse_iterator IDomScanStart = IDom->rbegin();
     while (IDomScanStart != IDom->rend() && IDomScanStart->isTerminator())
@@ -366,9 +416,17 @@ RISCVBranchSetupHoisting::findEarliestSafePoint(MachineInstr &SetupMI) {
     // every actual path from the candidate to SetupMI is free of hazards.
     if (!isSafeToHoistTo(SetupMI, *IDom, IDomSafePoint)) {
       LLVM_DEBUG(dbgs() << "  [Stop] Hazard on a CFG path from BB#"
-                        << IDom->getNumber() << " to BB#" << CurBB->getNumber()
+                        << CurBB->getNumber() << " to BB#" << IDom->getNumber()
                         << "\n");
       break;
+    }
+
+    for (MachineLoop *L = MLI->getLoopFor(BB); L && !L->contains(IDom);
+         L = L->getParentLoop()) {
+      LLVM_DEBUG(dbgs() << "  Checking loop hazard...\n");
+      if (loopHasHazard(*L, SetupMI, *TRI, Setup)) {
+        goto EndSearch;
+      }
     }
 
     LLVM_DEBUG(dbgs() << "  [Cross-BB] Hoisted into BB#" << IDom->getNumber()
@@ -379,8 +437,9 @@ RISCVBranchSetupHoisting::findEarliestSafePoint(MachineInstr &SetupMI) {
     if (HazardFound)
       break;
   }
+EndSearch:
 
-  return SafePoint;
+  return {BB, SafePoint};
 }
 
 INITIALIZE_PASS(RISCVBranchSetupHoisting, DEBUG_TYPE, PASS_NAME,
