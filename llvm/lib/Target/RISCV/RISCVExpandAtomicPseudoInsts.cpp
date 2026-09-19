@@ -310,8 +310,10 @@ static void doAtomicBinOpExpansion(const RISCVInstrInfo *TII, MachineInstr &MI,
       .addSym(Context.createTempSymbol("ns_atomic_bin_op_bne_"));
     BuildMI(LoopMBB, DL, TII->get(RISCV::BMOVT_J))
       .addReg(RISCV::B0)
+      .addReg(RISCV::B0)
       .addMBB(LoopMBB);
     BuildMI(LoopMBB, DL, TII->get(RISCV::BMOVC_BNE))
+      .addReg(RISCV::B0)
       .addReg(RISCV::B0)
       .addReg(ScratchReg)
       .addReg(RISCV::X0);
@@ -417,8 +419,10 @@ static void doMaskedAtomicBinOpExpansion(const RISCVInstrInfo *TII,
       .addSym(Context.createTempSymbol("ns_masked_atomic_bin_op_bne_"));
     BuildMI(LoopMBB, DL, TII->get(RISCV::BMOVT_J))
       .addReg(RISCV::B0)
+      .addReg(RISCV::B0)
       .addMBB(LoopMBB);
     BuildMI(LoopMBB, DL, TII->get(RISCV::BMOVC_BNE))
+      .addReg(RISCV::B0)
       .addReg(RISCV::B0)
       .addReg(ScratchReg)
       .addReg(RISCV::X0);
@@ -543,6 +547,7 @@ bool RISCVExpandAtomicPseudo::expandAtomicMinMaxOp(
       .addSym(Context.createTempSymbol("ns_atomic_min_max_op_bxx"));
     BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVT_J))
       .addReg(RISCV::B0)
+      .addReg(RISCV::B0)
       .addMBB(LoopTailMBB);
   }
   switch (BinOp) {
@@ -557,6 +562,7 @@ bool RISCVExpandAtomicPseudo::expandAtomicMinMaxOp(
           .addMBB(LoopTailMBB);
     else
       BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BGE))
+        .addReg(RISCV::B0)
         .addReg(RISCV::B0)
         .addReg(Scratch2Reg)
         .addReg(IncrReg);
@@ -573,6 +579,7 @@ bool RISCVExpandAtomicPseudo::expandAtomicMinMaxOp(
     else
       BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BGE))
         .addReg(RISCV::B0)
+        .addReg(RISCV::B0)
         .addReg(IncrReg)
         .addReg(Scratch2Reg);
     break;
@@ -586,6 +593,7 @@ bool RISCVExpandAtomicPseudo::expandAtomicMinMaxOp(
     else
       BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BGEU))
         .addReg(RISCV::B0)
+        .addReg(RISCV::B0)
         .addReg(Scratch2Reg)
         .addReg(IncrReg);
     break;
@@ -597,6 +605,7 @@ bool RISCVExpandAtomicPseudo::expandAtomicMinMaxOp(
         .addMBB(LoopTailMBB);
     else
       BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BGEU))
+        .addReg(RISCV::B0)
         .addReg(RISCV::B0)
         .addReg(IncrReg)
         .addReg(Scratch2Reg);
@@ -633,8 +642,10 @@ bool RISCVExpandAtomicPseudo::expandAtomicMinMaxOp(
       .addSym(Context.createTempSymbol("ns_atomic_min_max_op_bnez_"));
     BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVT_J))
       .addReg(RISCV::B0)
+      .addReg(RISCV::B0)
       .addMBB(LoopHeadMBB);
     BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVC_BNE))
+      .addReg(RISCV::B0)
       .addReg(RISCV::B0)
       .addReg(Scratch1Reg)
       .addReg(RISCV::X0);
@@ -778,8 +789,10 @@ bool RISCVExpandAtomicPseudo::expandAtomicCmpXchg(
         .addSym(Context.createTempSymbol("ns_atomic_cmpxchg_bne_"));
       BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVT_J))
         .addReg(RISCV::B0)
+        .addReg(RISCV::B0)
         .addMBB(LoopHeadBNETarget);
       BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BNE))
+        .addReg(RISCV::B0)
         .addReg(RISCV::B0)
         .addReg(DestReg)
         .addReg(CmpValReg);
@@ -805,8 +818,10 @@ bool RISCVExpandAtomicPseudo::expandAtomicCmpXchg(
         .addSym(Context.createTempSymbol("ns_atomic_cmpxchg_bnez_"));
       BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVT_J))
         .addReg(RISCV::B0)
+        .addReg(RISCV::B0)
         .addMBB(LoopHeadMBB);
       BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVC_BNE))
+        .addReg(RISCV::B0)
         .addReg(RISCV::B0)
         .addReg(ScratchReg)
         .addReg(RISCV::X0);
@@ -837,8 +852,10 @@ bool RISCVExpandAtomicPseudo::expandAtomicCmpXchg(
         .addSym(Context.createTempSymbol("ns_atomic_cmpxchg_bne_"));
       BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVT_J))
         .addReg(RISCV::B0)
+        .addReg(RISCV::B0)
         .addMBB(LoopHeadBNETarget);
       BuildMI(LoopHeadMBB, DL, TII->get(RISCV::BMOVC_BNE))
+        .addReg(RISCV::B0)
         .addReg(RISCV::B0)
         .addReg(ScratchReg)
         .addReg(CmpValReg);
@@ -870,8 +887,10 @@ bool RISCVExpandAtomicPseudo::expandAtomicCmpXchg(
         .addSym(Context.createTempSymbol("ns_atomic_bin_op_bnez_"));
       BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVT_J))
         .addReg(RISCV::B0)
+        .addReg(RISCV::B0)
         .addMBB(LoopHeadMBB);
       BuildMI(LoopTailMBB, DL, TII->get(RISCV::BMOVC_BNE))
+        .addReg(RISCV::B0)
         .addReg(RISCV::B0)
         .addReg(ScratchReg)
         .addReg(RISCV::X0);

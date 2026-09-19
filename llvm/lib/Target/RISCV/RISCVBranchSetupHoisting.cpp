@@ -16,6 +16,7 @@
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/Support/CommandLine.h"
 
@@ -62,6 +63,10 @@ public:
 
   bool scheduleBranchSetup(MachineInstr *MI, MachineInstr *S, MachineInstr *T,
                            MachineInstr *C);
+  /// Repair the live-in lists for the B-register of one branch's setup chain.
+  /// Must run after all of that chain's setups have been placed.
+  void addBranchRegisterLiveIns(MachineInstr *S, MachineInstr *C,
+                                MachineInstr *T, MachineInstr *MI) const;
   /// Returns the block to hoist \p SetupMI into and the insertion point
   /// within it. The iterator may be that block's end(), so it must not be
   /// dereferenced to recover the block.
@@ -99,6 +104,56 @@ static void printMachineCFG(const MachineFunction &MF) {
   }
 }
 
+/// Make \p Reg live-in on every block on a CFG path from \p DefBB (exclusive)
+/// to \p UseBB (inclusive).
+///
+/// \p DefBB must dominate \p UseBB. That is what bounds the walk: every path
+/// reaching \p UseBB passes through \p DefBB, so stopping there cannot leave a
+/// reaching path unmarked.
+static void markLiveInOnPathsFrom(MachineBasicBlock *DefBB,
+                                  MachineBasicBlock *UseBB, MCRegister Reg) {
+  if (DefBB == UseBB)
+    return;
+
+  SmallPtrSet<MachineBasicBlock *, 16> Visited;
+  SmallVector<MachineBasicBlock *, 16> WorkList(1, UseBB);
+
+  while (!WorkList.empty()) {
+    MachineBasicBlock *BB = WorkList.pop_back_val();
+    if (BB == DefBB || !Visited.insert(BB).second)
+      continue;
+
+    assert(!BB->pred_empty() &&
+           "Walked off the top of the function; the BMOVS block does not "
+           "dominate the block reading its B-register");
+
+    if (!BB->isLiveIn(Reg))
+      BB->addLiveIn(Reg);
+
+    llvm::append_range(WorkList, BB->predecessors());
+  }
+}
+
+void RISCVBranchSetupHoisting::addBranchRegisterLiveIns(MachineInstr *S,
+                                                        MachineInstr *C,
+                                                        MachineInstr *T,
+                                                        MachineInstr *MI) const {
+  MCRegister Reg = S->getOperand(0).getReg().asMCReg();
+  MachineBasicBlock *DefBB = S->getParent();
+
+  // BMOVC and BMOVT read the B-register through their tied operand, and the
+  // PB branch reads it outright, so each one is a use to be covered. Walking
+  // from every use back to the BMOVS block also covers the blocks between two
+  // setups, because all of them are dominated by that block.
+  for (MachineInstr *Use : {C, T, MI}) {
+    if (!Use)
+      continue;
+    assert(MDT->dominates(DefBB, Use->getParent()) &&
+           "BMOVS must dominate every read of its B-register");
+    markLiveInOnPathsFrom(DefBB, Use->getParent(), Reg);
+  }
+}
+
 bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
   if (DisableBranchSetupHoisting)
     return false;
@@ -111,8 +166,9 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
   MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
 
   constexpr unsigned MaxBranchSetups = 30;
-  if (BSI->Branches.size() > MaxBranchSetups)
+  if (BSI->Branches.size() > MaxBranchSetups) {
     return false;
+  }
 
   // Collect work in machine-function order. Iteration order of the analysis
   // map must not determine physical-register assignment.
@@ -151,11 +207,12 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
     auto Rewrite = [&](MachineInstr *SetupMI) {
       if (!SetupMI)
         return;
-      MachineOperand &Reg = SetupMI->getOperand(0);
-      if (Reg.getReg() == NewReg)
-        return;
-      Reg.setReg(NewReg);
-      Changed = true;
+      for (MachineOperand &MO : SetupMI->operands()) {
+        if (MO.isReg() && MO.getReg() == OldReg) {
+          MO.setReg(NewReg);
+          Changed = true;
+        }
+      }
     };
 
     Rewrite(W.S);
@@ -167,6 +224,15 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
   for (BranchWork &W : llvm::reverse(WorkList)) {
     Changed |= scheduleBranchSetup(W.MI, W.S, W.T, W.C);
   }
+
+  // The rewrite above turned the B-registers physical and the hoisting may
+  // have moved their writes into a dominating block, so a read can now be
+  // reached from a block that does not write the register. That is only valid
+  // MIR if every block in between lists the register as live-in, and nothing
+  // else in the pipeline will fill these lists in for us.
+  if (MF.getRegInfo().tracksLiveness())
+    for (const BranchWork &W : WorkList)
+      addBranchRegisterLiveIns(W.S, W.C, W.T, W.MI);
 
   LLVM_DEBUG(printMachineCFG(MF));
 

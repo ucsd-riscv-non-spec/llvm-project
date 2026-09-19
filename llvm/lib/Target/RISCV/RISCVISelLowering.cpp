@@ -1663,6 +1663,8 @@ RISCVTargetLowering::RISCVTargetLowering(const TargetMachine &TM,
   if (Subtarget.useRVVForFixedLengthVectors())
     setTargetDAGCombine(ISD::BITCAST);
 
+  setTargetDAGCombine(ISD::BRCOND);
+
   // Disable strict node mutation.
   IsStrictFPEnabled = true;
   EnableExtLdPromotion = true;
@@ -19682,6 +19684,41 @@ SDValue RISCVTargetLowering::PerformDAGCombine(SDNode *N,
   switch (N->getOpcode()) {
   default:
     break;
+  case ISD::BRCOND: {
+    SDValue Chain = N->getOperand(0);
+    SDValue Cond = N->getOperand(1);
+    SDValue Target = N->getOperand(2);
+
+    if (Cond.getOpcode() != ISD::INTRINSIC_W_CHAIN)
+      return SDValue();
+
+    auto *IID = dyn_cast<ConstantSDNode>(Cond.getOperand(1));
+    if (!IID || IID->getZExtValue() != Intrinsic::loop_decrement)
+      return SDValue();
+    
+    SDValue DecChain = Cond.getValue(1);
+    SDValue DecInputChain = Cond.getOperand(0);
+
+    SmallVector<SDValue, 4> Chains;
+
+    if (Chain.getOpcode() == ISD::TokenFactor) {
+      for (SDValue Op : Chain->ops()) {
+        if (Op != DecChain)
+          Chains.push_back(Op);
+      }
+    } else if (Chain != DecChain) {
+      return SDValue();
+    }
+
+    // Preserve everything before llvm.loop.decrement.
+    Chains.push_back(DecInputChain);
+
+    SDLoc DL(N);
+    SDValue NewChain = Chains.size() == 1 ? Chains.front()
+      : DAG.getNode(ISD::TokenFactor, DL, MVT::Other, Chains);
+    
+    return DAG.getNode(RISCVISD::LOOP_END, DL, MVT::Other, NewChain, Target);
+  }
   case RISCVISD::SplitF64: {
     SDValue Op0 = N->getOperand(0);
     // If the input to SplitF64 is just BuildPairF64 then the operation is

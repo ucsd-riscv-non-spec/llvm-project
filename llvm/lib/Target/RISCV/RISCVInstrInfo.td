@@ -622,8 +622,10 @@ include "RISCVInstrFormatsV.td"
 
 let isBMOV = 1, hasSideEffects = 0, mayLoad = 0, mayStore = 0 in
 class BMOVC_rri<bits<3> funct3, string opcodestr>
-    : RVInstR<0b0000000, funct3, OPC_OP_V, (outs),
-            (ins PBR:$rd, GPR:$rs1, GPR:$rs2), opcodestr, "$rd, $rs1, $rs2">;
+    : RVInstR<0b0000000, funct3, OPC_OP_V, (outs PBR:$rd),
+            (ins PBR:$rd_src, GPR:$rs1, GPR:$rs2), opcodestr, "$rd, $rs1, $rs2"> {
+  let Constraints = "$rd = $rd_src";
+}
 
 //===----------------------------------------------------------------------===//
 // Instruction Class Templates
@@ -771,16 +773,18 @@ def BGEU : BranchCC_rri<0b111, "bgeu">;
 // Non-Spec Instructions
 //===----------------------------------------------------------------------===//
 
-let isBMOV = 1, hasSideEffects = 1 , mayLoad = 0, mayStore = 0 in {
-def BMOVT_J : RVInstJ<OPC_CUSTOM_1, (outs), (ins PBR:$rd, simm21_lsb0_jal:$imm20),
-								"bmovt", "$rd, $imm20">, Sched<[WriteJal]>;
-def BMOVT_I : RVInstI<0b001, OPC_CUSTOM_2, (outs), (ins PBR:$rd, GPR:$rs1, simm12:$imm12),
-								"bmovt", "$rd, $rs1, $imm12">;
-
+let isBMOV = 1, hasSideEffects = 0 , mayLoad = 0, mayStore = 0 in {
 def BMOVS_J : RVInstJ<OPC_CUSTOM_0, (outs PBR:$rd), (ins simm21_lsb0_jal:$imm20),
 								"bmovs", "$rd, $imm20">, Sched<[WriteJal]>;
 def BMOVS_I : RVInstI<0b000, OPC_CUSTOM_2, (outs PBR:$rd), (ins GPR:$rs1, simm12:$imm12),
 								"bmovs", "$rd, $rs1, $imm12">;
+
+let Constraints = "$rd = $rd_src" in {
+def BMOVT_J : RVInstJ<OPC_CUSTOM_1, (outs PBR:$rd), (ins PBR:$rd_src, simm21_lsb0_jal:$imm20),
+								"bmovt", "$rd, $imm20">, Sched<[WriteJal]>;
+def BMOVT_I : RVInstI<0b001, OPC_CUSTOM_2, (outs PBR:$rd), (ins PBR:$rd_src, GPR:$rs1, simm12:$imm12),
+								"bmovt", "$rd, $rs1, $imm12">;
+}
 
 def BMOVC_BEQ : BMOVC_rri<0b000, "bmovc_beq">;
 def BMOVC_BNE : BMOVC_rri<0b001, "bmovc_bne">;
@@ -789,11 +793,13 @@ def BMOVC_BGE : BMOVC_rri<0b101, "bmovc_bge">;
 def BMOVC_BLTU : BMOVC_rri<0b110, "bmovc_bltu">;
 def BMOVC_BGEU : BMOVC_rri<0b111, "bmovc_bgeu">;
 
-def BMOVC_LOOP : RVInstI<0b100, OPC_OP_VE, (outs), (ins PBR:$rd, GPR:$rs1, uimm12:$imm12),
+let Constraints = "$rd = $rd_src" in {
+def BMOVC_LOOP : RVInstI<0b100, OPC_OP_VE, (outs PBR:$rd), (ins PBR:$rd_src, GPR:$rs1, uimm12:$imm12),
                                 "bmovc_loop", "$rd, ${imm12}(${rs1})">;
 
-def BMOVC_BITS : RVInstI<0b010, OPC_OP_VE, (outs), (ins PBR:$rd, GPR:$rs1, uimm12:$imm12),
+def BMOVC_BITS : RVInstI<0b010, OPC_OP_VE, (outs PBR:$rd), (ins PBR:$rd_src, GPR:$rs1, uimm12:$imm12),
                                 "bmovc_bits", "$rd, $rs1, $imm12">;
+}
 }
 
 let hasSideEffects = 0, mayLoad = 0, mayStore = 0, isBarrier = 1, isBranch = 1, isTerminator = 1 in {
@@ -1804,12 +1810,12 @@ def PseudoPBU : Pseudo<(outs), (ins PBR:$rs1, simm21_lsb0_jal:$imm20), []>,
                 PseudoInstExpansion<(PBAL X0, PBR:$rs1, X0)>;
 
 let isBarrier = 1, isBranch = 1, isIndirectBranch = 1, isTerminator = 1, mayLoad = 0, mayStore = 0, hasSideEffects = 0 in
-def PseudoPBI : Pseudo<(outs), (ins PBR:$rs1, GPRJALR:$dst), []>,
-                PseudoInstExpansion<(PBAL GPR:$dst, PBR:$rs1, X0)>;
+def PseudoPBI : Pseudo<(outs), (ins PBR:$rs1), []>,
+                PseudoInstExpansion<(PBAL X0, PBR:$rs1, X0)>;
 
-let isCall = 1, mayLoad = 0, mayStore = 0, hasSideEffects = 1 in
-def PseudoPBCALL : Pseudo<(outs), (ins PBR:$rs1, GPRJALR:$dst), []>,
-                   PseudoInstExpansion<(PBAL GPR:$dst, PBR:$rs1, X0)>;
+let isCall = 1, Defs = [X1], mayLoad = 0, mayStore = 0, hasSideEffects = 1 in
+def PseudoPBCALL : Pseudo<(outs), (ins PBR:$rs1), []>,
+                   PseudoInstExpansion<(PBAL X1, PBR:$rs1, X0)>;
 
 let isCall = 1, Defs = [X1], isCodeGenOnly = 0, Size = 16 in
 def PseudoCALL : Pseudo<(outs), (ins call_symbol:$func), [],
@@ -1931,6 +1937,34 @@ let isCall = 0, isBarrier = 1, isBranch = 1, isTerminator = 1, Size = 16,
 def PseudoJump : Pseudo<(outs GPR:$rd), (ins pseudo_jump_symbol:$target), [],
                         "jump", "$target, $rd">,
                  Sched<[WriteIALU, WriteJalr, ReadJalr]>;
+
+/// Hardware Loops
+
+let mayStore = 1, mayLoad = 1, hasSideEffects = 1 in {
+def PseudoLoopSetup : Pseudo<(outs), (ins GPR:$rs1), [],
+                        "ns_setup_loop", "$rs1">;
+}
+
+def : Pat<(int_set_loop_iterations (XLenVT GPR:$rs1)),
+          (PseudoLoopSetup GPR:$rs1)>;
+
+let isBranch = 1, isTerminator = 1,
+    mayLoad = 0, mayStore = 0, hasSideEffects = 1 in
+def PseudoLoopEnd :
+    Pseudo<(outs), (ins simm21_lsb0_jal:$target), [],
+           "ns_loop", "$target">;
+
+def SDT_RISCVLoopEnd :
+   SDTypeProfile<0, 1, [SDTCisVT<0, OtherVT>]>;
+
+def riscv_loop_end :
+   SDNode<"RISCVISD::LOOP_END",
+          SDT_RISCVLoopEnd,
+          [SDNPHasChain, SDNPSideEffect]>;
+
+def : Pat<(riscv_loop_end bb:$target),
+          (PseudoLoopEnd bb:$target)>;
+
 
 // Pseudo for a rematerializable constant materialization sequence.
 // This is an experimental feature enabled by

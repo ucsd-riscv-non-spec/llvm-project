@@ -472,6 +472,9 @@ public:
 
   TTI::MemCmpExpansionOptions
   enableMemCmpExpansion(bool OptSize, bool IsZeroCmp) const override;
+
+  bool isHardwareLoopProfitable(Loop *L, ScalarEvolution &SE, AssumptionCache &AC,
+                                TargetLibraryInfo *LibInfo, HardwareLoopInfo &HWLoopInfo) const override;
 };
 
 } // end namespace llvm

@@ -24,6 +24,8 @@
 #define LLVM_LIB_TARGET_RISCV_RISCVBRANCHSETUPANALYSIS_H
 
 #include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/ReachingDefAnalysis.h"
 
 namespace llvm {
 
@@ -77,6 +79,8 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<MachineDominatorTreeWrapperPass>();
+    // AU.addRequired<ReachingDefAnalysis>();
     AU.setPreservesAll();
     MachineFunctionPass::getAnalysisUsage(AU);
   }
@@ -104,7 +108,7 @@ class RISCVBranchSetupAnalysis : public AnalysisInfoMixin<RISCVBranchSetupAnalys
 public:
   using Result = RISCVBranchSetupInfo;
 
-  Result run(MachineFunction &MF, MachineFunctionAnalysisManager &MFAM);
+  Result run(MachineFunction &MF, MachineFunctionAnalysisManager &MFM);
 };
 
 /// New-PM printer, usable as `-passes=print<riscv-branch-support>` by tools

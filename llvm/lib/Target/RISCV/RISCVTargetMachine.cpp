@@ -341,7 +341,7 @@ static bool onlyAllocateRVVReg(const TargetRegisterInfo &TRI,
                                const MachineRegisterInfo &MRI,
                                const Register Reg) {
   const TargetRegisterClass *RC = MRI.getRegClass(Reg);
-  return RISCVRegisterInfo::isRVVRegClass(RC);
+  return RISCVRegisterInfo::isRVVRegClass(RC) && RC != &RISCV::PBRRegClass;
 }
 
 static FunctionPass *useDefaultRegisterAllocator() { return nullptr; }
@@ -482,6 +482,8 @@ void RISCVPassConfig::addIRPasses() {
     addPass(createRISCVCodeGenPreparePass());
   }
 
+  addPass(createHardwareLoopsLegacyPass());
+
   TargetPassConfig::addIRPasses();
 }
 
@@ -603,6 +605,8 @@ void RISCVPassConfig::addPreEmitPass2() {
   }));
 
   addPass(createRISCVBranchSetupHoistingPass());
+  addPass(createFastRegisterAllocator());
+  addPass(createVirtRegRewriter());
 }
 
 void RISCVPassConfig::addMachineSSAOptimization() {

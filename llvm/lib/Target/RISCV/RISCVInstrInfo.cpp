@@ -1225,7 +1225,8 @@ bool RISCVInstrInfo::analyzeBranch(MachineBasicBlock &MBB,
   if (NumTerminators == 2 && std::prev(I)->getDesc().isConditionalBranch() &&
   I->getDesc().isUnconditionalBranch()) {
     // We can't handle branches that have already been expanded
-    if (I->getOpcode() == RISCV::PseudoPBU || std::prev(I)->getOpcode() == RISCV::PseudoPBC)
+    if (I->getOpcode() == RISCV::PseudoPBU || std::prev(I)->getOpcode() == RISCV::PseudoPBC
+      || std::prev(I)->getOpcode() == RISCV::PseudoLoopEnd)
       return true; // TODO: non-spec: maybe special case here?
     parseCondBranch(*std::prev(I), TBB, Cond);
     FBB = getBranchDestBlock(*I);
@@ -1662,6 +1663,7 @@ bool RISCVInstrInfo::isBranchOffsetInRange(unsigned BranchOp,
   case RISCV::PseudoBRLTU:
   case RISCV::PseudoBRGE:
   case RISCV::PseudoBRGEU:
+  case RISCV::PseudoLoopEnd:
   // TODO(non-spec,mitch): Don't think this is right..
     return true;
   }

@@ -40,6 +40,10 @@ public:
 
   StringRef getPassName() const override { return RISCV_EXPAND_PSEUDO_NAME; }
 
+  MachineFunctionProperties getClearedProperties() const override {
+    return MachineFunctionProperties().setNoVRegs();
+  }
+
 private:
   bool expandMBB(MachineBasicBlock &MBB);
   bool expandMI(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
@@ -53,8 +57,11 @@ private:
   bool expandReturn(MachineBasicBlock &MBB,
                     MachineBasicBlock::iterator MBBI);
   bool expandIndirect(MachineBasicBlock &MBB,
-                      MachineBasicBlock::iterator MBBI,
-                      MCRegister Ra) const;
+                      MachineBasicBlock::iterator MBBI, bool IsCall) const;
+  bool expandLoopSetup(MachineBasicBlock &MBB,
+                       MachineBasicBlock::iterator MBBI);
+  bool expandLoopEnd(MachineBasicBlock &MBB,
+                     MachineBasicBlock::iterator MBBI);
   bool expandCCOp(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
                   MachineBasicBlock::iterator &NextMBBI);
   bool expandVMSET_VMCLR(MachineBasicBlock &MBB,
@@ -143,11 +150,15 @@ bool RISCVExpandPseudo::expandMI(MachineBasicBlock &MBB,
   case RISCV::PseudoTAILIndirect:
   case RISCV::PseudoTAILIndirectX7:
   case RISCV::PseudoTAILIndirectNonX7:
-    return expandIndirect(MBB, MBBI, RISCV::X0);
+    return expandIndirect(MBB, MBBI, /*IsCall=*/false);
   case RISCV::PseudoCALLIndirect:
   case RISCV::PseudoCALLIndirectX7:
   case RISCV::PseudoCALLIndirectNonX7:
-    return expandIndirect(MBB, MBBI, RISCV::X1);
+    return expandIndirect(MBB, MBBI, /*IsCall=*/true);
+  case RISCV::PseudoLoopSetup:
+    return expandLoopSetup(MBB, MBBI);
+  case RISCV::PseudoLoopEnd:
+    return expandLoopEnd(MBB, MBBI);
   case RISCV::PseudoMV_FPR16INX:
     return expandMV_FPR16INX(MBB, MBBI);
   case RISCV::PseudoMV_FPR32INX:
@@ -346,8 +357,9 @@ bool RISCVExpandPseudo::expandMV_FPR16INX(MachineBasicBlock &MBB,
 }
 
 bool RISCVExpandPseudo::expandBranch(MachineBasicBlock &MBB,
-                                     MachineBasicBlock::iterator MBBI) {
-  Register BReg = RISCV::B0; // TODO: use virtual registers
+  MachineBasicBlock::iterator MBBI) {
+  MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
+  Register BReg = MRI.createVirtualRegister(&RISCV::PBRRegClass);
   MachineBasicBlock *TBB = MBBI->getOperand(0).getMBB();
   DebugLoc DL = MBBI->getDebugLoc();
   MCContext &Context = MBB.getParent()->getContext();
@@ -360,6 +372,7 @@ bool RISCVExpandPseudo::expandBranch(MachineBasicBlock &MBB,
 
   // Emit BMOVT B0, Target
   BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVT_J))
+      .addDef(BReg)
       .addReg(BReg)
       .addMBB(TBB);
 
@@ -374,7 +387,8 @@ bool RISCVExpandPseudo::expandBranch(MachineBasicBlock &MBB,
 
 bool RISCVExpandPseudo::expandCondBranch(MachineBasicBlock &MBB,
                                          MachineBasicBlock::iterator MBBI) {
-  Register BReg = RISCV::B0; // TODO: use virtual registers
+  MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
+  Register BReg = MRI.createVirtualRegister(&RISCV::PBRRegClass);
   Register Rs1 = MBBI->getOperand(0).getReg();
   Register Rs2 = MBBI->getOperand(1).getReg();
   MachineBasicBlock *TBB = MBBI->getOperand(2).getMBB();
@@ -419,11 +433,13 @@ bool RISCVExpandPseudo::expandCondBranch(MachineBasicBlock &MBB,
 
   // Emit BMOVT B0, Target
   BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVT_J))
+      .addDef(BReg)
       .addReg(BReg)
       .addMBB(TBB);
 
   // Emit BMOVC_XX B0, Rs1, Rs2
   BuildMI(MBB, MBBI, DL, TII->get(Opcode))
+      .addDef(BReg)
       .addReg(BReg)
       .addReg(Rs1)
       .addReg(Rs2);
@@ -435,6 +451,33 @@ bool RISCVExpandPseudo::expandCondBranch(MachineBasicBlock &MBB,
 
   MBBI->eraseFromParent();
   return true;
+}
+
+/// Transfer what \p Old recorded implicitly -- the callee clobber mask, the
+/// argument registers it reads, the values it defines -- onto \p MIB, the PB
+/// instruction taking its place.
+///
+/// Dropping these leaves every later pass believing the call neither clobbers
+/// nor defines anything, so a return value reads as undefined and caller-saved
+/// registers read as preserved. Operands are tested directly rather than
+/// sliced at getNumExplicitOperands(), which counts a trailing non-register
+/// operand as explicit on a variadic instruction and would skip the mask.
+static void transferImplicitOps(const MachineInstrBuilder &MIB,
+                                const MachineInstr &Old) {
+  for (const MachineOperand &MO : Old.operands()) {
+    if (MO.isRegMask()) {
+      MIB.add(MO);
+      continue;
+    }
+    if (!MO.isReg() || !MO.isImplicit())
+      continue;
+    // PseudoPBCALL already carries Defs = [X1], so skip what the description
+    // of the replacement instruction states for itself.
+    if (MO.isDef() && llvm::is_contained(MIB->getDesc().implicit_defs(),
+                                        MO.getReg().asMCReg()))
+      continue;
+    MIB.add(MO);
+  }
 }
 
 bool RISCVExpandPseudo::expandCall(MachineBasicBlock &MBB,
@@ -470,7 +513,8 @@ bool RISCVExpandPseudo::expandCall(MachineBasicBlock &MBB,
   }
 
   DebugLoc DL = MBBI->getDebugLoc();
-  Register BReg = RISCV::B0; // TODO: use virtual registers
+  MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
+  Register BReg = MRI.createVirtualRegister(&RISCV::PBRRegClass);
 
   // Emit BMOVS B0, Label
   BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVS_J))
@@ -483,21 +527,25 @@ bool RISCVExpandPseudo::expandCall(MachineBasicBlock &MBB,
 
   // Emit BMOVT B0, Ra, 0
   BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVT_I))
+      .addDef(BReg)
       .addReg(BReg)
       .addReg(Ra)
       .addImm(0);
 
+  MachineInstrBuilder PB;
   if (MBBI->getOpcode() == RISCV::PseudoTAIL ||
       MBBI->getOpcode() == RISCV::PseudoJump) {
-    // Emit ~ JALR X0, Ra, 0
-    BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBCALL))
-        .addReg(BReg).addReg(RISCV::X0);
+    // Emit ~ JALR X0, Ra, 0. Neither a tail call nor a jump links; Ra is only
+    // the scratch register holding the target, which the BMOVT above has
+    // already consumed.
+    PB = BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBI)).addReg(BReg);
   }
   else {
     // Emit ~ JALR Ra, Ra, 0
-    BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBCALL))
-        .addReg(BReg).addReg(Ra);
+    assert(Ra == RISCV::X1);
+    PB = BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBCALL)).addReg(BReg);
   }
+  transferImplicitOps(PB, *MBBI);
 
   MBBI->eraseFromParent();
   return true;
@@ -505,7 +553,8 @@ bool RISCVExpandPseudo::expandCall(MachineBasicBlock &MBB,
 
 bool RISCVExpandPseudo::expandReturn(MachineBasicBlock &MBB,
                                      MachineBasicBlock::iterator MBBI) {
-  Register BReg = RISCV::B0; // TODO: use virtual registers
+  MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
+  Register BReg = MRI.createVirtualRegister(&RISCV::PBRRegClass);
   DebugLoc DL = MBBI->getDebugLoc();
   MCContext &Context = MBB.getParent()->getContext();
   MCSymbol* Sym = Context.createTempSymbol("ns_return_");
@@ -517,14 +566,14 @@ bool RISCVExpandPseudo::expandReturn(MachineBasicBlock &MBB,
 
   // Emit BMOVT B0, Ra, 0
   BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVT_I))
+      .addDef(BReg)
       .addReg(BReg)
       .addReg(RISCV::X1)
       .addImm(0);
 
   // Emit PBAL (JALR X0, Ra, 0)
-  BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBI))
-      .addReg(BReg)
-      .addReg(RISCV::X0);
+  transferImplicitOps(
+      BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBI)).addReg(BReg), *MBBI);
 
   MBBI->eraseFromParent();
   return true;
@@ -532,8 +581,9 @@ bool RISCVExpandPseudo::expandReturn(MachineBasicBlock &MBB,
 
 bool RISCVExpandPseudo::expandIndirect(MachineBasicBlock &MBB,
                                        MachineBasicBlock::iterator MBBI,
-                                       MCRegister Ra) const {
-  Register BReg = RISCV::B0;
+                                       bool IsCall) const {
+  MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
+  Register BReg = MRI.createVirtualRegister(&RISCV::PBRRegClass);
   DebugLoc DL = MBBI->getDebugLoc();
   MCRegister Rs1 = MBBI->getOperand(0).getReg();
   MCContext &Context = MBB.getParent()->getContext();
@@ -546,14 +596,75 @@ bool RISCVExpandPseudo::expandIndirect(MachineBasicBlock &MBB,
 
   // Emit BMOVT B0, Rs1, 0
   BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVT_I))
+      .addDef(BReg)
       .addReg(BReg)
       .addReg(Rs1)
       .addImm(0);
 
-  // Emit PBAL B0, RA (JALR X1, GPR:$rs1, 0)
-  BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBI))
+  // An indirect call has to link, so it needs PBCALL (PBAL X1, $rs1, X0).
+  // PBI expands to PBAL X0, $rs1, X0, which is only right for an indirect
+  // branch or an indirect tail call: neither writes a return address.
+  transferImplicitOps(
+      BuildMI(MBB, MBBI, DL,
+              TII->get(IsCall ? RISCV::PseudoPBCALL : RISCV::PseudoPBI))
+          .addReg(BReg),
+      *MBBI);
+
+  MBBI->eraseFromParent();
+  return true;
+}
+
+bool RISCVExpandPseudo::expandLoopSetup(MachineBasicBlock &MBB,
+                                        MachineBasicBlock::iterator MBBI) {
+  llvm_unreachable("TODO");
+  Register BReg = RISCV::B0; // TODO: use virtual registers
+  DebugLoc DL = MBBI->getDebugLoc();
+  MCContext &Context = MBB.getParent()->getContext();
+  MCSymbol* Sym = Context.createTempSymbol("ns_return_");
+
+  // Emit BMOVS B0, ns_return_
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVS_J))
+      .addDef(BReg)
+      .addSym(Sym);
+
+  // Emit BMOVT B0, Ra, 0
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVT_I))
+      .addDef(BReg)
       .addReg(BReg)
-      .addReg(Ra);
+      .addReg(RISCV::X1)
+      .addImm(0);
+
+  // Emit PBAL (JALR X0, Ra, 0)
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBI))
+      .addReg(BReg);
+
+  MBBI->eraseFromParent();
+  return true;
+}
+
+bool RISCVExpandPseudo::expandLoopEnd(MachineBasicBlock &MBB,
+                                        MachineBasicBlock::iterator MBBI) {
+  llvm_unreachable("TODO");
+  Register BReg = RISCV::B0; // TODO: use virtual registers
+  DebugLoc DL = MBBI->getDebugLoc();
+  MCContext &Context = MBB.getParent()->getContext();
+  MCSymbol* Sym = Context.createTempSymbol("ns_return_");
+
+  // Emit BMOVS B0, ns_return_
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVS_J))
+      .addDef(BReg)
+      .addSym(Sym);
+
+  // Emit BMOVT B0, Ra, 0
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVT_I))
+      .addDef(BReg)
+      .addReg(BReg)
+      .addReg(RISCV::X1)
+      .addImm(0);
+
+  // Emit PBAL (JALR X0, Ra, 0)
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBI))
+      .addReg(BReg);
 
   MBBI->eraseFromParent();
   return true;

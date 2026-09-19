@@ -190,11 +190,11 @@ void RISCVMCCodeEmitter::expandFunctionCall(const MCInst &MI,
 
   WRITE(MCInstBuilder(RISCV::AUIPC).addReg(Ra).addExpr(CallExpr));
   WRITE(MCInstBuilder(RISCV::BMOVT_I)
-    .addReg(RISCV::B0).addReg(Ra).addImm(0));
+    .addReg(RISCV::B0).addReg(RISCV::B0).addReg(Ra).addImm(0));
   WRITE(MCInstBuilder(RISCV::BMOVS_J).addReg(RISCV::B0).addImm(8));
   // TODO: [Non-Spec] This is a limitation of the current Gem5 implementation
   WRITE(MCInstBuilder(RISCV::BMOVC_BEQ)
-    .addReg(RISCV::B0).addReg(RISCV::X0).addReg(RISCV::X0));
+    .addReg(RISCV::B0).addReg(RISCV::B0).addReg(RISCV::X0).addReg(RISCV::X0));
 
   if (MI.getOpcode() == RISCV::PseudoTAIL ||
       MI.getOpcode() == RISCV::PseudoJump) {
@@ -214,7 +214,7 @@ void RISCVMCCodeEmitter::expandReturn(const MCInst &MI,
   uint32_t Binary;
   WRITE(MCInstBuilder(RISCV::BMOVS_J).addReg(RISCV::B0).addImm(8));
   WRITE(MCInstBuilder(RISCV::BMOVT_I)
-    .addReg(RISCV::B0).addReg(RISCV::X1).addImm(0));
+    .addReg(RISCV::B0).addReg(RISCV::B0).addReg(RISCV::X1).addImm(0));
   WRITE(MCInstBuilder(RISCV::PBAL)
     .addReg(RISCV::X0).addReg(RISCV::B0).addReg(RISCV::X0));
 }
@@ -231,7 +231,7 @@ void RISCVMCCodeEmitter::expandIndirect(const MCInst &MI,
 
   WRITE(MCInstBuilder(RISCV::BMOVS_J).addReg(RISCV::B0).addImm(8));
   WRITE(MCInstBuilder(RISCV::BMOVT_I)
-    .addReg(RISCV::B0).addReg(Rs1).addImm(0));
+    .addReg(RISCV::B0).addReg(RISCV::B0).addReg(Rs1).addImm(0));
   WRITE(MCInstBuilder(RISCV::PBAL)
     .addReg(Ra).addReg(RISCV::B0).addReg(RISCV::X0));
 }

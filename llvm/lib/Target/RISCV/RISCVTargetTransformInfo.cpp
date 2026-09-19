@@ -10,6 +10,7 @@
 #include "MCTargetDesc/RISCVMatInt.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/CodeGen/BasicTTIImpl.h"
 #include "llvm/CodeGen/CostTable.h"
 #include "llvm/CodeGen/TargetLowering.h"
@@ -2956,4 +2957,16 @@ RISCVTTIImpl::enableMemCmpExpansion(bool OptSize, bool IsZeroCmp) const {
       Options.LoadSizes.insert(Options.LoadSizes.begin(), Size);
   }
   return Options;
+}
+
+bool RISCVTTIImpl::isHardwareLoopProfitable(Loop *L, ScalarEvolution &SE, AssumptionCache &AC,
+                              TargetLibraryInfo *LibInfo, HardwareLoopInfo &HWLoopInfo) const {
+  LLVMContext& Ctx = SE.getContext();
+  HWLoopInfo.CounterInReg = false;
+  HWLoopInfo.IsNestingLegal = false;
+  HWLoopInfo.PerformEntryTest = false;
+  HWLoopInfo.CountType = Type::getIntNTy(Ctx, ST->getXLen());
+  HWLoopInfo.LoopDecrement = ConstantInt::get(HWLoopInfo.CountType, 1);
+  // TODO(mitch): Need to decide whether transform is possible
+  return false;
 }
