@@ -1940,27 +1940,20 @@ def PseudoJump : Pseudo<(outs GPR:$rd), (ins pseudo_jump_symbol:$target), [],
 
 /// Hardware Loops
 
-let mayStore = 1, mayLoad = 1, hasSideEffects = 1 in {
-def PseudoLoopSetup : Pseudo<(outs), (ins GPR:$rs1), [],
-                        "ns_setup_loop", "$rs1">;
-}
+let mayStore = 1, mayLoad = 1, hasSideEffects = 1, Size = 12 in
+def PseudoLoopSetup : Pseudo<(outs), (ins GPR:$rs1), []>;
+
+let isBranch = 1, isTerminator = 1, mayLoad = 0, mayStore = 0, hasSideEffects = 1 in
+def PseudoLoopEnd : Pseudo<(outs), (ins simm21_lsb0_jal:$target), []>;
 
 def : Pat<(int_set_loop_iterations (XLenVT GPR:$rs1)),
           (PseudoLoopSetup GPR:$rs1)>;
 
-let isBranch = 1, isTerminator = 1,
-    mayLoad = 0, mayStore = 0, hasSideEffects = 1 in
-def PseudoLoopEnd :
-    Pseudo<(outs), (ins simm21_lsb0_jal:$target), [],
-           "ns_loop", "$target">;
+def SDT_RISCVLoopEnd : SDTypeProfile<0, 1, [SDTCisVT<0, OtherVT>]>;
 
-def SDT_RISCVLoopEnd :
-   SDTypeProfile<0, 1, [SDTCisVT<0, OtherVT>]>;
-
-def riscv_loop_end :
-   SDNode<"RISCVISD::LOOP_END",
-          SDT_RISCVLoopEnd,
-          [SDNPHasChain, SDNPSideEffect]>;
+def riscv_loop_end : SDNode<"RISCVISD::LOOP_END",
+                     SDT_RISCVLoopEnd,
+                     [SDNPHasChain, SDNPSideEffect]>;
 
 def : Pat<(riscv_loop_end bb:$target),
           (PseudoLoopEnd bb:$target)>;

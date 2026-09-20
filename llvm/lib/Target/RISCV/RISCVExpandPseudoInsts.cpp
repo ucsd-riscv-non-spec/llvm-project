@@ -19,6 +19,7 @@
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/MC/MCContext.h"
 
 using namespace llvm;
@@ -32,11 +33,18 @@ class RISCVExpandPseudo : public MachineFunctionPass {
 public:
   const RISCVSubtarget *STI;
   const RISCVInstrInfo *TII;
+  const MachineLoopInfo *MLI;
   static char ID;
 
   RISCVExpandPseudo() : MachineFunctionPass(ID) {}
 
   bool runOnMachineFunction(MachineFunction &MF) override;
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    MachineFunctionPass::getAnalysisUsage(AU);
+    AU.addRequired<MachineLoopInfoWrapperPass>();
+    AU.setPreservesAll();
+  }
 
   StringRef getPassName() const override { return RISCV_EXPAND_PSEUDO_NAME; }
 
@@ -58,8 +66,6 @@ private:
                     MachineBasicBlock::iterator MBBI);
   bool expandIndirect(MachineBasicBlock &MBB,
                       MachineBasicBlock::iterator MBBI, bool IsCall) const;
-  bool expandLoopSetup(MachineBasicBlock &MBB,
-                       MachineBasicBlock::iterator MBBI);
   bool expandLoopEnd(MachineBasicBlock &MBB,
                      MachineBasicBlock::iterator MBBI);
   bool expandCCOp(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
@@ -92,6 +98,7 @@ char RISCVExpandPseudo::ID = 0;
 bool RISCVExpandPseudo::runOnMachineFunction(MachineFunction &MF) {
   STI = &MF.getSubtarget<RISCVSubtarget>();
   TII = STI->getInstrInfo();
+  MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
 
 #ifndef NDEBUG
   const unsigned OldSize = getInstSizeInBytes(MF);
@@ -155,8 +162,6 @@ bool RISCVExpandPseudo::expandMI(MachineBasicBlock &MBB,
   case RISCV::PseudoCALLIndirectX7:
   case RISCV::PseudoCALLIndirectNonX7:
     return expandIndirect(MBB, MBBI, /*IsCall=*/true);
-  case RISCV::PseudoLoopSetup:
-    return expandLoopSetup(MBB, MBBI);
   case RISCV::PseudoLoopEnd:
     return expandLoopEnd(MBB, MBBI);
   case RISCV::PseudoMV_FPR16INX:
@@ -614,59 +619,51 @@ bool RISCVExpandPseudo::expandIndirect(MachineBasicBlock &MBB,
   return true;
 }
 
-bool RISCVExpandPseudo::expandLoopSetup(MachineBasicBlock &MBB,
-                                        MachineBasicBlock::iterator MBBI) {
-  llvm_unreachable("TODO");
-  Register BReg = RISCV::B0; // TODO: use virtual registers
-  DebugLoc DL = MBBI->getDebugLoc();
-  MCContext &Context = MBB.getParent()->getContext();
-  MCSymbol* Sym = Context.createTempSymbol("ns_return_");
-
-  // Emit BMOVS B0, ns_return_
-  BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVS_J))
-      .addDef(BReg)
-      .addSym(Sym);
-
-  // Emit BMOVT B0, Ra, 0
-  BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVT_I))
-      .addDef(BReg)
-      .addReg(BReg)
-      .addReg(RISCV::X1)
-      .addImm(0);
-
-  // Emit PBAL (JALR X0, Ra, 0)
-  BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBI))
-      .addReg(BReg);
-
-  MBBI->eraseFromParent();
-  return true;
-}
-
 bool RISCVExpandPseudo::expandLoopEnd(MachineBasicBlock &MBB,
                                         MachineBasicBlock::iterator MBBI) {
-  llvm_unreachable("TODO");
-  Register BReg = RISCV::B0; // TODO: use virtual registers
+  // dbgs() << "expandLoopEnd: "; MBBI->dump();
+
+  MachineInstr *Setup = nullptr;
+  MachineLoop *ML = MLI->getLoopFor(&MBB);
+  MachineBasicBlock *Preheader = ML->getLoopPreheader();
+  for (MachineInstr &MI : *Preheader) {
+    if (MI.getOpcode() == RISCV::PseudoLoopSetup) {
+      Setup = &MI;
+    }
+  }
+
+  assert(Setup && "Loop end must also contain a setup");
+  // dbgs() << "Found: "; Setup->dump();
+
+  MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
+  Register BReg = MRI.createVirtualRegister(&RISCV::PBRRegClass);
   DebugLoc DL = MBBI->getDebugLoc();
   MCContext &Context = MBB.getParent()->getContext();
-  MCSymbol* Sym = Context.createTempSymbol("ns_return_");
+  MCSymbol* Sym = Context.createTempSymbol("ns_loop_");
 
-  // Emit BMOVS B0, ns_return_
-  BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVS_J))
-      .addDef(BReg)
-      .addSym(Sym);
+  MachineBasicBlock *TargetMBB = MBBI->getOperand(0).getMBB();
+  Register Count = Setup->getOperand(0).getReg();
 
-  // Emit BMOVT B0, Ra, 0
-  BuildMI(MBB, MBBI, DL, TII->get(RISCV::BMOVT_I))
-      .addDef(BReg)
-      .addReg(BReg)
-      .addReg(RISCV::X1)
-      .addImm(0);
+  // Emit BMOVS B0, ns_loop_
+  BuildMI(*Setup->getParent(), Setup, Setup->getDebugLoc(),
+    TII->get(RISCV::BMOVS_J))
+      .addDef(BReg).addSym(Sym);
 
-  // Emit PBAL (JALR X0, Ra, 0)
-  BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBI))
-      .addReg(BReg);
+  // Emit BMOVT B0, Target
+  BuildMI(*Setup->getParent(), Setup, Setup->getDebugLoc(), TII->get(RISCV::BMOVT_J))
+      .addDef(BReg).addReg(BReg).addMBB(TargetMBB);
 
+  // Emit BMOVC_LOOP B0, Rs1, 0
+  BuildMI(*Setup->getParent(), Setup, Setup->getDebugLoc(), TII->get(RISCV::BMOVC_LOOP))
+      .addDef(BReg).addReg(BReg).addReg(Count).addImm(0);
+
+  // Emit conditional branch
+  BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBC))
+      .addReg(BReg).addMBB(TargetMBB);
+
+  Setup->eraseFromParent();
   MBBI->eraseFromParent();
+
   return true;
 }
 

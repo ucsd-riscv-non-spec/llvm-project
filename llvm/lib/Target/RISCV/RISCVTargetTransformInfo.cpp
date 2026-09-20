@@ -44,6 +44,12 @@ static cl::opt<unsigned>
                              "vectorization while tail-folding."),
                     cl::init(5), cl::Hidden);
 
+static cl::opt<bool>
+    DisableHardwareLoops("non-spec-disable-hardware-loops",
+                    cl::desc("Disable Non-Spec BMOVC_LOOP instruction"
+                      "generation"),
+                    cl::init(false), cl::Hidden);
+
 InstructionCost
 RISCVTTIImpl::getRISCVInstructionCost(ArrayRef<unsigned> OpCodes, MVT VT,
                                       TTI::TargetCostKind CostKind) const {
@@ -2963,10 +2969,10 @@ bool RISCVTTIImpl::isHardwareLoopProfitable(Loop *L, ScalarEvolution &SE, Assump
                               TargetLibraryInfo *LibInfo, HardwareLoopInfo &HWLoopInfo) const {
   LLVMContext& Ctx = SE.getContext();
   HWLoopInfo.CounterInReg = false;
-  HWLoopInfo.IsNestingLegal = false;
+  HWLoopInfo.IsNestingLegal = true;
   HWLoopInfo.PerformEntryTest = false;
   HWLoopInfo.CountType = Type::getIntNTy(Ctx, ST->getXLen());
   HWLoopInfo.LoopDecrement = ConstantInt::get(HWLoopInfo.CountType, 1);
   // TODO(mitch): Need to decide whether transform is possible
-  return false;
+  return DisableHardwareLoops ? false : true;
 }
