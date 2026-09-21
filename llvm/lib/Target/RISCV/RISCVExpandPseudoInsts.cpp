@@ -655,7 +655,7 @@ bool RISCVExpandPseudo::expandLoopEnd(MachineBasicBlock &MBB,
 
   // Emit BMOVC_LOOP B0, Rs1, 0
   BuildMI(*Setup->getParent(), Setup, Setup->getDebugLoc(), TII->get(RISCV::BMOVC_LOOP))
-      .addDef(BReg).addReg(BReg).addReg(Count).addImm(0);
+      .addDef(BReg).addReg(BReg).addReg(Count).addImm(-1);
 
   // Emit conditional branch
   BuildMI(MBB, MBBI, DL, TII->get(RISCV::PseudoPBC))

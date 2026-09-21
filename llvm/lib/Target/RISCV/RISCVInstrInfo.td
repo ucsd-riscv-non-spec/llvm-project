@@ -794,10 +794,10 @@ def BMOVC_BLTU : BMOVC_rri<0b110, "bmovc_bltu">;
 def BMOVC_BGEU : BMOVC_rri<0b111, "bmovc_bgeu">;
 
 let Constraints = "$rd = $rd_src" in {
-def BMOVC_LOOP : RVInstI<0b100, OPC_OP_VE, (outs PBR:$rd), (ins PBR:$rd_src, GPR:$rs1, uimm12:$imm12),
+def BMOVC_LOOP : RVInstI<0b100, OPC_OP_VE, (outs PBR:$rd), (ins PBR:$rd_src, GPR:$rs1, simm12:$imm12),
                                 "bmovc_loop", "$rd, ${imm12}(${rs1})">;
 
-def BMOVC_BITS : RVInstI<0b010, OPC_OP_VE, (outs PBR:$rd), (ins PBR:$rd_src, GPR:$rs1, uimm12:$imm12),
+def BMOVC_BITS : RVInstI<0b010, OPC_OP_VE, (outs PBR:$rd), (ins PBR:$rd_src, GPR:$rs1, simm12:$imm12),
                                 "bmovc_bits", "$rd, $rs1, $imm12">;
 }
 }
@@ -811,7 +811,7 @@ def : InstAlias<"pb $rs1",                (PBAL X0, PBR:$rs1, X0)>;
 def : InstAlias<"pbal $rs1, $rd",         (PBAL GPR:$rd, PBR:$rs1, X0)>;
 def : InstAlias<"bmovs $rd, $rs1",        (BMOVS_I PBR:$rd, GPR:$rs1, 0)>;
 def : InstAlias<"bmovt $rd, $rs1",        (BMOVT_I PBR:$rd, GPR:$rs1, 0)>;
-def : InstAlias<"bmovc_loop $rd, $imm12", (BMOVC_LOOP PBR:$rd, X0, uimm12:$imm12)>;
+def : InstAlias<"bmovc_loop $rd, $imm12", (BMOVC_LOOP PBR:$rd, X0, simm12:$imm12)>;
 def : InstAlias<"bmovc_loop $rd, $rs",    (BMOVC_LOOP PBR:$rd, GPR:$rs, 0)>;
 
 let IsSignExtendingOpW = 1 in {
