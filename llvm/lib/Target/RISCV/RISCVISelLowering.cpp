@@ -19685,39 +19685,57 @@ SDValue RISCVTargetLowering::PerformDAGCombine(SDNode *N,
   default:
     break;
   case ISD::BRCOND: {
-    SDValue Chain = N->getOperand(0);
-    SDValue Cond = N->getOperand(1);
-    SDValue Target = N->getOperand(2);
-
-    if (Cond.getOpcode() != ISD::INTRINSIC_W_CHAIN)
-      return SDValue();
-
-    auto *IID = dyn_cast<ConstantSDNode>(Cond.getOperand(1));
-    if (!IID || IID->getZExtValue() != Intrinsic::loop_decrement)
-      return SDValue();
-    
-    SDValue DecChain = Cond.getValue(1);
-    SDValue DecInputChain = Cond.getOperand(0);
-
-    SmallVector<SDValue, 4> Chains;
-
-    if (Chain.getOpcode() == ISD::TokenFactor) {
-      for (SDValue Op : Chain->ops()) {
-        if (Op != DecChain)
-          Chains.push_back(Op);
+    // SelectionDAGBuilder inverts a branch whose true successor is the layout
+    // successor, so the decrement can show up as (xor dec, 1), which the
+    // generic combine then rewrites to (setcc dec, 1, setne). Look through
+    // both, tracking whether the brcond is taken when the loop exits.
+    SDValue Dec = N->getOperand(1);
+    bool BranchesToExit = false;
+    while (true) {
+      if (Dec.getOpcode() == ISD::XOR && isOneConstant(Dec.getOperand(1))) {
+        BranchesToExit = !BranchesToExit;
+        Dec = Dec.getOperand(0);
+      } else if (Dec.getOpcode() == ISD::SETCC) {
+        ISD::CondCode CC = cast<CondCodeSDNode>(Dec.getOperand(2))->get();
+        SDValue RHS = Dec.getOperand(1);
+        if ((CC != ISD::SETEQ && CC != ISD::SETNE) ||
+            (!isNullConstant(RHS) && !isOneConstant(RHS)))
+          return SDValue();
+        // (seteq dec, 0) and (setne dec, 1) both mean !dec.
+        if ((CC == ISD::SETEQ) == isNullConstant(RHS))
+          BranchesToExit = !BranchesToExit;
+        Dec = Dec.getOperand(0);
+      } else {
+        break;
       }
-    } else if (Chain != DecChain) {
-      return SDValue();
     }
 
-    // Preserve everything before llvm.loop.decrement.
-    Chains.push_back(DecInputChain);
+    if (Dec.getOpcode() != ISD::INTRINSIC_W_CHAIN ||
+        Dec.getConstantOperandVal(1) != Intrinsic::loop_decrement)
+      return SDValue();
 
-    SDLoc DL(N);
-    SDValue NewChain = Chains.size() == 1 ? Chains.front()
-      : DAG.getNode(ISD::TokenFactor, DL, MVT::Other, Chains);
-    
-    return DAG.getNode(RISCVISD::LOOP_END, DL, MVT::Other, NewChain, Target);
+    SDValue Target = N->getOperand(2);
+
+    if (BranchesToExit) {
+      // LOOP_END only branches while the counter is non-zero, so it has to
+      // target the block the trailing br continues the loop in. Swap the
+      // destinations of the brcond and the br.
+      if (!N->hasOneUse() || N->user_begin()->getOpcode() != ISD::BR)
+        return SDValue();
+      SDNode *Br = *N->user_begin();
+      SDValue ExitTarget = Target;
+      Target = Br->getOperand(1);
+      SDValue NewBr = DAG.getNode(ISD::BR, SDLoc(Br), MVT::Other,
+                                  Br->getOperand(0), ExitTarget);
+      DAG.ReplaceAllUsesOfValueWith(SDValue(Br, 0), NewBr);
+    }
+
+    // llvm.loop.decrement cannot be selected, so splice it out of the chain.
+    // Whatever was ordered before it stays ordered before the branch.
+    DAG.ReplaceAllUsesOfValueWith(Dec.getValue(1), Dec.getOperand(0));
+
+    return DAG.getNode(RISCVISD::LOOP_END, SDLoc(N), MVT::Other,
+                       N->getOperand(0), Target);
   }
   case RISCVISD::SplitF64: {
     SDValue Op0 = N->getOperand(0);

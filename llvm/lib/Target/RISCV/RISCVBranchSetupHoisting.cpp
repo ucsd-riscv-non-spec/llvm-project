@@ -165,7 +165,7 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
 
-  constexpr unsigned MaxBranchSetups = 30;
+  constexpr unsigned MaxBranchSetups = 32;
   if (BSI->Branches.size() > MaxBranchSetups) {
     return false;
   }

@@ -1940,11 +1940,15 @@ def PseudoJump : Pseudo<(outs GPR:$rd), (ins pseudo_jump_symbol:$target), [],
 
 /// Hardware Loops
 
+// expandLoopEnd pairs one PseudoLoopEnd with one PseudoLoopSetup in the loop
+// preheader, so neither may be duplicated (e.g. by tail duplication).
+let isNotDuplicable = 1 in {
 let mayStore = 1, mayLoad = 1, hasSideEffects = 1, Size = 12 in
 def PseudoLoopSetup : Pseudo<(outs), (ins GPR:$rs1), []>;
 
 let isBranch = 1, isTerminator = 1, mayLoad = 0, mayStore = 0, hasSideEffects = 1 in
 def PseudoLoopEnd : Pseudo<(outs), (ins simm21_lsb0_jal:$target), []>;
+}
 
 def : Pat<(int_set_loop_iterations (XLenVT GPR:$rs1)),
           (PseudoLoopSetup GPR:$rs1)>;
