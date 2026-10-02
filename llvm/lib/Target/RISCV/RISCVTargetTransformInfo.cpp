@@ -45,9 +45,9 @@ static cl::opt<unsigned>
                     cl::init(5), cl::Hidden);
 
 static cl::opt<bool>
-    DisableHardwareLoops("non-spec-disable-hardware-loops",
-                    cl::desc("Disable Non-Spec BMOVC_LOOP instruction"
-                      "generation"),
+    DisableHardwareLoops("riscv-ns-disable-hardware-loops",
+                    cl::desc("Disable Non-Spec hardware loop generation, so "
+                    "BMOVC_LOOP instructions do not get emitted"),
                     cl::init(false), cl::Hidden);
 
 InstructionCost

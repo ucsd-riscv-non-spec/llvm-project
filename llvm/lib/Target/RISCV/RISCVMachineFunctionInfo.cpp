@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "RISCVMachineFunctionInfo.h"
-#include "RISCVNonSpec.h"
 
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Module.h"

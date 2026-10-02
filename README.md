@@ -9,6 +9,14 @@ Non-speculative RISCV modification to the [LLVM Project](https://github.com/llvm
 	- See RISCVExpandPseudoInsts.cpp
 - Added Branch Support Analysis pass (used to emit PBAL labels)
 	- See RISCVBranchSupportAnalysis.{h,cpp} and RISCVAsmPrinter.cpp
+	
+## New Compiler Flags
+| Flag                                      | Description                                              |
+|-------------------------------------------|----------------------------------------------------------|
+| `-riscv-ns-disable-hardware-loops`        | Disables BMOVC_LOOP transformation/emission              |
+| `-riscv-ns-disable-branch-setup-hoisting` | Disables BMOV hoisting optimization pass                 |
+| `-riscv-ns-disable-cross-bb-hoisting`     | Disables cross basic block hoisting of BMOV instructions |
+
 
 ## My CMake Setup
 ```bash

@@ -25,13 +25,13 @@
 
 using namespace llvm;
 
-static cl::opt<bool> DisableBranchSetupHoisting("disable-branch-setup-hoisting",
+static cl::opt<bool> DisableBranchSetupHoisting("riscv-ns-disable-branch-setup-hoisting",
                                                 cl::Hidden,
                                                 cl::desc("Disable " PASS_NAME),
                                                 cl::init(false));
 
 static cl::opt<bool>
-    DisableCrossBBHoisting("disable-cross-bb-hoisting", cl::Hidden,
+    DisableCrossBBHoisting("riscv-ns-disable-cross-bb-hoisting", cl::Hidden,
                            cl::desc("Disable Cross BB Hoisting"),
                            cl::init(false));
 
