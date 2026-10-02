@@ -205,8 +205,10 @@ public:
                       uint64_t &Target) const override {
     switch (Inst.getOpcode()) {
     case RISCV::BMOVS_J:
-    case RISCV::BMOVT_J:
       Target = Addr + Inst.getOperand(1).getImm();
+      return true;
+    case RISCV::BMOVT_J:
+      Target = Addr + Inst.getOperand(2).getImm();
       return true;
     case RISCV::PBAL:
       return false;
