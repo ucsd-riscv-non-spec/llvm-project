@@ -786,6 +786,14 @@ def BMOVT_I : RVInstI<0b001, OPC_CUSTOM_2, (outs PBR:$rd), (ins PBR:$rd_src, GPR
 								"bmovt", "$rd, $rs1, $imm12">;
 }
 
+let hasSideEffects = 0, mayLoad = 1, mayStore = 0 in
+def BPOP : RVInstI<0b010, OPC_CUSTOM_2, (outs PBR:$rd), (ins GPRMem:$rs1, simm12:$imm12),
+								"bpop", "$rd, ${imm12}(${rs1})">, Sched<[WriteLDD, ReadMemBase]>;
+
+let hasSideEffects = 0, mayLoad = 0, mayStore = 1 in
+def BPUSH : RVInstS<0b011, OPC_CUSTOM_2, (outs), (ins PBR:$rs2, GPRMem:$rs1, simm12:$imm12),
+              "bpush", "$rs2, ${imm12}(${rs1})">, Sched<[WriteSTD, ReadStoreData, ReadMemBase]>;
+
 def BMOVC_BEQ : BMOVC_rri<0b000, "bmovc_beq">;
 def BMOVC_BNE : BMOVC_rri<0b001, "bmovc_bne">;
 def BMOVC_BLT : BMOVC_rri<0b100, "bmovc_blt">;
