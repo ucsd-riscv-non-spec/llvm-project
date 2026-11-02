@@ -10,9 +10,13 @@ body: |
   bb.0:
     liveins: $x10
     dead $b24 = BMOVS_I $x10, 0
-    PseudoRET
+    $x10 = ADDI $x10, 1
+    PseudoRET implicit $x10
 ...
 # CHECK: $x2 = frame-setup ADDI $x2, -48
 # CHECK: frame-setup BPUSH killed $b24, $x2, 0
+# CHECK: dead $b24 = BMOVS_I $x10, 0
 # CHECK: $b24 = frame-destroy BPOP $x2, 0
 # CHECK: $x2 = frame-destroy ADDI $x2, 48
+# The B-registers assigned after this pass must not reuse the restored one.
+# CHECK: PseudoRET implicit $x10, implicit $b24

@@ -178,6 +178,18 @@ BitVector RISCVRegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   // Shadow stack pointer.
   markSuperRegs(Reserved, RISCV::SSP);
 
+  // B-registers are assigned after the prologue and epilogue are in place,
+  // and nothing would restore a callee-saved one they do not save.
+  const MachineFrameInfo &MFI = MF.getFrameInfo();
+  if (MFI.isCalleeSavedInfoValid())
+    for (const MCPhysReg *R = MF.getRegInfo().getCalleeSavedRegs(); *R; ++R)
+      if (RISCV::PBRRegClass.contains(*R) &&
+          llvm::none_of(MFI.getCalleeSavedInfo(),
+                        [&](const CalleeSavedInfo &CS) {
+                          return CS.getReg() == *R;
+                        }))
+        markSuperRegs(Reserved, *R);
+
   assert(checkAllSuperRegsMarked(Reserved));
   return Reserved;
 }

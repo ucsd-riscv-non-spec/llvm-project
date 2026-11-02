@@ -17,9 +17,11 @@
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/CodeGen/CFIInstBuilder.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
+#include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/RegisterScavenging.h"
 #include "llvm/IR/DiagnosticInfo.h"
@@ -1508,10 +1510,80 @@ RISCVFrameLowering::getFrameIndexReference(const MachineFunction &MF, int FI,
   return Offset;
 }
 
+/// Whether \p MI is a branch whose B-register is live around its whole loop:
+/// the end of a hardware loop, set up in the preheader, or the branch of a
+/// condition queue, filled iterations ahead.
+static bool holdsBranchRegAroundLoop(const MachineInstr &MI) {
+  return MI.getOpcode() == RISCV::PseudoLoopEnd ||
+         MI.getOpcode() == RISCV::PseudoNSQBR;
+}
+
+/// Return the most B-registers that can be live across one call in \p MF,
+/// among those assigned after the frame is laid out.
+///
+/// Of those, only the B-registers of hardware loops and condition queues are
+/// live across a call, as each is live around its whole loop.
+/// RISCVExpandPseudo sets up every other branch directly before it, after any
+/// call, and RISCVBranchSetupHoisting does not move setups above calls. The
+/// B-registers of RISCVLoopFission's split branches are assigned by the main
+/// register allocator, so they are already physical here.
+static unsigned getMaxBranchRegsAcrossCall(const MachineFunction &MF) {
+  if (llvm::none_of(MF, [](const MachineBasicBlock &MBB) {
+        return llvm::any_of(MBB, holdsBranchRegAroundLoop);
+      }))
+    return 0;
+
+  // Neither analysis changes the function, but the dominator tree only
+  // takes a mutable one.
+  MachineDominatorTree MDT(const_cast<MachineFunction &>(MF));
+  MachineLoopInfo MLI(MDT);
+
+  DenseMap<const MachineLoop *, unsigned> RegsPerLoop;
+  for (const MachineBasicBlock &MBB : MF)
+    for (const MachineInstr &MI : MBB)
+      if (holdsBranchRegAroundLoop(MI))
+        if (const MachineLoop *L = MLI.getLoopFor(&MBB))
+          ++RegsPerLoop[L];
+
+  unsigned MaxRegs = 0;
+  for (const MachineBasicBlock &MBB : MF) {
+    // A tail call leaves the function, so nothing has to survive it.
+    if (llvm::none_of(MBB, [](const MachineInstr &MI) {
+          return MI.isCall() && !MI.isReturn();
+        }))
+      continue;
+    unsigned Regs = 0;
+    for (const MachineLoop *L = MLI.getLoopFor(&MBB); L; L = L->getParentLoop())
+      Regs += RegsPerLoop.lookup(L);
+    MaxRegs = std::max(MaxRegs, Regs);
+  }
+  return MaxRegs;
+}
+
 void RISCVFrameLowering::determineCalleeSaves(MachineFunction &MF,
                                               BitVector &SavedRegs,
                                               RegScavenger *RS) const {
   TargetFrameLowering::determineCalleeSaves(MF, SavedRegs, RS);
+
+  // A B-register live across a call has to be callee-saved to survive it, so
+  // this function has to save the ones it uses. Most are only assigned after
+  // the frame is laid out, so save as many as can be live across one call,
+  // besides any the main register allocator already used;
+  // RISCVRegisterInfo::getReservedRegs keeps the rest from being assigned.
+  if (unsigned NumBRegs = getMaxBranchRegsAcrossCall(MF)) {
+    SmallVector<MCPhysReg, 8> FreeBRegCSRs;
+    for (const MCPhysReg *R = MF.getRegInfo().getCalleeSavedRegs(); *R; ++R)
+      if (RISCV::PBRRegClass.contains(*R) && !SavedRegs.test(*R))
+        FreeBRegCSRs.push_back(*R);
+    if (NumBRegs > FreeBRegCSRs.size())
+      reportFatalUsageError(
+          "function '" + MF.getName() + "' keeps " + Twine(NumBRegs) +
+          " branch register(s) live across calls, but only " +
+          Twine(FreeBRegCSRs.size()) +
+          " callee-saved branch register(s) are available");
+    for (MCPhysReg Reg : ArrayRef(FreeBRegCSRs).take_front(NumBRegs))
+      SavedRegs.set(Reg);
+  }
   // Unconditionally spill RA and FP only if the function uses a frame
   // pointer.
   if (hasFP(MF)) {
@@ -2232,12 +2304,30 @@ bool RISCVFrameLowering::restoreCalleeSavedRegisters(
       }
     }
   }
+
+  // Nothing records that a restored register stays live until the return,
+  // which only matters to a register allocator running after this one. The
+  // one assigning B-registers does, and could otherwise hand a restored
+  // B-register to the return's own branch setup. RISCVExpandPseudo moves
+  // these uses onto the PB that replaces the return.
+  for (MachineInstr &Term : MBB.terminators())
+    if (Term.isReturn())
+      for (const CalleeSavedInfo &CS : CSI)
+        if (RISCV::PBRRegClass.contains(CS.getReg()))
+          MachineInstrBuilder(*MF, Term).addReg(CS.getReg(),
+                                                RegState::Implicit);
   return true;
 }
 
 bool RISCVFrameLowering::enableShrinkWrapping(const MachineFunction &MF) const {
   // Keep the conventional code flow when not optimizing.
   if (MF.getFunction().hasOptNone())
+    return false;
+
+  // The B-registers saved for loops around calls are only assigned after the
+  // prologue and epilogue are placed, so shrink-wrapping cannot see where
+  // they are used. Save them on entry and restore them at every return.
+  if (getMaxBranchRegsAcrossCall(MF))
     return false;
 
   return true;

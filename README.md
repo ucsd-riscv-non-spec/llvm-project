@@ -30,6 +30,17 @@ Branch condition pipelining also has tuning limits: `-riscv-ns-swp-max-slice-siz
 `-debug-only=riscv-branch-condition-pipelining` for why it skips the others.
 From clang, pass these flags through `-mllvm`.
 
+## Known Issues
+- `RISCVExpandPseudo` claims to preserve every analysis (`AU.setPreservesAll()`), but
+  `expandCCOp` splits blocks when it expands the `PseudoCC*` instructions (selected with
+  `short-forward-branch-opt`), leaving its `MachineDominatorTree` and `MachineLoopInfo` stale
+	- Latent for now: `RISCVExpandAtomicPseudo` runs next and preserves neither, so the
+	  pass manager frees them and `RISCVBranchSetupHoisting` gets freshly computed ones
+	- Becomes a real bug if a pass that needs them is scheduled right after
+	  `RISCVExpandPseudo`, or if `RISCVExpandAtomicPseudo` starts preserving them
+	- Fix by dropping `setPreservesAll()`, or by updating both analyses in `expandCCOp`
+	- See RISCVExpandPseudoInsts.cpp
+
 
 ## My CMake Setup
 ```bash

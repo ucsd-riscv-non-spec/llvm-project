@@ -64,10 +64,6 @@ public:
   bool scheduleBranchSetup(MachineInstr *MI, MachineInstr *S, MachineInstr *T,
                            MachineInstr *C);
   bool repairBranchTargets(const MachineFunction &MF) const;
-  /// Repair the live-in lists for the B-register of one branch's setup chain.
-  /// Must run after all of that chain's setups have been placed.
-  void addBranchRegisterLiveIns(MachineInstr *S,
-                                ArrayRef<MachineInstr *> Users) const;
   /// Returns the block to hoist \p SetupMI into and the insertion point
   /// within it. The iterator may be that block's end(), so it must not be
   /// dereferenced to recover the block.
@@ -143,39 +139,6 @@ static void printMachineCFG(const MachineFunction &MF) {
   }
 }
 
-/// Make \p Reg live-in on every block on a CFG path from \p DefBB (exclusive)
-/// to \p UseBB (inclusive).
-///
-/// \p DefBB must dominate \p UseBB. That is what bounds the walk: every path
-/// reaching \p UseBB passes through \p DefBB, so stopping there cannot leave a
-/// reaching path unmarked. Paths from unreachable blocks never execute, so
-/// they are not followed.
-static void markLiveInOnPathsFrom(MachineBasicBlock *DefBB,
-                                  MachineBasicBlock *UseBB, MCRegister Reg,
-                                  const MachineDominatorTree &MDT) {
-  if (DefBB == UseBB)
-    return;
-
-  SmallPtrSet<MachineBasicBlock *, 16> Visited;
-  SmallVector<MachineBasicBlock *, 16> WorkList(1, UseBB);
-
-  while (!WorkList.empty()) {
-    MachineBasicBlock *BB = WorkList.pop_back_val();
-    if (BB == DefBB || !MDT.isReachableFromEntry(BB) ||
-        !Visited.insert(BB).second)
-      continue;
-
-    assert(!BB->pred_empty() &&
-           "Walked off the top of the function; the BMOVS block does not "
-           "dominate the block reading its B-register");
-
-    if (!BB->isLiveIn(Reg))
-      BB->addLiveIn(Reg);
-
-    llvm::append_range(WorkList, BB->predecessors());
-  }
-}
-
 /// Whether \p MI appends to its B-register's condition FIFO.
 static bool pushesCondition(const MachineInstr &MI) {
   switch (MI.getOpcode()) {
@@ -192,24 +155,6 @@ static bool pushesCondition(const MachineInstr &MI) {
   }
 }
 
-void RISCVBranchSetupHoisting::addBranchRegisterLiveIns(
-    MachineInstr *S, ArrayRef<MachineInstr *> Users) const {
-  MCRegister Reg = S->getOperand(0).getReg().asMCReg();
-  MachineBasicBlock *DefBB = S->getParent();
-
-  // BMOVC and BMOVT read the B-register through their tied operand, and the
-  // PB branch reads it outright, so each one is a use to be covered. Walking
-  // from every use back to the BMOVS block also covers the blocks between two
-  // setups, because all of them are dominated by that block.
-  for (MachineInstr *Use : Users) {
-    if (Use == S)
-      continue;
-    assert(MDT->dominates(DefBB, Use->getParent()) &&
-           "BMOVS must dominate every read of its B-register");
-    markLiveInOnPathsFrom(DefBB, Use->getParent(), Reg, *MDT);
-  }
-}
-
 bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
   if (DisableBranchSetupHoisting)
     return false;
@@ -223,18 +168,21 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
 
   bool Changed = repairBranchTargets(MF);
 
-  constexpr unsigned MaxBranchSetups = 32;
-  if (BSI->Branches.size() > MaxBranchSetups) {
+  // Hoisting lengthens the live ranges of the B-registers, and the register
+  // allocator that assigns them runs after frame finalization, so it cannot
+  // spill. Capping the branches at the number of B-registers it may assign
+  // keeps the setups from outnumbering the registers.
+  BitVector Reserved = TRI->getReservedRegs(MF);
+  unsigned NumBRegs = llvm::count_if(
+      RISCV::PBRRegClass, [&](MCPhysReg Reg) { return !Reserved.test(Reg); });
+  if (BSI->Branches.size() > NumBRegs)
     return Changed;
-  }
 
-  // Collect work in machine-function order. Iteration order of the analysis
-  // map must not determine physical-register assignment.
+  // Collect work in machine-function order, so the order the setups are
+  // moved in does not depend on the iteration order of the analysis map.
   struct BranchWork {
     MachineInstr *MI;
     MachineInstr *S, *T, *C;
-    /// Every instruction that reads or writes the branch's B-register.
-    SmallVector<MachineInstr *, 8> Users;
     /// Whether several BMOVCs fill the B-register's condition FIFO, as for a
     /// queue from RISCVBranchConditionPipelining. C is then only the BMOVC
     /// nearest the branch.
@@ -245,36 +193,30 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
   const MachineRegisterInfo &MRI = MF.getRegInfo();
   for (auto &MBB : MF) {
     for (auto &MI : MBB) {
-      if (RISCVBranchSetup BS = BSI->Branches.lookup(&MI)) {
-        BranchWork W = {&MI,
-                        const_cast<MachineInstr *>(BS.S),
-                        const_cast<MachineInstr *>(BS.T),
-                        const_cast<MachineInstr *>(BS.C),
-                        {}};
-        // RISCVExpandPseudo gives each branch a fresh virtual B-register,
-        // so its users are exactly the instructions of this branch.
-        if (BS.S && BS.S->getOperand(0).getReg().isVirtual()) {
-          // A BMOVC both reads and writes the register, so it can come up
-          // twice.
-          Register Reg = BS.S->getOperand(0).getReg();
-          for (MachineInstr &UseMI : MRI.reg_instructions(Reg))
-            if (!llvm::is_contained(W.Users, &UseMI))
-              W.Users.push_back(&UseMI);
-          W.IsQueue = llvm::count_if(W.Users, [](const MachineInstr *U) {
-                        return pushesCondition(*U);
-                      }) > 1;
-        } else {
-          for (MachineInstr *U : {W.S, W.C, W.T, W.MI})
-            if (U)
-              W.Users.push_back(U);
-        }
-        WorkList.push_back(std::move(W));
-      }
+      RISCVBranchSetup BS = BSI->Branches.lookup(&MI);
+      if (!BS)
+        continue;
+      // The B-registers are assigned by the register allocator that follows,
+      // which also fills in the live-in lists. Moving the setup of a register
+      // that is already physical would leave those lists stale.
+      if (BS.S && BS.S->getOperand(0).getReg().isPhysical())
+        continue;
+      BranchWork W = {&MI, const_cast<MachineInstr *>(BS.S),
+                      const_cast<MachineInstr *>(BS.T),
+                      const_cast<MachineInstr *>(BS.C)};
+      // RISCVExpandPseudo gives each branch a fresh virtual B-register, so
+      // every write to it belongs to this branch.
+      if (BS.S)
+        W.IsQueue = llvm::count_if(MRI.def_instructions(
+                                       BS.S->getOperand(0).getReg()),
+                                   pushesCondition) > 1;
+      WorkList.push_back(W);
     }
   }
 
-  // A shared setup instruction cannot be renamed independently for two branch
-  // consumers. Refuse the transformation instead of silently miscompiling.
+  // A setup shared by two branches cannot be scheduled for each of them
+  // independently. Refuse the transformation instead of silently
+  // miscompiling.
   SmallPtrSet<MachineInstr *, 32> ClaimedSetups;
   for (const BranchWork &W : WorkList) {
     if (!W.S || !W.T)
@@ -294,22 +236,6 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
         return Changed;
   }
 
-  for (auto [BranchIdx, W] : llvm::enumerate(WorkList)) {
-    Register NewReg = Register(RISCV::B0 + static_cast<unsigned>(BranchIdx));
-    Register OldReg = W.S->getOperand(0).getReg();
-
-    // Rewrite every user, not just S/C/T/MI: a queue has more BMOVCs than C,
-    // and one left virtual would be given another B-register.
-    for (MachineInstr *SetupMI : W.Users) {
-      for (MachineOperand &MO : SetupMI->operands()) {
-        if (MO.isReg() && MO.getReg() == OldReg) {
-          MO.setReg(NewReg);
-          Changed = true;
-        }
-      }
-    }
-  }
-
   for (BranchWork &W : llvm::reverse(WorkList)) {
     // A queue's BMOVCs run iterations ahead of its branch, and its BMOVS and
     // BMOVT empty the FIFO, so they must stay where the pipeliner put them:
@@ -319,15 +245,6 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
       continue;
     Changed |= scheduleBranchSetup(W.MI, W.S, W.T, W.C);
   }
-
-  // The rewrite above turned the B-registers physical and the hoisting may
-  // have moved their writes into a dominating block, so a read can now be
-  // reached from a block that does not write the register. That is only valid
-  // MIR if every block in between lists the register as live-in, and nothing
-  // else in the pipeline will fill these lists in for us.
-  if (MF.getRegInfo().tracksLiveness())
-    for (const BranchWork &W : WorkList)
-      addBranchRegisterLiveIns(W.S, W.Users);
 
   LLVM_DEBUG(printMachineCFG(MF));
 
@@ -339,6 +256,11 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
 static bool isHoistBarrier(const MachineInstr &MI) {
   if (MI.isBMOV())
     return false;
+  // A callee-saved B-register holds the caller's value until the prologue
+  // saves it, so a setup above the save could not be given that register,
+  // and a B-register live across a call has to get one.
+  if (MI.getOpcode() == RISCV::BPUSH && MI.getFlag(MachineInstr::FrameSetup))
+    return true;
   // isBarrier() means that control cannot fall through; it is not a generic
   // instruction-motion barrier. Calls, inline asm, and unmodelled effects are
   // the boundaries relevant to these branch-setup register writes.
