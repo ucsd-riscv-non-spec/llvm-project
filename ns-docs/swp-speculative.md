@@ -10,7 +10,9 @@ Verification is done in layers. This document covers layers 1 to 5.
 
 On MiBench `bitcount`, built with `acb2007` and the paired-condition patch, dispatch is blocked behind a `pb` for about 12.4M of 23.7M cycles. 88% of those stalls are in three while-loops (`bit_shifter`, `bit_count`, `ntbl_bitcnt`). The pass rejected all of them with "trip count is not computable".
 
-The pass needs a trip count only to stop computing conditions for iterations that do not exist. Its header comment says the kernel runs `tc - D` iterations and the original loop finishes the last `D` "so that it never evaluates the condition of an iteration that does not exist". The danger is the condition's inputs, mainly loads past the end of an array. Bits queued for iterations that never run are already harmless: `init` empties the queue the next time the loop is entered.
+The pass needs a trip count only to stop computing conditions for iterations that do not exist. Its header comment says the kernel runs `tc - D` iterations and the original loop finishes the last `D` "so that it never evaluates the condition of an iteration that does not exist". The danger is the condition's inputs, mainly loads past the end of an array. Bits queued for iterations that never run are already harmless for correctness: `init` empties the queue the next time the loop is entered.
+
+**Correction, found later** (`swp-shift-recurrences.md`, section 7): they are not harmless for prediction. If the next entry's first `pb` is fetched before `init` reaches decode, fetch predicts it from those leftover bits. On bitcount at distance 4, that is one mispredict per call of `ntbl_bitcnt`.
 
 So when every instruction of a condition is safe to compute for any iteration, the trip count is not needed. This is the change described here.
 
