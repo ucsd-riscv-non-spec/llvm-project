@@ -1,0 +1,448 @@
+# RUN: llc -mtriple=riscv64 -run-pass=riscv-branch-setup-hoisting,greedy,virtregrewriter \
+# RUN:   -o - %s | FileCheck %s
+# RUN: llc -mtriple=riscv64 -run-pass=riscv-branch-setup-hoisting,greedy,virtregrewriter \
+# RUN:   -riscv-ns-disable-branch-reg-hints -o - %s | FileCheck %s --check-prefix=NOHINT
+# RUN: llc -mtriple=riscv64 -run-pass=riscv-branch-setup-hoisting \
+# RUN:   -riscv-ns-hoist-max-freq-ratio=0 -o - %s | FileCheck %s --check-prefix=NOLIMIT
+
+# The branch registers are assigned by the register allocator run after the
+# hoisting pass. isCalleeSavedInfoValid is set, as it is after frame lowering,
+# so B24-B31, which these functions do not save, are reserved, leaving 24.
+
+# Hoisting the loop branches' source/target setups keeps their registers live
+# across the backedges. The hints give them registers in branch layout order.
+---
+name: two_loops
+tracksRegLiveness: true
+frameInfo:
+  isCalleeSavedInfoValid: true
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x1, $x10, $x11
+    %0:pbr = BMOVS_J <mcsymbol .Lj0>
+    %0:pbr = BMOVT_J %0, %bb.1
+    PseudoPBU %0, %bb.1
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $x1, $x10, $x11
+    $x10 = ADDI $x10, 1
+    %1:pbr = BMOVS_J <mcsymbol .Lblt1>
+    %1:pbr = BMOVT_J %1, %bb.1
+    %1:pbr = BMOVC_BLT %1, $x10, $x11
+    PseudoPBC %1, %bb.1
+
+  bb.2:
+    successors: %bb.2, %bb.3
+    liveins: $x1, $x10, $x11
+    $x11 = ADDI $x11, -1
+    %2:pbr = BMOVS_J <mcsymbol .Lblt2>
+    %2:pbr = BMOVT_J %2, %bb.2
+    %2:pbr = BMOVC_BLT %2, $x10, $x11
+    PseudoPBC %2, %bb.2
+
+  bb.3:
+    liveins: $x1
+    %3:pbr = BMOVS_J <mcsymbol .Lret>
+    %3:pbr = BMOVT_I %3, $x1, 0
+    PseudoPBI %3
+...
+# The loop branches' and return's setups are hoisted to the entry.
+# CHECK-LABEL: name: two_loops
+# CHECK:       bb.0:
+# CHECK:         renamable $b0 = BMOVS_J <mcsymbol .Lj0>
+# CHECK:         renamable $b1 = BMOVS_J <mcsymbol .Lblt1>
+# CHECK:         renamable $b2 = BMOVS_J <mcsymbol .Lblt2>
+# CHECK:         renamable $b3 = BMOVS_J <mcsymbol .Lret>
+# CHECK:         PseudoPBU killed renamable $b0, %bb.1
+# CHECK:       bb.1:
+# CHECK-NOT:     BMOVS
+# CHECK-NOT:     BMOVT
+# CHECK:         renamable $b1 = BMOVC_BLT
+# CHECK:         PseudoPBC renamable $b1, %bb.1
+# CHECK:       bb.2:
+# CHECK-NOT:     BMOVS
+# CHECK-NOT:     BMOVT
+# CHECK:         renamable $b2 = BMOVC_BLT
+# CHECK:         PseudoPBC renamable $b2, %bb.2
+# CHECK:       bb.3:
+# CHECK:         PseudoPBI killed renamable $b3
+
+# NOHINT-LABEL: name: two_loops
+# NOHINT:       bb.0:
+# NOHINT:         renamable [[LOOP1:\$b[0-9]+]] = BMOVS_J <mcsymbol .Lblt1>
+# NOHINT:         renamable [[LOOP2:\$b[0-9]+]] = BMOVS_J <mcsymbol .Lblt2>
+# NOHINT:       bb.1:
+# NOHINT:         PseudoPBC renamable [[LOOP1]], %bb.1
+# NOHINT:       bb.2:
+# NOHINT:         PseudoPBC renamable [[LOOP2]], %bb.2
+
+# Every jump's setup could be hoisted to the entry, but that would keep 27
+# B-registers live there. The setups hoisted first, those of the last jumps,
+# go to the entry until 24 are live in it, counting the entry's own jump, and
+# the rest stay put. Each register live in the entry is a different one.
+---
+name: many_jumps
+tracksRegLiveness: true
+frameInfo:
+  isCalleeSavedInfoValid: true
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x1
+    %0:pbr = BMOVS_J <mcsymbol .Lj0>
+    %0:pbr = BMOVT_J %0, %bb.1
+    PseudoPBU %0, %bb.1
+
+  bb.1:
+    successors: %bb.2
+    liveins: $x1
+    %1:pbr = BMOVS_J <mcsymbol .Lj1>
+    %1:pbr = BMOVT_J %1, %bb.2
+    PseudoPBU %1, %bb.2
+
+  bb.2:
+    successors: %bb.3
+    liveins: $x1
+    %2:pbr = BMOVS_J <mcsymbol .Lj2>
+    %2:pbr = BMOVT_J %2, %bb.3
+    PseudoPBU %2, %bb.3
+
+  bb.3:
+    successors: %bb.4
+    liveins: $x1
+    %3:pbr = BMOVS_J <mcsymbol .Lj3>
+    %3:pbr = BMOVT_J %3, %bb.4
+    PseudoPBU %3, %bb.4
+
+  bb.4:
+    successors: %bb.5
+    liveins: $x1
+    %4:pbr = BMOVS_J <mcsymbol .Lj4>
+    %4:pbr = BMOVT_J %4, %bb.5
+    PseudoPBU %4, %bb.5
+
+  bb.5:
+    successors: %bb.6
+    liveins: $x1
+    %5:pbr = BMOVS_J <mcsymbol .Lj5>
+    %5:pbr = BMOVT_J %5, %bb.6
+    PseudoPBU %5, %bb.6
+
+  bb.6:
+    successors: %bb.7
+    liveins: $x1
+    %6:pbr = BMOVS_J <mcsymbol .Lj6>
+    %6:pbr = BMOVT_J %6, %bb.7
+    PseudoPBU %6, %bb.7
+
+  bb.7:
+    successors: %bb.8
+    liveins: $x1
+    %7:pbr = BMOVS_J <mcsymbol .Lj7>
+    %7:pbr = BMOVT_J %7, %bb.8
+    PseudoPBU %7, %bb.8
+
+  bb.8:
+    successors: %bb.9
+    liveins: $x1
+    %8:pbr = BMOVS_J <mcsymbol .Lj8>
+    %8:pbr = BMOVT_J %8, %bb.9
+    PseudoPBU %8, %bb.9
+
+  bb.9:
+    successors: %bb.10
+    liveins: $x1
+    %9:pbr = BMOVS_J <mcsymbol .Lj9>
+    %9:pbr = BMOVT_J %9, %bb.10
+    PseudoPBU %9, %bb.10
+
+  bb.10:
+    successors: %bb.11
+    liveins: $x1
+    %10:pbr = BMOVS_J <mcsymbol .Lj10>
+    %10:pbr = BMOVT_J %10, %bb.11
+    PseudoPBU %10, %bb.11
+
+  bb.11:
+    successors: %bb.12
+    liveins: $x1
+    %11:pbr = BMOVS_J <mcsymbol .Lj11>
+    %11:pbr = BMOVT_J %11, %bb.12
+    PseudoPBU %11, %bb.12
+
+  bb.12:
+    successors: %bb.13
+    liveins: $x1
+    %12:pbr = BMOVS_J <mcsymbol .Lj12>
+    %12:pbr = BMOVT_J %12, %bb.13
+    PseudoPBU %12, %bb.13
+
+  bb.13:
+    successors: %bb.14
+    liveins: $x1
+    %13:pbr = BMOVS_J <mcsymbol .Lj13>
+    %13:pbr = BMOVT_J %13, %bb.14
+    PseudoPBU %13, %bb.14
+
+  bb.14:
+    successors: %bb.15
+    liveins: $x1
+    %14:pbr = BMOVS_J <mcsymbol .Lj14>
+    %14:pbr = BMOVT_J %14, %bb.15
+    PseudoPBU %14, %bb.15
+
+  bb.15:
+    successors: %bb.16
+    liveins: $x1
+    %15:pbr = BMOVS_J <mcsymbol .Lj15>
+    %15:pbr = BMOVT_J %15, %bb.16
+    PseudoPBU %15, %bb.16
+
+  bb.16:
+    successors: %bb.17
+    liveins: $x1
+    %16:pbr = BMOVS_J <mcsymbol .Lj16>
+    %16:pbr = BMOVT_J %16, %bb.17
+    PseudoPBU %16, %bb.17
+
+  bb.17:
+    successors: %bb.18
+    liveins: $x1
+    %17:pbr = BMOVS_J <mcsymbol .Lj17>
+    %17:pbr = BMOVT_J %17, %bb.18
+    PseudoPBU %17, %bb.18
+
+  bb.18:
+    successors: %bb.19
+    liveins: $x1
+    %18:pbr = BMOVS_J <mcsymbol .Lj18>
+    %18:pbr = BMOVT_J %18, %bb.19
+    PseudoPBU %18, %bb.19
+
+  bb.19:
+    successors: %bb.20
+    liveins: $x1
+    %19:pbr = BMOVS_J <mcsymbol .Lj19>
+    %19:pbr = BMOVT_J %19, %bb.20
+    PseudoPBU %19, %bb.20
+
+  bb.20:
+    successors: %bb.21
+    liveins: $x1
+    %20:pbr = BMOVS_J <mcsymbol .Lj20>
+    %20:pbr = BMOVT_J %20, %bb.21
+    PseudoPBU %20, %bb.21
+
+  bb.21:
+    successors: %bb.22
+    liveins: $x1
+    %21:pbr = BMOVS_J <mcsymbol .Lj21>
+    %21:pbr = BMOVT_J %21, %bb.22
+    PseudoPBU %21, %bb.22
+
+  bb.22:
+    successors: %bb.23
+    liveins: $x1
+    %22:pbr = BMOVS_J <mcsymbol .Lj22>
+    %22:pbr = BMOVT_J %22, %bb.23
+    PseudoPBU %22, %bb.23
+
+  bb.23:
+    successors: %bb.24
+    liveins: $x1
+    %23:pbr = BMOVS_J <mcsymbol .Lj23>
+    %23:pbr = BMOVT_J %23, %bb.24
+    PseudoPBU %23, %bb.24
+
+  bb.24:
+    successors: %bb.25
+    liveins: $x1
+    %24:pbr = BMOVS_J <mcsymbol .Lj24>
+    %24:pbr = BMOVT_J %24, %bb.25
+    PseudoPBU %24, %bb.25
+
+  bb.25:
+    successors: %bb.26
+    liveins: $x1
+    %25:pbr = BMOVS_J <mcsymbol .Lj25>
+    %25:pbr = BMOVT_J %25, %bb.26
+    PseudoPBU %25, %bb.26
+
+  bb.26:
+    liveins: $x1
+    %26:pbr = BMOVS_J <mcsymbol .Lret>
+    %26:pbr = BMOVT_I %26, $x1, 0
+    PseudoPBI %26
+...
+# CHECK-LABEL: name: many_jumps
+# CHECK:       bb.0:
+# CHECK:         renamable $b0 = BMOVS_J <mcsymbol .Lj0>
+# CHECK-NEXT:    renamable $b0 = BMOVT_J killed renamable $b0, %bb.1
+# CHECK-NEXT:    renamable $b4 = BMOVS_J <mcsymbol .Lj4>
+# CHECK:         renamable $b23 = BMOVS_J <mcsymbol .Lj23>
+# CHECK-NEXT:    renamable $b23 = BMOVT_J killed renamable $b23, %bb.24
+# CHECK-NEXT:    renamable $b1 = BMOVS_J <mcsymbol .Lj24>
+# CHECK-NEXT:    renamable $b1 = BMOVT_J killed renamable $b1, %bb.25
+# CHECK-NEXT:    renamable $b2 = BMOVS_J <mcsymbol .Lj25>
+# CHECK-NEXT:    renamable $b2 = BMOVT_J killed renamable $b2, %bb.26
+# CHECK-NEXT:    renamable $b3 = BMOVS_J <mcsymbol .Lret>
+# CHECK-NEXT:    renamable $b3 = BMOVT_I killed renamable $b3, $x1, 0
+# CHECK-NEXT:    PseudoPBU killed renamable $b0, %bb.1
+# CHECK:       bb.1:
+# CHECK-NOT:   bb.2:
+# CHECK:         renamable $b0 = BMOVS_J <mcsymbol .Lj1>
+# CHECK-NEXT:    renamable $b0 = BMOVT_J killed renamable $b0, %bb.2
+# CHECK-NEXT:    PseudoPBU killed renamable $b0, %bb.2
+# CHECK:       bb.3:
+# CHECK-NOT:   bb.4:
+# CHECK:         renamable $b0 = BMOVS_J <mcsymbol .Lj3>
+# CHECK:       bb.4:
+# CHECK-NOT:     BMOVS_J
+# CHECK:         PseudoPBU killed renamable $b4, %bb.5
+# CHECK:       bb.26:
+# CHECK-NOT:     BMOVS_J
+# CHECK:         PseudoPBI killed renamable $b3
+
+# A branch whose B-register the main register allocator already made
+# physical, as it does for RISCVLoopFission's, is hoisted too when no other
+# branch uses that register. The blocks it now crosses list it as live-in,
+# and the jump set up in the same block is kept off it.
+---
+name: physical_reg_branch
+tracksRegLiveness: true
+frameInfo:
+  isCalleeSavedInfoValid: true
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x1, $x10, $x11
+    %0:pbr = BMOVS_J <mcsymbol .Lj0>
+    %0:pbr = BMOVT_J %0, %bb.1
+    PseudoPBU %0, %bb.1
+
+  bb.1:
+    successors: %bb.2, %bb.3
+    liveins: $x1, $x10, $x11
+    $b0 = BMOVS_J <mcsymbol .Lbeq>
+    $b0 = BMOVT_J $b0, %bb.3
+    $b0 = BMOVC_BEQ $b0, $x10, $x11
+    PseudoPBC $b0, %bb.3
+
+  bb.2:
+    successors: %bb.3
+    liveins: $x1
+    %1:pbr = BMOVS_J <mcsymbol .Lj1>
+    %1:pbr = BMOVT_J %1, %bb.3
+    PseudoPBU %1, %bb.3
+
+  bb.3:
+    liveins: $x1
+    %2:pbr = BMOVS_J <mcsymbol .Lret>
+    %2:pbr = BMOVT_I %2, $x1, 0
+    PseudoPBI %2
+...
+# CHECK-LABEL: name: physical_reg_branch
+# CHECK:       bb.0:
+# CHECK-DAG:     $b0 = BMOVS_J <mcsymbol .Lbeq>
+# CHECK-DAG:     renamable $b1 = BMOVS_J <mcsymbol .Lj0>
+# CHECK:         PseudoPBU killed renamable $b1, %bb.1
+# CHECK:       bb.1:
+# CHECK:         liveins: {{.*}}$b0
+# CHECK-NOT:     BMOVS_J
+# CHECK:         PseudoPBC $b0, %bb.3
+
+# The inline asm in the loop keeps the return's setup from being hoisted
+# through it. The loop's block dominates the return, but a setup there would
+# run on every iteration, so it stays after the loop.
+---
+name: setup_after_loop
+tracksRegLiveness: true
+frameInfo:
+  isCalleeSavedInfoValid: true
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x1, $x10
+    %0:pbr = BMOVS_J <mcsymbol .Lj0>
+    %0:pbr = BMOVT_J %0, %bb.1
+    PseudoPBU %0, %bb.1
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $x1, $x10
+    INLINEASM &"", 1 /* sideeffect attdialect */
+    $x10 = ADDI $x10, -1
+    %1:pbr = BMOVS_J <mcsymbol .Lloop>
+    %1:pbr = BMOVT_J %1, %bb.1
+    %1:pbr = BMOVC_BNE %1, $x10, $x0
+    PseudoPBC %1, %bb.1
+
+  bb.2:
+    liveins: $x1
+    %2:pbr = BMOVS_J <mcsymbol .Lret>
+    %2:pbr = BMOVT_I %2, $x1, 0
+    PseudoPBI %2
+...
+# CHECK-LABEL: name: setup_after_loop
+# CHECK:       bb.1:
+# CHECK-NOT:     .Lret
+# CHECK:         PseudoPBC
+# CHECK:       bb.2:
+# CHECK:         renamable $[[RET:b[0-9]+]] = BMOVS_J <mcsymbol .Lret>
+# CHECK-NEXT:    renamable $[[RET]] = BMOVT_I killed renamable $[[RET]], $x1, 0
+# CHECK-NEXT:    PseudoPBI killed renamable $[[RET]]
+
+# The jump in bb.2 runs once in 16 times bb.0 does, so its setup is not
+# hoisted there, where it would run whichever way bb.0 branches. Those of the
+# jump in bb.1 and of the return are.
+---
+name: cold_path_setup
+tracksRegLiveness: true
+frameInfo:
+  isCalleeSavedInfoValid: true
+body: |
+  bb.0:
+    successors: %bb.1(0x78000000), %bb.2(0x08000000)
+    liveins: $x1, $x10
+    %0:pbr = BMOVS_J <mcsymbol .Lbeq>
+    %0:pbr = BMOVT_J %0, %bb.2
+    %0:pbr = BMOVC_BEQ %0, $x10, $x0
+    PseudoPBC %0, %bb.2
+
+  bb.1:
+    successors: %bb.3
+    liveins: $x1
+    %1:pbr = BMOVS_J <mcsymbol .Lhot>
+    %1:pbr = BMOVT_J %1, %bb.3
+    PseudoPBU %1, %bb.3
+
+  bb.2:
+    successors: %bb.3
+    liveins: $x1
+    %2:pbr = BMOVS_J <mcsymbol .Lcold>
+    %2:pbr = BMOVT_J %2, %bb.3
+    PseudoPBU %2, %bb.3
+
+  bb.3:
+    liveins: $x1
+    %3:pbr = BMOVS_J <mcsymbol .Lret>
+    %3:pbr = BMOVT_I %3, $x1, 0
+    PseudoPBI %3
+...
+# CHECK-LABEL: name: cold_path_setup
+# CHECK:       bb.0:
+# CHECK-NOT:     .Lcold
+# CHECK-DAG:     BMOVS_J <mcsymbol .Lhot>
+# CHECK-DAG:     BMOVS_J <mcsymbol .Lret>
+# CHECK:         PseudoPBC
+# CHECK:       bb.2:
+# CHECK:         BMOVS_J <mcsymbol .Lcold>
+# CHECK:         PseudoPBU
+
+# NOLIMIT-LABEL: name: cold_path_setup
+# NOLIMIT:       bb.0:
+# NOLIMIT-DAG:     BMOVS_J <mcsymbol .Lcold>
+# NOLIMIT-DAG:     BMOVS_J <mcsymbol .Lhot>
+# NOLIMIT:         PseudoPBC

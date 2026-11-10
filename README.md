@@ -20,6 +20,8 @@ Non-speculative RISCV modification to the [LLVM Project](https://github.com/llvm
 | `-riscv-ns-disable-hardware-loops`        | Disables BMOVC_LOOP transformation/emission              |
 | `-riscv-ns-disable-branch-setup-hoisting` | Disables BMOV hoisting optimization pass                 |
 | `-riscv-ns-disable-cross-bb-hoisting`     | Disables cross basic block hoisting of BMOV instructions |
+| `-riscv-ns-hoist-max-freq-ratio=N`        | Hoists no BMOV into a block expected to run more than N times as often as its own (default 2, 0 for no limit) |
+| `-riscv-ns-disable-branch-reg-hints`      | Lets the register allocator pick each branch's B-register without a preference |
 | `-riscv-ns-disable-software-pipelining`   | Disables branch condition pipelining                     |
 | `-riscv-ns-swp-distance=N`                | Iterations ahead to compute conditions (default 16, max 62) |
 
