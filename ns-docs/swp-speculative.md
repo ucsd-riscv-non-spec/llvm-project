@@ -12,7 +12,7 @@ On MiBench `bitcount`, built with `acb2007` and the paired-condition patch, disp
 
 The pass needs a trip count only to stop computing conditions for iterations that do not exist. Its header comment says the kernel runs `tc - D` iterations and the original loop finishes the last `D` "so that it never evaluates the condition of an iteration that does not exist". The danger is the condition's inputs, mainly loads past the end of an array. Bits queued for iterations that never run are already harmless for correctness: `init` empties the queue the next time the loop is entered.
 
-**Correction, found later** (`swp-shift-recurrences.md`, section 7): they are not harmless for prediction. If the next entry's first `pb` is fetched before `init` reaches decode, fetch predicts it from those leftover bits. On bitcount at distance 4, that is one mispredict per call of `ntbl_bitcnt`.
+**A note on prediction** (`swp-shift-recurrences.md`, section 7): a per-call mispredict found on bitcount was at first blamed on these leftover bits, with fetch predicting the next entry's first `pb` from them. That was wrong; the cause was a gem5 bug (a decode-updated `bmovs` applied a second time at execute, erasing the record of `pb`s fetched in between). Leftover bits are harmless for correctness. Some per-call mispredicts remain at distances 1 and 2 and are not traced yet, so whether leftover bits play any part in prediction there is still open.
 
 So when every instruction of a condition is safe to compute for any iteration, the trip count is not needed. This is the change described here.
 
@@ -137,7 +137,7 @@ The 8 tests for the fork's own passes all passed before and after the change:
   Both are limits of the rebuild script, not compiler problems.
 - **Result:** 16 programs, 112 ELF files (objects and executables), compared with `.comment` removed, since it holds the compiler's version string.
   - **Flag off: identical**, after also removing debug info from ispell and fft. Their Makefiles use `-g`, and debug info records the build folder (`old/` against `off/`). All loaded sections (`.text`, `.rodata`, `.data` and the rest) were identical before that.
-  - **Flag on: exactly one object file changes,** fft's `fftmisc.o`. Its `NumberOfBitsNeeded` has `for (i = 0; ; i++) if (PowerOfTwo & (1 << i)) return i;`. That loop has no trip count, its condition is an induction variable with a shift and an AND, and it is now pipelined 16 iterations ahead. That is the kind of loop this mode is for.
+  - **Flag on: exactly one object file changes,** fft's `fftmisc.o`. Its `NumberOfBitsNeeded` has `for (i = 0; ; i++) if (PowerOfTwo & (1 << i)) return i;`. That loop has no trip count, its condition is an induction variable with a shift and an AND, and it is now pipelined 16 iterations ahead (4 since the speculative distance got its own default; `swp-shift-recurrences.md`, section 9). That is the kind of loop this mode is for.
   - It also exercises the poison rules: for iterations that never run, `1 << i` can go past 31, so the pushed value is meaningless, but that bit is never popped.
 - **Not yet checked:** that fft's output is still correct. That is layer 4.
 
@@ -270,7 +270,7 @@ The earlier layers check what the compiler emits. This one checks that the progr
   |---|---|
   | `van` | host `/usr/bin/clang` (Ubuntu clang 14) with the vanilla MiBench flags, no `-DPBTB`. The reference. |
   | `off` | new compiler, flag off |
-  | `on16` | flag on, default distance 16 |
+  | `on16` | flag on, distance 16 (the default at the time) |
   | `on4` | flag on, distance 4 |
 
 - **Passing criteria for every run:** output identical to `van`, and `earlyDispatchOutcomeChanged` = 0, meaning early dispatch never concluded a wrong outcome.

@@ -1,14 +1,21 @@
 ; RUN: llc -mtriple=riscv64 -O2 -riscv-ns-swp-distance=4 \
+; RUN:   -riscv-ns-swp-speculative-distance=4 \
 ; RUN:   -riscv-ns-swp-speculative -riscv-ns-swp-shift-recurrences \
 ; RUN:   -stop-after=riscv-branch-condition-pipelining < %s | FileCheck %s
 ; RUN: llc -mtriple=riscv64 -O2 -riscv-ns-swp-distance=16 \
+; RUN:   -riscv-ns-swp-speculative-distance=16 \
 ; RUN:   -riscv-ns-swp-speculative -riscv-ns-swp-shift-recurrences \
 ; RUN:   -stop-after=riscv-branch-condition-pipelining < %s \
 ; RUN:   | FileCheck %s --check-prefix=D16
 ; RUN: llc -mtriple=riscv64 -O2 -riscv-ns-swp-distance=4 \
+; RUN:   -riscv-ns-swp-speculative-distance=4 \
 ; RUN:   -riscv-ns-swp-speculative \
 ; RUN:   -stop-after=riscv-branch-condition-pipelining < %s \
 ; RUN:   | FileCheck %s --check-prefix=OFF
+; RUN: llc -mtriple=riscv64 -O2 \
+; RUN:   -riscv-ns-swp-speculative -riscv-ns-swp-shift-recurrences \
+; RUN:   -stop-after=riscv-branch-condition-pipelining < %s \
+; RUN:   | FileCheck %s --check-prefix=DEF
 
 ; Tests -riscv-ns-swp-shift-recurrences: a value shifted by the same constant
 ; every iteration is advanced to a later iteration by one shift of the total
@@ -34,6 +41,11 @@
 ; CHECK-NEXT:    call void @llvm.riscv.ns.cond.push.i64(i32 0, i32 36, i64 %x.next.ahead, i64 16)
 ; CHECK-NEXT:    [[POP:%.*]] = call i1 @llvm.riscv.ns.cond.pop(i32 0)
 ; CHECK-NEXT:    br i1 [[POP]], label %exit, label %loop
+; With no distance given, a loop without a trip count is 4 ahead.
+; DEF-LABEL:   define {{.*}} @ashr_by_4(
+; DEF:         loop:
+; DEF:           %x.ahead = ashr i64 %x, 16
+; DEF-NEXT:      %x.next.ahead = ashr i64 %x.ahead, 4
 ; OFF-LABEL:   define {{.*}} @ashr_by_4(
 ; OFF-NOT:       llvm.riscv.ns.cond
 define i32 @ashr_by_4(i64 %x0) {
@@ -212,6 +224,10 @@ exit:
 ; CHECK:       swp.drain.ph:
 ; CHECK-NEXT:    %{{.*}} = phi i64
 ; CHECK:         %x.swp.resume = phi i64 [ %x0, %loop.preheader ], [ %x.next.swp, %swp.kernel.exit ]
+; With no distance given, a counted loop stays 16 ahead.
+; DEF-LABEL:   define {{.*}} @counted_with_shift(
+; DEF:           %swp.long.enough = icmp ugt i64 %n, 16
+; DEF:           %x.ahead = lshr i64 %x.swp, 16
 ; OFF-LABEL:   define {{.*}} @counted_with_shift(
 ; OFF-NOT:       llvm.riscv.ns.cond
 define void @counted_with_shift(ptr %p, i64 %n, i64 %x0) {

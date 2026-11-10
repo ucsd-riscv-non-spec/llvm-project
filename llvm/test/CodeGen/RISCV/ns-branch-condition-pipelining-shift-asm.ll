@@ -1,4 +1,5 @@
 ; RUN: llc -mtriple=riscv64 -mattr=+m -O2 -riscv-ns-swp-distance=4 \
+; RUN:   -riscv-ns-swp-speculative-distance=4 \
 ; RUN:   -riscv-ns-swp-speculative -riscv-ns-swp-shift-recurrences < %s \
 ; RUN:   | FileCheck %s
 

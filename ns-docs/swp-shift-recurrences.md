@@ -2,7 +2,7 @@
 
 Record of the second change to `RISCVBranchConditionPipelining`: conditions on a value shifted by the same constant every iteration (`x >>= 1`) can be computed ahead, alongside affine induction variables. Branch `swp-speculative`, on top of change 1 (`dbcdc6c8096e`, `-riscv-ns-swp-speculative`, recorded in `swp-speculative.md`). Started 2026-11-10.
 
-The change is verified in the same layers as change 1. Layers 1 to 4 are done, layer 5 is not (section 8). Section 7 records a distance sweep and a prediction problem with leftover queue bits that affects change 1 too.
+The change is verified in the same layers as change 1; all five are done (layer 5 in section 8). Section 7 records a distance sweep and a per-call mispredict that first looked like a compiler problem with leftover queue bits and turned out to be a gem5 bug. Section 9 records a follow-up: loops without a trip count now default to distance 4 (`-riscv-ns-swp-speculative-distance`).
 
 ---
 
@@ -199,16 +199,16 @@ Setup as in change 1's layer 4: `gem5.opt.fixC`, all PBTB flags, model 2 and tag
 - **Correctness:** all three print the same bit counts.
 - **Stall cycles fall by 65%** (12.40M to 4.38M), as hoped: `bit_shifter` and `ntbl_bitcnt` no longer wait.
 - **Cycles only fall by 10%,** because instructions grow by 28% (+12.3M). At distance 16, each call pays a 16-push prologue: in `bit_shifter`, about 4 instructions per push, so 64 per call, 75,000 times per function. Each kernel iteration also computes the condition 16 ahead. These loops run only about 30 iterations per call, so the prologue is a large share.
-- **Mispredicts** rise from 12k to 32k. Not investigated.
+- **Mispredicts** rise from 12k to 32k. Traced later: mostly a gem5 bug, not the compiler (section 7.2).
 - The distance was not tuned. A shorter distance should cut the prologue cost. That is a follow-up, not part of this layer.
 
 ---
 
-## 7. Distance sweep, and leftover bits used for prediction
+## 7. Distance sweep, and a per-call mispredict that was a simulator bug
 
 ### 7.1 Distance sweep on bitcount
 
-bitcount small, rebuilt with both flags at distances 1 to 16, run in parallel in gem5 (`swpspec/c2/dist/`). All outputs match vanilla, with `earlyDispatchOutcomeChanged` = 0.
+bitcount small, rebuilt with both flags at distances 1 to 16, run in parallel in gem5 (`swpspec/c2/dist/`). All outputs match vanilla, with `earlyDispatchOutcomeChanged` = 0. These are the first runs, on the gem5 build of the time (`fixC`); section 7.3 has the numbers after the gem5 fix.
 
 | Distance | Cycles | x vanilla | Instructions | Mispredicts | pb stall cycles |
 |---|---:|---:|---:|---:|---:|
@@ -226,58 +226,130 @@ bitcount small, rebuilt with both flags at distances 1 to 16, run in parallel in
 - **Instructions grow by about 450k per step,** from the longer prologues.
 - **Mispredicts did not follow the distance**, so they were traced.
 
-### 7.2 The cause: fetch predicts from the previous entry's leftover bits
+### 7.2 The cause: gem5 applied a decode-updated `bmovs` twice
 
-Traced with the instrumented gem5 (`gem5.opt.pbcause`):
+**Correction.** An earlier version of this section blamed the bits a previous call leaves queued: fetch would predict the loop's first `pb` from them before the queue's `bmovs` reached decode. That was inferred from the mispredict pattern and a fetch-to-decode-delay experiment, and it was **wrong**. A trace with debug prints on that one `pb` showed a different cause, in the simulator, not the compiler.
 
-- **Where:** almost all extra mispredicts are one branch, `ntbl_bitcnt`'s pipelined loop `pb`. It mispredicts on 74,999 of 75,000 calls at distance 4, and on 37,500 at distance 3.
-- **What fetch saw:** each time, the register held this `pb`'s own source with the queue type. So fetch predicted from bits that looked valid.
+- **Where:** almost all extra mispredicts are one branch, `ntbl_bitcnt`'s pipelined loop `pb`, about once per call (74,999 of 75,000 calls at distance 4).
+- **The simulator option involved:** with `pbtbDecodeUpdate`, a PC-relative `bmovs` or `bmovt` is applied to fetch's view of the branch registers at decode. Every `pb` fetched afterwards starts from the reset queue, as it should.
+- **The bug:** gem5 applied the same `bmovs` again when it executed, to the younger instructions' snapshots and fetch's state. Applying the source again is harmless. Emptying the queue again is not: it also erases what `pb`s fetched in between recorded. A `pb` that consumes from an empty queue records a debt, so that the next push pays it off instead of being queued. With the debt erased, every later bit reaches its iteration one too late, and the loop's last iteration mispredicts.
+- **When it shows:** only when `pb`s are fetched between the `bmovs`'s decode and its execute, while the queue is still empty: the first iterations of each entry, before the prologue's pushes have executed. That explains the once-per-call pattern, why the gap between the setup and the loop seemed to matter, and why a fetch-to-decode delay of 1 hid most of it.
+- **Correctness:** unaffected. Every `pb` is checked against the real register when it dispatches, so every output was right and `earlyDispatchOutcomeChanged` stayed 0. Leftover queued bits remain harmless for correctness, as change 1 says: `init` empties the queue on the next entry.
+- **The fix,** in gem5 (`8bc685160b` on `jv-pbtb`): at execute, skip a `bmovs` or `bmovt` that decode update already applied with the same address. A companion fix (`ac63d421ee`) restores the branch registers' fetch state on a squash from decode. A decode-time redirect of `pb`s predicted from state a later decode update changes (`8786891c80`, `pbtbDecodeRedirect`, off by default) turned out neutral (within 0.02%).
 
-**Mechanism (inferred from the numbers, then confirmed by the delay experiment below):**
+### 7.3 After the gem5 fix
 
-- The core fetches 6 instructions per cycle, with a fetch-to-decode delay of 3. Decode update applies the queue's `bmovs` (which empties the queue) to fetch's state only when it reaches decode.
-- If the loop's first `pb` is fetched before that, fetch still sees the previous call's register for this function. That means the same source, the same type, and the bits queued for iterations past the previous loop's exit, which say "exit".
-- The first iteration of the new call usually continues, so it mispredicts.
+Same binaries, gem5 `8786891c80` (fetch-to-decode delay 3, as before), all flags. All outputs match vanilla, with `earlyDispatchOutcomeChanged` = 0.
 
-**The setup-to-`pb` gap decides it:**
+| Distance | Before the fix | x vanilla | Mispredicts | After the fix | x vanilla | Mispredicts |
+|---|---:|---:|---:|---:|---:|---:|
+| v3 | 23.73M | 2.15 | 12,241 | 23.73M | 2.15 | 12,241 |
+| 1 | 19.87M | 1.80 | 87,848 | 19.87M | 1.80 | 87,848 |
+| 2 | 20.51M | 1.85 | 87,761 | 20.51M | 1.85 | 87,761 |
+| 3 | 20.10M | 1.82 | 50,230 | **19.38M** | **1.75** | 12,745 |
+| 4 | 20.73M | 1.87 | 87,706 | **19.53M** | **1.77** | 12,713 |
+| 8 | 21.19M | 1.92 | 88,049 | 20.46M | 1.85 | 38,043 |
+| 16 | 21.30M | 1.93 | 31,728 | 21.23M | 1.92 | 27,970 |
 
-| Function | Gap | Effect |
-|---|---:|---|
-| `ntbl_bitcnt`, distance 4 | 18 instructions | every call |
-| `ntbl_bitcnt`, distance 3 | 16 instructions | half the calls |
-| `bit_shifter` | 28 instructions | not affected |
-
-**This corrects change 1's claim** that leftover bits are harmless. They are harmless for correctness: `init` empties the queue before the next entry's `pb` executes, and every output is right. They are not harmless for prediction.
-
-### 7.3 Confirmation: fetch-to-decode delay 1
-
-`fetchToDecodeDelay` set to 1 in a scratch copy of the config (`swpspec/c2/f2d1/sim`; only that line differs; the baseline config is unchanged). All outputs match vanilla, with `earlyDispatchOutcomeChanged` = 0. Vanilla moves from 11.06M to 11.03M cycles.
-
-| Build | Cycles | x vanilla (same delay) | Mispredicts | pb stall cycles |
-|---|---:|---:|---:|---:|
-| v3 | 23.31M | 2.11 | 12,942 | 12.11M |
-| distance 1 | **18.39M** | **1.67** | 13,027 | 6.71M |
-| distance 2 | 19.70M | 1.79 | **37,925** | 4.38M |
-| distance 3 | 19.30M | 1.75 | 12,755 | 4.00M |
-| distance 4 | 19.45M | 1.76 | 13,026 | 4.08M |
-| distance 8 | 19.90M | 1.80 | 12,928 | 4.00M |
-| distance 16 | 20.80M | 1.89 | 12,975 | 4.00M |
-
-- **The extra mispredicts disappear** at distances 1, 3, 4, 8 and 16; what remains is `bit_count`'s ~9k real ones.
-- **Shorter distance is then simply better.** Distance 1 is fastest, 21% below v3. Distance 4 is within 6% of it and safer for slower conditions. 4 remains a reasonable default.
-- **Distance 2 still mispredicts on a third of the calls** (`ntbl_bitcnt`, setup 12 instructions before the loop, more than one fetch cycle). The likely reason: fetch can run up to `fetchQueueSize` (70) instructions ahead of decode while decode is blocked, which happens constantly here because of dispatch stalls. So no fixed gap is safe, and the delay is not a fix.
-
-### 7.4 Possible fixes, not built
-
-1. **gem5:** when a queue's `bmovs` reaches decode, re-check the younger `pb`s already predicted from that register, and redirect fetch if they used stale state. This covers any gap or fetch-queue depth. It is close to the "early redirect" item in gem5 docs 06/07.
-2. **Compiler:** also empty the queue on loop exit (`bmovs`/`bmovt` in the exit block, 2 instructions per exit). The next entry's first `pb` then finds an empty queue and falls back to the predictor, which is allowed for a known source.
-3. **Compiler:** move the queue's setup earlier, staying within the preheader's loop. This helps only partly, given the distance-2 result.
+- **At distances 3 and 4 the extra mispredicts are gone**: about 12,700, vanilla's level. Distance 4 goes from 1.87x to 1.77x vanilla.
+- **At distances 1 and 2 nothing changed, and 8 and 16 improved only partly.** About 75,000 extra mispredicts remain there, again once per call, so a second mechanism with the same symptom is at work. It is not traced yet, and it is not known whether it is in gem5 or the compiler.
+- **Distance 4 is now the default** for loops without a trip count (section 9).
 
 ---
 
-## 8. Not done
+## 8. Layer 5: checks inside the pass
 
-- **Layer 5** (assertions for change 2) is not done. The range assertion in `advanceInductionVar` exists but was not mutation-tested, and the full rebuild with checks active was not rerun.
-- **The fixes in 7.4.**
-- **Choosing a default distance.** It is still 16; the data suggests 4.
+Layers 1 to 4 test examples. This layer adds checks that run every time the pass advances a shift recurrence, in builds with assertions, such as ours. They are compiled out of release builds (`NDEBUG`).
+
+### 8.1 The checks
+
+All in `advanceInductionVar` and a new helper, `checkShiftAdvance`.
+
+1. **The value emitted equals shifting once per iteration.** After emitting the advanced value, the pass reads back what it emitted and compares it with applying the recurrence's own shift `K` times, one at a time, using `APInt`.
+   - The emitted value must be a constant or one shift of the base by a constant; anything else fails.
+   - When the base is a non-constant value, the comparison runs on 7 sample values: 0, 1, all ones, the signed minimum and maximum, and two mixed patterns. When the base is a constant, which happens in a prologue that starts from a constant, it runs on that constant.
+   - Because it reads back the emitted IR rather than recomputing the formula, it also catches a wrong opcode or amount in what is emitted, not only in the arithmetic.
+2. **The emitted shift amount is below the width** (`shift out of range`). This existed in change 2; it is now mutation-tested.
+3. **An affine induction variable has a materialized step.** A shift recurrence has no step, so it must never take the affine path.
+
+To read back what was emitted, the shift path now builds its result in one place and returns it after the check. The values emitted are unchanged (8.3).
+
+### 8.2 Does each check fire
+
+Each mutation was applied to a copy of the pass, `llc` rebuilt, and `ns-branch-condition-pipelining-shift.ll` compiled at distance 4 and 16. The pass was restored from `swpspec/c2/l5/pass.l5.cpp` after each one (byte-identical, then rebuilt).
+
+| Mutation | Distance 4 | Distance 16 | Check that fires |
+|---|---|---|---|
+| `ashr` past the width gives 0 instead of the sign | no error | fires | 1 |
+| The total amount is `c + K` instead of `c * K` | fires | fires | 1 |
+| Always emit `lshr`, whatever the recurrence | fires | fires | 1 |
+| No clamp at `width - 1` for `ashr` | no error | fires | 2 |
+| Shift recurrences take the affine path | fires | fires | 3 |
+
+The two "no error" cases are expected: those mutations only matter once the total amount reaches the width, which this test first does at distance 16 (`ashr_by_4`, 4 x 16 = 64).
+
+**A slip in the process, not in the pass:** the restore used `cp -p`, which kept the copy's older timestamp, so `ninja` did not rebuild and two tests failed on the last mutant's `llc`. Touching the file and rebuilding fixed it; all tests below are on the correct build.
+
+### 8.3 Results with the checks active
+
+| Run | Result |
+|---|---|
+| The 538 RISC-V tests that passed before (536 from layer 1, plus this change's 2) | all pass |
+| 32 generated programs, rebuilt `off`, `on16`, `on4` | 96 builds, no check fires; byte-identical to the layer 4 binaries |
+| 16 MiBench programs, rebuilt flags off, speculative only and both flags (speculative distance 16) | 48 builds, no check fires; all 345 ELF files byte-identical to layer 1's builds |
+
+Byte identity, ignoring `.comment` and debug info, also shows the restructured shift path and the checks do not change what the compiler emits. The full RISC-V suite's failing tests were not rerun, by agreement: they fail on the unmodified fork.
+
+### 8.4 What these checks do not prove
+
+That the recurrence the pass recognized is the one the loop computes. That rests on the pattern match in `findInductionVar` (a header phi whose latch value is a constant shift of the phi itself) and on layers 2 to 4.
+
+---
+
+## 9. Follow-up: distance 4 by default for loops without a trip count
+
+### 9.1 The change
+
+A new option, `-riscv-ns-swp-speculative-distance`, default 4, sets the distance for loops pipelined without a trip count (`-riscv-ns-swp-speculative`). Counted loops keep `-riscv-ns-swp-distance`, default 16. The two are independent: each applies only to its own kind of loop.
+
+Why 4: each entry of a loop without a trip count computes up to D conditions for iterations that may never run, and these loops often run only a few dozen iterations per entry (section 6.2). The sweep in 7.3 is best at 3 and 4, and computing more than a few iterations ahead buys nothing once the condition is ready in time.
+
+### 9.2 Tests
+
+- Every existing RUN line that turns on `-riscv-ns-swp-speculative` now also passes `-riscv-ns-swp-speculative-distance` with the same value as its `-riscv-ns-swp-distance`, so every existing check keeps its meaning.
+- **New `DEF` RUN lines** check the defaults with no distance given:
+  - `ns-branch-condition-pipelining-speculative.ll`: `while_square` queues 4 conditions and computes 4 ahead.
+  - `ns-branch-condition-pipelining-shift.ll`: in one compile, the speculative loop `ashr_by_4` is 4 ahead, and the counted loop `counted_with_shift` is 16 ahead. So neither option leaks into the other.
+
+### 9.3 Effect on code
+
+Rebuilt with the default (no distance options), with layer 5's checks active, compared with the distance 16 builds of 8.3:
+
+- **Generated programs:** all 32 are byte-identical to `on4`. They contain only loops without a trip count.
+- **MiBench, speculative only:** only fft changes (`fftmisc.o` and `fft`).
+- **MiBench, both flags:** only bitcount and fft change.
+- **bitcount at the default is not byte-identical to the distance-4 build of 7.1,** as expected: that build passed `-riscv-ns-swp-distance=4`, which also moved its one pipelined counted loop (`bitstring`'s `while (--biz >= 0)` in `bitstrng.c`) to 4. Now that loop stays at 16 and the three loops without a trip count are 4 ahead (from the pass's debug output, each source file compiled on its own).
+
+### 9.4 gem5
+
+gem5 `8786891c80`, all flags, as in 7.3.
+
+| Program | Build | Cycles | x vanilla | Instructions | Mispredicts | pb stall cycles |
+|---|---|---:|---:|---:|---:|---:|
+| bitcount small | vanilla | 11,060,583 | 1.00 | 37.45M | 13,050 | 29,124 |
+| | both flags, default | 19,532,473 | **1.77** | 50.57M | 12,631 | 4.38M |
+| fft small (`4 4096`) | vanilla | 52,240,157 | 1.00 | 51.06M | 2,245,071 | |
+| | speculative only, default | 52,187,038 | 1.00 | 51.30M | 2,278,426 | |
+| | both flags, default | 52,186,759 | 1.00 | 51.30M | 2,278,416 | |
+
+- **Every output matches vanilla,** with `earlyDispatchOutcomeChanged` = 0. bitcount's counts are compared with the timings stripped; fft's full `RealOut`/`ImagOut` output is compared.
+- **bitcount** is where distance 4 was in 7.3 (19.53M, 1.77x), with counted loops kept at 16.
+- **fft** matches vanilla's cycles. fft's distance 16 build was only measured on the older gem5 (change 1's layer 4), so no same-simulator comparison with 16 is given here.
+
+---
+
+## 10. Not done
+
+- **The remaining per-call mispredicts** at distances 1 and 2 (and partly 8 and 16), section 7.3. Not traced; not known whether gem5 or the compiler is responsible.
 - **Which code-generation step splits `bit_shifter`'s merged condition** back into two branches (section 1).
+- **`bit_count`** (`x &= x - 1`) has no closed form and still stalls.

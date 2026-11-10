@@ -1,14 +1,20 @@
 ; RUN: llc -mtriple=riscv64 -O2 -riscv-ns-swp-distance=4 \
+; RUN:   -riscv-ns-swp-speculative-distance=4 \
 ; RUN:   -riscv-ns-swp-speculative \
 ; RUN:   -stop-after=riscv-branch-condition-pipelining < %s | FileCheck %s
 ; RUN: llc -mtriple=riscv64 -O2 -riscv-ns-swp-distance=1 \
+; RUN:   -riscv-ns-swp-speculative-distance=1 \
 ; RUN:   -riscv-ns-swp-speculative \
 ; RUN:   -stop-after=riscv-branch-condition-pipelining < %s \
 ; RUN:   | FileCheck %s --check-prefix=D1
 ; RUN: llc -mtriple=riscv64 -O2 -riscv-ns-swp-distance=62 \
+; RUN:   -riscv-ns-swp-speculative-distance=62 \
 ; RUN:   -riscv-ns-swp-speculative \
 ; RUN:   -stop-after=riscv-branch-condition-pipelining < %s \
 ; RUN:   | FileCheck %s --check-prefix=D62
+; RUN: llc -mtriple=riscv64 -O2 -riscv-ns-swp-speculative \
+; RUN:   -stop-after=riscv-branch-condition-pipelining < %s \
+; RUN:   | FileCheck %s --check-prefix=DEF
 ; RUN: llc -mtriple=riscv64 -O2 -riscv-ns-swp-distance=4 \
 ; RUN:   -stop-after=riscv-branch-condition-pipelining < %s \
 ; RUN:   | FileCheck %s --check-prefix=OFF
@@ -56,6 +62,15 @@ declare void @ext(i64)
 ; D62-COUNT-62:  call void @llvm.riscv.ns.cond.push.i64(i32 0, i32 40,
 ; D62-NEXT:      br label %loop
 ; D62:           %i.ahead = add i64 %i, 62
+; With no distance given, a loop without a trip count is 4 ahead.
+; DEF-LABEL:   define {{.*}} @while_square(
+; DEF:         entry:
+; DEF-NEXT:      call void @llvm.riscv.ns.cond.init(i32 0)
+; DEF-NEXT:      %sq.swp0 = mul i64 0, 0
+; DEF-NEXT:      call void @llvm.riscv.ns.cond.push.i64(i32 0, i32 40, i64 %sq.swp0, i64 %n)
+; DEF-COUNT-3:   call void @llvm.riscv.ns.cond.push.i64(i32 0, i32 40,
+; DEF-NEXT:      br label %loop
+; DEF:           %i.ahead = add i64 %i, 4
 ; OFF-LABEL:   define {{.*}} @while_square(
 ; OFF-NOT:       llvm.riscv.ns.cond
 define i64 @while_square(i64 %n) {

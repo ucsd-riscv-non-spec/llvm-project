@@ -147,6 +147,14 @@ static cl::opt<bool> EnableSpeculativePipelining(
     cl::desc("Also pipeline loops without a computable trip count when the "
              "conditions can be computed for iterations that never run"));
 
+// Each entry of a loop without a trip count computes this many conditions
+// for iterations that may never run, so it is kept shorter than the distance
+// of counted loops.
+static cl::opt<unsigned> SpeculativePipelineDistance(
+    "riscv-ns-swp-speculative-distance", cl::Hidden, cl::init(4),
+    cl::desc("Number of iterations ahead of its branch that a loop pipelined "
+             "without a trip count computes a condition"));
+
 STATISTIC(NumLoopsPipelined, "Number of loops whose conditions were pipelined");
 STATISTIC(NumBranchesPipelined, "Number of branches given a condition queue");
 STATISTIC(NumLoopsPipelinedSpeculatively,
@@ -829,7 +837,9 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
       return std::nullopt;
   }
 
-  unsigned Distance = std::min<unsigned>(PipelineDistance, MaxDistance);
+  unsigned Distance = std::min<unsigned>(
+      P.Speculative ? SpeculativePipelineDistance : PipelineDistance,
+      MaxDistance);
   unsigned MaxTripCount = SE->getSmallConstantMaxTripCount(L);
   if (MaxTripCount && MaxTripCount <= Distance) {
     LLVM_DEBUG(dbgs() << "  never runs more than " << MaxTripCount
@@ -919,6 +929,65 @@ void RISCVBranchConditionPipelining::materializeValues(LoopPlan &P) {
   }
 }
 
+#ifndef NDEBUG
+static APInt applyShift(Instruction::BinaryOps Op, const APInt &X,
+                        uint64_t Amount) {
+  switch (Op) {
+  case Instruction::LShr:
+    return X.lshr(Amount);
+  case Instruction::AShr:
+    return X.ashr(Amount);
+  case Instruction::Shl:
+    return X.shl(Amount);
+  default:
+    llvm_unreachable("not a shift recurrence");
+  }
+}
+
+/// Checks that \p Result, emitted for a shift recurrence \p Iterations
+/// iterations after \p Base, equals shifting \p Base by the recurrence's
+/// amount \p Iterations times, one shift at a time. It reads back what was
+/// emitted, a constant or one shift of \p Base by a constant, and compares on
+/// sample values, or on \p Base itself when it is a constant.
+static void checkShiftAdvance(const InductionVar &IV, Value *Base,
+                              unsigned Iterations, Value *Result) {
+  unsigned Width = Base->getType()->getScalarSizeInBits();
+  SmallVector<APInt, 8> Samples;
+  if (auto *C = dyn_cast<ConstantInt>(Base))
+    Samples.push_back(C->getValue());
+  else if (isa<Constant>(Base))
+    return;
+  else
+    Samples = {APInt::getZero(Width),
+               APInt::getOneBitSet(Width, 0),
+               APInt::getAllOnes(Width),
+               APInt::getSignedMinValue(Width),
+               APInt::getSignedMaxValue(Width),
+               APInt(64, 0x5a5a5a5a5a5a5a5aULL).zextOrTrunc(Width),
+               APInt(64, 0x8badf00ddeadbeefULL).zextOrTrunc(Width)};
+  auto *ResultC = dyn_cast<ConstantInt>(Result);
+  auto *ResultShift = dyn_cast<BinaryOperator>(Result);
+  assert((ResultC || (ResultShift && ResultShift->getOperand(0) == Base &&
+                      isa<ConstantInt>(ResultShift->getOperand(1)))) &&
+         "advanced shift recurrence is neither a constant nor one shift");
+  for (const APInt &X : Samples) {
+    APInt Expected = X;
+    for (unsigned K = 0; K < Iterations; ++K)
+      Expected = applyShift(IV.ShiftOp, Expected, IV.ShiftAmount);
+    APInt Got =
+        ResultC ? ResultC->getValue()
+                : applyShift(
+                      ResultShift->getOpcode(), X,
+                      cast<ConstantInt>(ResultShift->getOperand(1))
+                          ->getZExtValue());
+    assert(Got == Expected &&
+           "advanced shift recurrence differs from shifting once per "
+           "iteration");
+    (void)Got;
+  }
+}
+#endif
+
 /// Returns the value \p IV has \p Iterations iterations after it has
 /// \p Base.
 static Value *advanceInductionVar(IRBuilder<> &B, const InductionVar &IV,
@@ -934,14 +1003,21 @@ static Value *advanceInductionVar(IRBuilder<> &B, const InductionVar &IV,
     Type *Ty = Base->getType();
     unsigned Width = Ty->getScalarSizeInBits();
     uint64_t Total = uint64_t(IV.ShiftAmount) * Iterations;
-    if (Total >= Width) {
-      if (IV.ShiftOp != Instruction::AShr)
-        return Constant::getNullValue(Ty);
-      Total = Width - 1;
+    Value *Result;
+    if (Total >= Width && IV.ShiftOp != Instruction::AShr) {
+      Result = Constant::getNullValue(Ty);
+    } else {
+      Total = std::min<uint64_t>(Total, Width - 1);
+      assert(Total > 0 && Total < Width && "shift out of range");
+      Result =
+          B.CreateBinOp(IV.ShiftOp, Base, ConstantInt::get(Ty, Total), Name);
     }
-    assert(Total > 0 && Total < Width && "shift out of range");
-    return B.CreateBinOp(IV.ShiftOp, Base, ConstantInt::get(Ty, Total), Name);
+#ifndef NDEBUG
+    checkShiftAdvance(IV, Base, Iterations, Result);
+#endif
+    return Result;
   }
+  assert(IV.StepV && "affine induction variable without a materialized step");
   Value *Offset = B.CreateMul(
       IV.StepV, ConstantInt::get(IV.StepV->getType(), Iterations));
   if (Base->getType()->isPointerTy())

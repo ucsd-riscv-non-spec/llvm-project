@@ -1,4 +1,5 @@
 ; RUN: llc -mtriple=riscv64 -mattr=+m -O2 -riscv-ns-swp-distance=4 \
+; RUN:   -riscv-ns-swp-speculative-distance=4 \
 ; RUN:   -riscv-ns-swp-speculative < %s | FileCheck %s
 
 ; Tests that RISCVBranchSetupHoisting leaves the setup of a queue from
