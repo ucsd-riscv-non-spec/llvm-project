@@ -48,6 +48,16 @@
 //  - the loop has a computable trip count and no exit but its latch,
 //    other than into undefined behavior.
 //
+// With -riscv-ns-swp-speculative, a loop without a computable trip count is
+// also pipelined, if each instruction of its conditions is safe to execute
+// on any operands (no loads, no division that could trap or be undefined).
+// Its conditions are then also computed for iterations that never run, so
+// there is no kernel copy, guard or drain loop: the loop is rewritten in
+// place, its latch's condition can be pipelined too, and the conditions
+// left queued when it exits are discarded by init the next time it is
+// entered. The clones drop flags such as nsw, which an iteration that never
+// runs could violate.
+//
 // The queue operations are the llvm.riscv.ns.cond.* intrinsics. Instruction
 // selection turns them into PseudoNSQ* instructions, which RISCVExpandPseudo
 // assigns a branch register.
@@ -73,6 +83,7 @@
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
@@ -80,6 +91,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicsRISCV.h"
 #include "llvm/IR/PatternMatch.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/CommandLine.h"
@@ -125,8 +137,16 @@ static cl::opt<unsigned> MaxFunctionBranches(
     cl::desc("Do not pipeline a loop if the function could then need more "
              "branch registers than this"));
 
+static cl::opt<bool> EnableSpeculativePipelining(
+    "riscv-ns-swp-speculative", cl::Hidden, cl::init(false),
+    cl::desc("Also pipeline loops without a computable trip count when the "
+             "conditions can be computed for iterations that never run"));
+
 STATISTIC(NumLoopsPipelined, "Number of loops whose conditions were pipelined");
 STATISTIC(NumBranchesPipelined, "Number of branches given a condition queue");
+STATISTIC(NumLoopsPipelinedSpeculatively,
+          "Number of loops without a trip count whose conditions were "
+          "pipelined");
 
 /// The FIFO of a branch register holds 63 conditions, and a pipelined
 /// branch's holds its distance plus the one pushed before it is popped.
@@ -164,8 +184,14 @@ struct LoopPlan {
   /// The loop's blocks in reverse post-order.
   SmallVector<BasicBlock *, 8> Blocks;
   /// The trip count, as an XLen integer, materialized in the preheader.
-  const SCEV *TripCount;
+  /// Null when Speculative.
+  const SCEV *TripCount = nullptr;
   Value *TripCountV = nullptr;
+  /// Whether the loop has no computable trip count, so its conditions are
+  /// computed for iterations that may never run. The loop is then pipelined
+  /// in place, without a kernel copy, a guard or a drain loop, and every
+  /// condition must be safe to compute for any iteration.
+  bool Speculative = false;
   SmallVector<InductionVar, 4> IVs;
   SmallVector<PipelinedBranch, 2> Branches;
 
@@ -235,7 +261,9 @@ private:
   void materializeValues(LoopPlan &P);
   void transformLoop(LoopPlan &P);
   Value *cloneCondition(IRBuilder<> &B, const PipelinedBranch &PB,
-                        ValueToValueMapTy &Map, const Twine &Suffix);
+                        ValueToValueMapTy &Map, const Twine &Suffix,
+                        bool Speculative);
+  void transformLoopInPlace(LoopPlan &P);
   void emitPush(IRBuilder<> &B, unsigned Queue, Value *Cond);
 };
 
@@ -388,6 +416,12 @@ bool RISCVBranchConditionPipelining::buildSlice(LoopPlan &P,
       return true;
     }
     if (!isClonableIntoCondition(*I))
+      return false;
+    // Without a trip count, conditions are also computed for iterations that
+    // never run, so each instruction must be safe to execute on any operands.
+    // No load is: its address may not be valid in such an iteration.
+    if (P.Speculative &&
+        (isa<LoadInst>(I) || !isSafeToSpeculativelyExecute(I)))
       return false;
     if (InSlice.insert(I).second)
       WorkList.push_back(I);
@@ -740,16 +774,24 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
   const SCEV *BTC = SE->getExitCount(L, P.Latch);
   if (isa<SCEVCouldNotCompute>(BTC) || !BTC->getType()->isIntegerTy() ||
       BTC->getType()->getIntegerBitWidth() > XLenTy->getBitWidth()) {
-    LLVM_DEBUG(dbgs() << "  trip count is not computable\n");
-    return std::nullopt;
+    if (!EnableSpeculativePipelining) {
+      LLVM_DEBUG(dbgs() << "  trip count is not computable\n");
+      return std::nullopt;
+    }
+    // Without a trip count, the loop is pipelined in place: its conditions
+    // are computed until it exits, also for iterations that never run.
+    LLVM_DEBUG(dbgs() << "  trip count is not computable, pipelining "
+                         "speculatively\n");
+    P.Speculative = true;
+  } else {
+    // tc wraps to 0 for a loop of 2^XLen iterations, which only makes the
+    // guard send it to the original loop.
+    P.TripCount = SE->getAddExpr(SE->getNoopOrZeroExtend(BTC, XLenTy),
+                                 SE->getOne(XLenTy));
+    SCEVExpander Expander(*SE, *DL, "swp");
+    if (!Expander.isSafeToExpandAt(P.TripCount, P.Preheader->getTerminator()))
+      return std::nullopt;
   }
-  // tc wraps to 0 for a loop of 2^XLen iterations, which only makes the
-  // guard send it to the original loop.
-  P.TripCount = SE->getAddExpr(SE->getNoopOrZeroExtend(BTC, XLenTy),
-                               SE->getOne(XLenTy));
-  SCEVExpander Expander(*SE, *DL, "swp");
-  if (!Expander.isSafeToExpandAt(P.TripCount, P.Preheader->getTerminator()))
-    return std::nullopt;
 
   unsigned Distance = std::min<unsigned>(PipelineDistance, MaxDistance);
   unsigned MaxTripCount = SE->getSmallConstantMaxTripCount(L);
@@ -761,7 +803,10 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
 
   unsigned PrologueSize = 0;
   for (BasicBlock *BB : P.Blocks) {
-    if (BB == P.Latch)
+    // With a trip count, the kernel counts its iterations in place of the
+    // latch's condition. Without one, the latch's condition decides when the
+    // loop exits, and it can be pipelined like any other.
+    if (BB == P.Latch && !P.Speculative)
       continue;
     auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
     // The branch must run exactly once per iteration, to pop the condition
@@ -821,7 +866,8 @@ static unsigned estimateBranchRegisters(const Function &F) {
 void RISCVBranchConditionPipelining::materializeValues(LoopPlan &P) {
   SCEVExpander Expander(*SE, *DL, "swp");
   Instruction *InsertPt = P.Preheader->getTerminator();
-  P.TripCountV = Expander.expandCodeFor(P.TripCount, XLenTy, InsertPt);
+  if (!P.Speculative)
+    P.TripCountV = Expander.expandCodeFor(P.TripCount, XLenTy, InsertPt);
   // Rejected branches may have found induction variables nothing uses.
   SmallSet<unsigned, 4> Used;
   for (const PipelinedBranch &PB : P.Branches)
@@ -852,7 +898,7 @@ static Value *advanceInductionVar(IRBuilder<> &B, const InductionVar &IV,
 
 Value *RISCVBranchConditionPipelining::cloneCondition(
     IRBuilder<> &B, const PipelinedBranch &PB, ValueToValueMapTy &Map,
-    const Twine &Suffix) {
+    const Twine &Suffix, bool Speculative) {
   for (Instruction *I : PB.Slice) {
     Instruction *C = I->clone();
     // These describe the accesses of the iteration I belongs to, and the
@@ -860,9 +906,19 @@ Value *RISCVBranchConditionPipelining::cloneCondition(
     C->setMetadata(LLVMContext::MD_alias_scope, nullptr);
     C->setMetadata(LLVMContext::MD_noalias, nullptr);
     C->setMetadata(LLVMContext::MD_access_group, nullptr);
+    // In an iteration that never runs, an operation may overflow where the
+    // original, in an iteration that runs, cannot. Without these flags the
+    // clone computes the same value in every iteration that runs.
+    if (Speculative)
+      C->dropPoisonGeneratingAnnotations();
     RemapInstruction(C, Map,
                      RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
     B.Insert(C, I->hasName() ? I->getName() + Suffix : "");
+    // The clone, with its operands and flags as emitted, may run for an
+    // iteration that never does, so it must be safe to execute anywhere.
+    assert((!Speculative ||
+            (!isa<LoadInst>(C) && isSafeToSpeculativelyExecute(C))) &&
+           "speculative condition clone is not safe to execute anywhere");
     Map[I] = C;
   }
   return Map[PB.Slice.back()];
@@ -905,6 +961,61 @@ void RISCVBranchConditionPipelining::emitPush(IRBuilder<> &B, unsigned Queue,
     RecursivelyDeleteTriviallyDeadInstructions(Cmp);
 }
 
+/// Pipelines a loop without a trip count where it is: the preheader queues
+/// each branch's conditions for its first iterations, and each branch
+/// consumes the condition queued Distance iterations ago and queues the one
+/// for Distance iterations ahead. The loop runs until it exits as before, so
+/// up to Distance conditions per branch are left queued for iterations that
+/// never run; init empties the queue the next time the loop is entered. No
+/// block is added or removed.
+void RISCVBranchConditionPipelining::transformLoopInPlace(LoopPlan &P) {
+  assert(P.Speculative && !P.TripCountV && "loop has a trip count");
+  unsigned Distance = P.maxDistance();
+
+  // The preheader runs once each time the loop is entered.
+  IRBuilder<> B(P.Preheader->getTerminator());
+  for (const PipelinedBranch &PB : P.Branches)
+    B.CreateIntrinsic(Intrinsic::riscv_ns_cond_init, {},
+                      {B.getInt32(PB.Queue)});
+  for (unsigned K = 0; K < Distance; ++K) {
+    for (const PipelinedBranch &PB : P.Branches) {
+      if (K >= PB.Distance)
+        continue;
+      ValueToValueMapTy Map;
+      for (unsigned Idx : PB.IVs) {
+        const InductionVar &IV = P.IVs[Idx];
+        Map[IV.Phi] = advanceInductionVar(B, IV, IV.Start, K,
+                                          IV.Phi->getName() + ".swp" + Twine(K));
+      }
+      emitPush(B, PB.Queue,
+               cloneCondition(B, PB, Map, ".swp" + Twine(K),
+                              /*Speculative=*/true));
+    }
+  }
+
+  // The slices still compute the other branches' conditions, so the old
+  // conditions are only deleted once every branch is rewritten. Two branches
+  // may share one, which the handles track once it is deleted.
+  SmallVector<WeakTrackingVH, 2> OldConds;
+  for (const PipelinedBranch &PB : P.Branches) {
+    B.SetInsertPoint(PB.Br);
+    B.SetCurrentDebugLocation(PB.Br->getDebugLoc());
+    ValueToValueMapTy Map;
+    for (unsigned Idx : PB.IVs) {
+      const InductionVar &IV = P.IVs[Idx];
+      Map[IV.Phi] = advanceInductionVar(B, IV, IV.Phi, PB.Distance,
+                                        IV.Phi->getName() + ".ahead");
+    }
+    emitPush(B, PB.Queue,
+             cloneCondition(B, PB, Map, ".ahead", /*Speculative=*/true));
+    OldConds.push_back(PB.Br->getCondition());
+    PB.Br->setCondition(B.CreateIntrinsic(Intrinsic::riscv_ns_cond_pop, {},
+                                          {B.getInt32(PB.Queue)}));
+  }
+  // A condition the loop still uses elsewhere is left in place.
+  RecursivelyDeleteTriviallyDeadInstructionsPermissive(OldConds);
+}
+
 void RISCVBranchConditionPipelining::transformLoop(LoopPlan &P) {
   Function *F = P.Header->getParent();
   LLVMContext &Ctx = F->getContext();
@@ -945,7 +1056,9 @@ void RISCVBranchConditionPipelining::transformLoop(LoopPlan &P) {
         Map[IV.Phi] = advanceInductionVar(B, IV, IV.Start, K,
                                           IV.Phi->getName() + ".swp" + Twine(K));
       }
-      emitPush(B, PB.Queue, cloneCondition(B, PB, Map, ".swp" + Twine(K)));
+      emitPush(B, PB.Queue,
+               cloneCondition(B, PB, Map, ".swp" + Twine(K),
+                              /*Speculative=*/false));
     }
   }
   // The kernel stops Distance iterations early: its last iteration queues
@@ -986,7 +1099,8 @@ void RISCVBranchConditionPipelining::transformLoop(LoopPlan &P) {
       Map[IV.Phi] = advanceInductionVar(B, IV, VMap[IV.Phi], PB.Distance,
                                         IV.Phi->getName() + ".ahead");
     }
-    emitPush(B, PB.Queue, cloneCondition(B, PB, Map, ".ahead"));
+    emitPush(B, PB.Queue,
+             cloneCondition(B, PB, Map, ".ahead", /*Speculative=*/false));
     Value *OldCond = KBr->getCondition();
     KBr->setCondition(B.CreateIntrinsic(Intrinsic::riscv_ns_cond_pop, {},
                                         {B.getInt32(PB.Queue)}));
@@ -1091,10 +1205,26 @@ bool RISCVBranchConditionPipelining::runOnFunction(Function &F) {
   for (LoopPlan &P : Plans)
     materializeValues(P);
   for (LoopPlan &P : Plans) {
-    transformLoop(P);
+    if (P.Speculative) {
+#ifndef NDEBUG
+      size_t NumBlocks = F.size();
+#endif
+      transformLoopInPlace(P);
+      // Pipelining in place adds and removes no block, so the dominator
+      // tree and loop info the other plans rely on stay valid.
+      assert(F.size() == NumBlocks &&
+             "speculative pipelining changed the control flow");
+      ++NumLoopsPipelinedSpeculatively;
+    } else {
+      transformLoop(P);
+    }
     ++NumLoopsPipelined;
     NumBranchesPipelined += P.Branches.size();
   }
+#ifndef NDEBUG
+  if (verifyFunction(F, &errs()))
+    report_fatal_error("RISC-V branch condition pipelining produced invalid IR");
+#endif
   return true;
 }
 
