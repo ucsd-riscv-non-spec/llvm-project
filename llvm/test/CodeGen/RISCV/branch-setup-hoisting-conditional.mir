@@ -1,0 +1,256 @@
+# RUN: llc -mtriple=riscv64 -verify-machineinstrs \
+# RUN:   -run-pass=riscv-branch-setup-hoisting -o - %s | FileCheck %s
+# RUN: llc -mtriple=riscv64 -verify-machineinstrs \
+# RUN:   -run-pass=riscv-branch-setup-hoisting,riscv-branch-setup-hoisting \
+# RUN:   -o - %s | FileCheck %s
+# RUN: llc -mtriple=riscv64 -verify-machineinstrs \
+# RUN:   -run-pass=riscv-branch-setup-hoisting,greedy,virtregrewriter \
+# RUN:   -o /dev/null %s
+
+# Both the conditional store's branch and the latch can retain their source
+# and target across iterations. Their condition pushes must stay in the loop.
+# CHECK-LABEL: name: conditional_in_loop
+# CHECK:       bb.0:
+# CHECK-DAG:     %0:pbr = BMOVS_J <mcsymbol .Lif>
+# CHECK-DAG:     %0:pbr = BMOVT_J %0, %bb.3
+# CHECK-DAG:     %1:pbr = BMOVS_J <mcsymbol .Llatch>
+# CHECK-DAG:     %1:pbr = BMOVT_J %1, %bb.1
+# CHECK-NOT:     BMOVC
+# CHECK:       bb.1:
+# CHECK-NOT:     BMOVS
+# CHECK-NOT:     BMOVT
+# CHECK:         $x13 = LW $x10, 0
+# CHECK-NEXT:    %0:pbr = BMOVC_BLT %0, $x11, $x13
+# CHECK-NEXT:    PseudoPBC %0, %bb.3
+# CHECK:       bb.2:
+# CHECK:         SW $x0, $x10, 0
+# CHECK:       bb.3:
+# CHECK-NOT:     BMOVS
+# CHECK-NOT:     BMOVT
+# CHECK:         $x12 = ADDI $x12, -1
+# CHECK-NEXT:    %1:pbr = BMOVC_BNE %1, $x12, $x0
+# CHECK-NEXT:    PseudoPBC %1, %bb.1
+---
+name: conditional_in_loop
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x10, $x11, $x12
+
+  bb.1:
+    successors: %bb.2, %bb.3
+    liveins: $x10, $x11, $x12
+    $x13 = LW $x10, 0
+    %0:pbr = BMOVS_J <mcsymbol .Lif>
+    %0:pbr = BMOVT_J %0, %bb.3
+    %0:pbr = BMOVC_BLT %0, $x11, $x13
+    PseudoPBC %0, %bb.3
+
+  bb.2:
+    successors: %bb.3
+    liveins: $x10, $x11, $x12
+    SW $x0, $x10, 0
+
+  bb.3:
+    successors: %bb.1, %bb.4
+    liveins: $x10, $x11, $x12
+    $x10 = ADDI $x10, 4
+    $x12 = ADDI $x12, -1
+    %1:pbr = BMOVS_J <mcsymbol .Llatch>
+    %1:pbr = BMOVT_J %1, %bb.1
+    %1:pbr = BMOVC_BNE %1, $x12, $x0
+    PseudoPBC %1, %bb.1
+
+  bb.4:
+...
+
+# Even an invariant condition needs one push for every PB. This also checks
+# that a later invocation of the pass cannot hoist C after S/T have moved.
+# CHECK-LABEL: name: invariant_condition
+# CHECK:       bb.0:
+# CHECK:         %0:pbr = BMOVS_J <mcsymbol .Linvariant>
+# CHECK-NEXT:    %0:pbr = BMOVT_J %0, %bb.1
+# CHECK-NOT:     BMOVC
+# CHECK:       bb.1:
+# CHECK:         %0:pbr = BMOVC_BNE %0, $x10, $x0
+# CHECK-NEXT:    PseudoPBC %0, %bb.1
+---
+name: invariant_condition
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x10
+    %0:pbr = BMOVS_J <mcsymbol .Linvariant>
+    %0:pbr = BMOVT_J %0, %bb.1
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $x10
+    %0:pbr = BMOVC_BNE %0, $x10, $x0
+    PseudoPBC %0, %bb.1
+
+  bb.2:
+...
+
+# A single static push is not sufficient: the earlier terminator may skip
+# its consumer. Keep the resets for %0, even though C and PB share a block.
+# CHECK-LABEL: name: bypassed_consumer
+# CHECK:       bb.0:
+# CHECK-NOT:     .Lbypassed
+# CHECK:       bb.1:
+# CHECK:         %0:pbr = BMOVS_J <mcsymbol .Lbypassed>
+# CHECK-NEXT:    %0:pbr = BMOVT_J %0, %bb.1
+# CHECK-NEXT:    %0:pbr = BMOVC_BNE %0, $x10, $x0
+# CHECK:         PseudoPBC %1, %bb.2
+# CHECK-NEXT:    PseudoPBC %0, %bb.1
+---
+name: bypassed_consumer
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x10, $x11
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $x10, $x11
+    %0:pbr = BMOVS_J <mcsymbol .Lbypassed>
+    %0:pbr = BMOVT_J %0, %bb.1
+    %0:pbr = BMOVC_BNE %0, $x10, $x0
+    %1:pbr = BMOVS_J <mcsymbol .Learly_exit>
+    %1:pbr = BMOVT_J %1, %bb.2
+    %1:pbr = BMOVC_BEQ %1, $x11, $x0
+    PseudoPBC %1, %bb.2
+    PseudoPBC %0, %bb.1
+
+  bb.2:
+...
+
+# One static producer can also push multiple times before a consumer in a
+# different block. The inner backedge below bypasses %0's PB, so keep its resets.
+# CHECK-LABEL: name: split_condition
+# CHECK:       bb.0:
+# CHECK-NOT:     .Lsplit
+# CHECK:       bb.1:
+# CHECK:         %0:pbr = BMOVS_J <mcsymbol .Lsplit>
+# CHECK-NEXT:    %0:pbr = BMOVT_J %0, %bb.1
+# CHECK-NEXT:    %0:pbr = BMOVC_BNE %0, $x10, $x0
+# CHECK:         PseudoPBC %1, %bb.1
+# CHECK:       bb.2:
+# CHECK:         PseudoPBC %0, %bb.1
+---
+name: split_condition
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x10, $x11
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $x10, $x11
+    %0:pbr = BMOVS_J <mcsymbol .Lsplit>
+    %0:pbr = BMOVT_J %0, %bb.1
+    %0:pbr = BMOVC_BNE %0, $x10, $x0
+    %1:pbr = BMOVS_J <mcsymbol .Linner>
+    %1:pbr = BMOVT_J %1, %bb.1
+    %1:pbr = BMOVC_BEQ %1, $x11, $x0
+    PseudoPBC %1, %bb.1
+
+  bb.2:
+    successors: %bb.1, %bb.3
+    liveins: $x10, $x11
+    PseudoPBC %0, %bb.1
+
+  bb.3:
+...
+
+# Multiple pushes leave surplus conditions after PB. The next iteration's
+# resets must remain, as must the resets on reentry to a pipelined loop.
+# CHECK-LABEL: name: queued_conditions
+# CHECK:       bb.0:
+# CHECK-NOT:     BMOV
+# CHECK:       bb.1:
+# CHECK:         %0:pbr = BMOVS_J <mcsymbol .Lqueued>
+# CHECK-NEXT:    %0:pbr = BMOVT_J %0, %bb.1
+# CHECK-NEXT:    %0:pbr = BMOVC_BNE %0, $x10, $x0
+# CHECK-NEXT:    %0:pbr = BMOVC_BEQ %0, $x11, $x0
+# CHECK-NEXT:    PseudoPBC %0, %bb.1
+---
+name: queued_conditions
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x10, $x11
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $x10, $x11
+    %0:pbr = BMOVS_J <mcsymbol .Lqueued>
+    %0:pbr = BMOVT_J %0, %bb.1
+    %0:pbr = BMOVC_BNE %0, $x10, $x0
+    %0:pbr = BMOVC_BEQ %0, $x11, $x0
+    PseudoPBC %0, %bb.1
+
+  bb.2:
+...
+
+# Exempting the owning PB must not exempt a call in the same loop.
+# CHECK-LABEL: name: call_in_loop
+# CHECK:       bb.0:
+# CHECK-NOT:     BMOV
+# CHECK:       bb.1:
+# CHECK:         PseudoCALL
+# CHECK-NEXT:    %0:pbr = BMOVS_J <mcsymbol .Lcall>
+# CHECK-NEXT:    %0:pbr = BMOVT_J %0, %bb.1
+# CHECK-NEXT:    %0:pbr = BMOVC_BEQ %0, $x0, $x0
+# CHECK-NEXT:    PseudoPBC %0, %bb.1
+---
+name: call_in_loop
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    PseudoCALL target-flags(riscv-call) &callee, csr_ilp32_lp64, implicit-def dead $x1
+    %0:pbr = BMOVS_J <mcsymbol .Lcall>
+    %0:pbr = BMOVT_J %0, %bb.1
+    %0:pbr = BMOVC_BEQ %0, $x0, $x0
+    PseudoPBC %0, %bb.1
+
+  bb.2:
+...
+
+# BMOVC_LOOP initializes a counter rather than pushing a condition. It does
+# not qualify for the new exception for a paired FIFO push and pop.
+# CHECK-LABEL: name: loop_counter
+# CHECK:       bb.0:
+# CHECK-NOT:     BMOV
+# CHECK:       bb.1:
+# CHECK:         %0:pbr = BMOVS_J <mcsymbol .Lcounter>
+# CHECK-NEXT:    %0:pbr = BMOVT_J %0, %bb.1
+# CHECK-NEXT:    %0:pbr = BMOVC_LOOP %0, $x10, 0
+# CHECK-NEXT:    PseudoPBC %0, %bb.1
+---
+name: loop_counter
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x10
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $x10
+    %0:pbr = BMOVS_J <mcsymbol .Lcounter>
+    %0:pbr = BMOVT_J %0, %bb.1
+    %0:pbr = BMOVC_LOOP %0, $x10, 0
+    PseudoPBC %0, %bb.1
+
+  bb.2:
+...

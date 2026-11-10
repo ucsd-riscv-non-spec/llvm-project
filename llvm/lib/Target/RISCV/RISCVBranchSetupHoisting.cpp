@@ -780,6 +780,37 @@ static bool isHoistBarrier(const MachineInstr &MI) {
          MI.hasUnmodeledSideEffects();
 }
 
+/// Whether each condition pushed for Branch is consumed by that branch,
+/// leaving an empty FIFO without repeating its BMOVS/BMOVT resets.
+static bool hasPairedCondition(const MachineInstr &Branch,
+                               const MachineInstr &S, const MachineInstr &T,
+                               const MachineInstr *C) {
+  if (Branch.getOpcode() != RISCV::PseudoPBC || !C || !pushesCondition(*C) ||
+      C->getParent() != Branch.getParent())
+    return false;
+
+  // In particular, exclude other producers, consumers, or resets of the
+  // register. Counting static BMOVCs alone does not prove the FIFO is balanced.
+  const MachineRegisterInfo &MRI = Branch.getMF()->getRegInfo();
+  Register Reg = S.getOperand(0).getReg();
+  if (!llvm::all_of(MRI.reg_nodbg_instructions(Reg),
+                    [&](const MachineInstr &MI) {
+                      return llvm::is_contained({&S, &T, C, &Branch}, &MI);
+                    }))
+    return false;
+
+  // A preceding conditional terminator could bypass this PB after the push.
+  for (MachineBasicBlock::const_iterator I = std::next(C->getIterator()),
+                                         E = Branch.getParent()->end();
+       I != E; ++I) {
+    if (&*I == &Branch)
+      return true;
+    if (I->isTerminator())
+      break;
+  }
+  return false;
+}
+
 bool RISCVBranchSetupHoisting::scheduleBranchSetup(
     MachineInstr *MI, MachineInstr *S, MachineInstr *T, MachineInstr *C,
     BRegLiveness &Liveness, bool LimitPressure) {
@@ -787,17 +818,26 @@ bool RISCVBranchSetupHoisting::scheduleBranchSetup(
   assert(T && "Branch must have BMOVT");
   bool Changed = false;
 
-  // A PB reading its B-register is normally what keeps the setup in the
-  // loop around it, executing again before every iteration's PB. An
-  // unconditional branch's register does not change once set up, as its PB
-  // consumes nothing, so it can be set up once before the loop instead.
+  // PB preserves the source and target. An unconditional PB consumes nothing;
+  // a conditional PB with a paired push leaves its FIFO empty, so neither
+  // needs its source/target setup repeated on each iteration.
+  bool PairedCondition =
+      MLI->getLoopFor(MI->getParent()) && hasPairedCondition(*MI, *S, *T, C);
   const MachineInstr *OwnBranch =
-      !C && MI->getOpcode() == RISCV::PseudoPBU ? MI : nullptr;
+      ((!C && MI->getOpcode() == RISCV::PseudoPBU) || PairedCondition)
+          ? MI
+          : nullptr;
 
   // Keep architectural setup order. The dependency checks also prevent a
   // later setup from being moved across an earlier setup of the same B-reg.
   for (MachineInstr *SetupMI : {S, C, T}) {
     if (!SetupMI)
+      continue;
+
+    // Once the per-iteration resets are removed, speculating even an invariant
+    // condition push onto a path that bypasses PB could leave surplus bits.
+    // Keep the paired push in place, and never exempt PB when moving BMOVC.
+    if (SetupMI == C && PairedCondition)
       continue;
 
     LLVM_DEBUG(dbgs() << "Hoisting: " << *SetupMI);
