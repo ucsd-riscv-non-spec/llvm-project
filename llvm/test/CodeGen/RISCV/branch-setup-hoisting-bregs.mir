@@ -9,9 +9,8 @@
 # hoisting pass. isCalleeSavedInfoValid is set, as it is after frame lowering,
 # so B24-B31, which these functions do not save, are reserved, leaving 24.
 
-# Fetch predicts a branch only while its B-register still holds its setup, so
-# each branch gets its own register. Left to itself, the register allocator
-# gives all of these B0, as no two are live at once.
+# Hoisting the loop branches' source/target setups keeps their registers live
+# across the backedges. The hints give them registers in branch layout order.
 ---
 name: two_loops
 tracksRegLiveness: true
@@ -49,24 +48,35 @@ body: |
     %3:pbr = BMOVT_I %3, $x1, 0
     PseudoPBI %3
 ...
-# The return's setup is hoisted to the entry.
+# The loop branches' and return's setups are hoisted to the entry.
 # CHECK-LABEL: name: two_loops
 # CHECK:       bb.0:
 # CHECK:         renamable $b0 = BMOVS_J <mcsymbol .Lj0>
+# CHECK:         renamable $b1 = BMOVS_J <mcsymbol .Lblt1>
+# CHECK:         renamable $b2 = BMOVS_J <mcsymbol .Lblt2>
 # CHECK:         renamable $b3 = BMOVS_J <mcsymbol .Lret>
 # CHECK:         PseudoPBU killed renamable $b0, %bb.1
 # CHECK:       bb.1:
-# CHECK:         renamable $b1 = BMOVS_J <mcsymbol .Lblt1>
-# CHECK:         PseudoPBC killed renamable $b1, %bb.1
+# CHECK-NOT:     BMOVS
+# CHECK-NOT:     BMOVT
+# CHECK:         renamable $b1 = BMOVC_BLT
+# CHECK:         PseudoPBC renamable $b1, %bb.1
 # CHECK:       bb.2:
-# CHECK:         renamable $b2 = BMOVS_J <mcsymbol .Lblt2>
-# CHECK:         PseudoPBC killed renamable $b2, %bb.2
+# CHECK-NOT:     BMOVS
+# CHECK-NOT:     BMOVT
+# CHECK:         renamable $b2 = BMOVC_BLT
+# CHECK:         PseudoPBC renamable $b2, %bb.2
 # CHECK:       bb.3:
 # CHECK:         PseudoPBI killed renamable $b3
 
 # NOHINT-LABEL: name: two_loops
-# NOHINT:         PseudoPBC killed renamable [[LOOPREG:\$b[0-9]+]], %bb.1
-# NOHINT:         PseudoPBC killed renamable [[LOOPREG]], %bb.2
+# NOHINT:       bb.0:
+# NOHINT:         renamable [[LOOP1:\$b[0-9]+]] = BMOVS_J <mcsymbol .Lblt1>
+# NOHINT:         renamable [[LOOP2:\$b[0-9]+]] = BMOVS_J <mcsymbol .Lblt2>
+# NOHINT:       bb.1:
+# NOHINT:         PseudoPBC renamable [[LOOP1]], %bb.1
+# NOHINT:       bb.2:
+# NOHINT:         PseudoPBC renamable [[LOOP2]], %bb.2
 
 # Every jump's setup could be hoisted to the entry, but that would keep 27
 # B-registers live there. The setups hoisted first, those of the last jumps,

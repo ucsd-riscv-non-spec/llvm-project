@@ -780,6 +780,37 @@ static bool isHoistBarrier(const MachineInstr &MI) {
          MI.hasUnmodeledSideEffects();
 }
 
+/// Whether each condition pushed for Branch is consumed by that branch,
+/// leaving an empty FIFO without repeating its BMOVS/BMOVT resets.
+static bool hasPairedCondition(const MachineInstr &Branch,
+                               const MachineInstr &S, const MachineInstr &T,
+                               const MachineInstr *C) {
+  if (Branch.getOpcode() != RISCV::PseudoPBC || !C || !pushesCondition(*C) ||
+      C->getParent() != Branch.getParent())
+    return false;
+
+  // In particular, exclude other producers, consumers, or resets of the
+  // register. Counting static BMOVCs alone does not prove the FIFO is balanced.
+  const MachineRegisterInfo &MRI = Branch.getMF()->getRegInfo();
+  Register Reg = S.getOperand(0).getReg();
+  if (!llvm::all_of(MRI.reg_nodbg_instructions(Reg),
+                    [&](const MachineInstr &MI) {
+                      return llvm::is_contained({&S, &T, C, &Branch}, &MI);
+                    }))
+    return false;
+
+  // A preceding conditional terminator could bypass this PB after the push.
+  for (MachineBasicBlock::const_iterator I = std::next(C->getIterator()),
+                                         E = Branch.getParent()->end();
+       I != E; ++I) {
+    if (&*I == &Branch)
+      return true;
+    if (I->isTerminator())
+      break;
+  }
+  return false;
+}
+
 bool RISCVBranchSetupHoisting::scheduleBranchSetup(
     MachineInstr *MI, MachineInstr *S, MachineInstr *T, MachineInstr *C,
     BRegLiveness &Liveness, bool LimitPressure) {
@@ -787,17 +818,26 @@ bool RISCVBranchSetupHoisting::scheduleBranchSetup(
   assert(T && "Branch must have BMOVT");
   bool Changed = false;
 
-  // A PB reading its B-register is normally what keeps the setup in the
-  // loop around it, executing again before every iteration's PB. An
-  // unconditional branch's register does not change once set up, as its PB
-  // consumes nothing, so it can be set up once before the loop instead.
+  // PB preserves the source and target. An unconditional PB consumes nothing;
+  // a conditional PB with a paired push leaves its FIFO empty, so neither
+  // needs its source/target setup repeated on each iteration.
+  bool PairedCondition =
+      MLI->getLoopFor(MI->getParent()) && hasPairedCondition(*MI, *S, *T, C);
   const MachineInstr *OwnBranch =
-      !C && MI->getOpcode() == RISCV::PseudoPBU ? MI : nullptr;
+      ((!C && MI->getOpcode() == RISCV::PseudoPBU) || PairedCondition)
+          ? MI
+          : nullptr;
 
   // Keep architectural setup order. The dependency checks also prevent a
   // later setup from being moved across an earlier setup of the same B-reg.
   for (MachineInstr *SetupMI : {S, C, T}) {
     if (!SetupMI)
+      continue;
+
+    // Once the per-iteration resets are removed, speculating even an invariant
+    // condition push onto a path that bypasses PB could leave surplus bits.
+    // Keep the paired push in place, and never exempt PB when moving BMOVC.
+    if (SetupMI == C && PairedCondition)
       continue;
 
     LLVM_DEBUG(dbgs() << "Hoisting: " << *SetupMI);
@@ -942,6 +982,18 @@ scanBlockBackward(MachineBasicBlock *BB,
   return SafePoint;
 }
 
+/// Whether \p MI, in a cycle that \p SetupMI would be hoisted out of, keeps
+/// the setup in that cycle. The other setups of the same B-register do not:
+/// they are hoisted with it, or checked on their own.
+static bool isCycleHazard(const MachineInstr &MI, const MachineInstr &SetupMI,
+                          const TargetRegisterInfo &TRI,
+                          const MachineInstr *OwnBranch) {
+  if (MI.isBMOV() &&
+      MI.getOperand(0).getReg() == SetupMI.getOperand(0).getReg())
+    return false;
+  return isHoistHazard(MI, SetupMI, TRI, OwnBranch);
+}
+
 bool RISCVBranchSetupHoisting::isSafeToHoistTo(
     const MachineInstr &SetupMI, MachineBasicBlock &DestBB,
     MachineBasicBlock::const_iterator InsertPt,
@@ -949,6 +1001,7 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
   const MachineBasicBlock *SrcBB = SetupMI.getParent();
   if (SrcBB == &DestBB || !MDT->dominates(&DestBB, SrcBB))
     return false;
+  bool SrcInCycle = false;
 
   auto rangeHasHazard = [&](MachineBasicBlock::const_iterator Begin,
                             MachineBasicBlock::const_iterator End) {
@@ -987,9 +1040,30 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
       return false;
 
     for (const MachineBasicBlock *Pred : BB->predecessors()) {
+      // SrcBB reaches itself again without passing DestBB.
+      if (Pred == SrcBB)
+        SrcInCycle = true;
       if (Pred == &DestBB || MDT->dominates(&DestBB, Pred))
         WorkList.push_back(Pred);
     }
+  }
+
+  // The walk covers every block of a cycle around SrcBB except the part of
+  // SrcBB after the setup, which the hoisted B-register would now stay live
+  // through on every trip round. MachineLoopInfo reports only natural loops,
+  // so loopHasHazard() does not see an irreducible cycle, such as one left by
+  // tail duplication giving a loop a second entry.
+  MachineBasicBlock::const_iterator AfterSetup = SetupMI.getIterator();
+  ++AfterSetup;
+  if (ReachedDest && SrcInCycle &&
+      llvm::any_of(llvm::make_range(AfterSetup, SrcBB->end()),
+                   [&](const MachineInstr &MI) {
+                     return isCycleHazard(MI, SetupMI, *TRI, OwnBranch);
+                   })) {
+    LLVM_DEBUG(dbgs() << "  [Stop] Hazard after the setup in BB#"
+                      << SrcBB->getNumber() << ", in a cycle not through BB#"
+                      << DestBB.getNumber() << "\n");
+    return false;
   }
 
   return ReachedDest;
@@ -998,14 +1072,9 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
 static bool loopHasHazard(const MachineLoop &L, const MachineInstr &SetupMI,
                           const TargetRegisterInfo &TRI,
                           const MachineInstr *OwnBranch) {
-  Register BR = SetupMI.getOperand(0).getReg();
   for (MachineBasicBlock *MBB : L.getBlocks()) {
     for (const MachineInstr &MI : *MBB) {
-      if (MI.isBMOV()) {
-        if (MI.getOperand(0).getReg() == BR)
-          continue;
-      }
-      bool IsHazard = isHoistHazard(MI, SetupMI, TRI, OwnBranch);
+      bool IsHazard = isCycleHazard(MI, SetupMI, TRI, OwnBranch);
       LLVM_DEBUG(dbgs() << "  Checking loop MI (isHazard=" << IsHazard << "): " << MI);
       if (IsHazard) {
         return true;

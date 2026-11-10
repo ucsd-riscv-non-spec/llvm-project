@@ -1,0 +1,56 @@
+# RUN: llc -mtriple=riscv64 -verify-machineinstrs \
+# RUN:   -run-pass=riscv-branch-setup-hoisting -o - %s | FileCheck %s
+# RUN: llc -mtriple=riscv64 -verify-machineinstrs \
+# RUN:   -run-pass=riscv-branch-setup-hoisting,greedy,virtregrewriter \
+# RUN:   -o - %s | FileCheck %s --check-prefix=RA
+
+# bb.1 and bb.2 form a cycle that bb.0 enters at either block, as tail
+# duplication leaves a loop whose header it copies into the predecessors.
+# MachineLoopInfo does not report such a cycle. The call's setup must still
+# stay in it: hoisted to bb.0, its B-register would be live across the call on
+# every trip round, with no call-preserved B-register to hold it, and the
+# register allocator would spill it after frame lowering.
+# CHECK-LABEL: name: call_in_irreducible_cycle
+# CHECK:       bb.0:
+# CHECK-NOT:     .Lcall
+# CHECK:       bb.1:
+# CHECK:         %1:pbr = BMOVS_J <mcsymbol .Lcall>
+# CHECK:         %1:pbr = BMOVT_I %1, $x1, 0
+# CHECK-NEXT:    PseudoPBCALL %1
+
+# RA-LABEL: name: call_in_irreducible_cycle
+# RA-NOT:     BPUSH
+# RA-NOT:     BPOP
+---
+name: call_in_irreducible_cycle
+tracksRegLiveness: true
+frameInfo:
+  isCalleeSavedInfoValid: true
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10, $x11
+    %0:pbr = BMOVS_J <mcsymbol .Lentry>
+    %0:pbr = BMOVT_J %0, %bb.2
+    %0:pbr = BMOVC_BEQ %0, $x10, $x0
+    PseudoPBC %0, %bb.2
+
+  bb.1:
+    successors: %bb.2
+    liveins: $x10, $x11
+    %1:pbr = BMOVS_J <mcsymbol .Lcall>
+    $x1 = AUIPC target-flags(riscv-call) &callee
+    %1:pbr = BMOVT_I %1, $x1, 0
+    PseudoPBCALL %1, csr_ilp32_lp64, implicit-def dead $x1, implicit-def $x2
+
+  bb.2:
+    successors: %bb.1, %bb.3
+    liveins: $x10, $x11
+    $x11 = ADDI $x11, -1
+    %2:pbr = BMOVS_J <mcsymbol .Lback>
+    %2:pbr = BMOVT_J %2, %bb.1
+    %2:pbr = BMOVC_BNE %2, $x11, $x0
+    PseudoPBC %2, %bb.1
+
+  bb.3:
+...
