@@ -137,6 +137,11 @@ static cl::opt<unsigned> MaxFunctionBranches(
     cl::desc("Do not pipeline a loop if the function could then need more "
              "branch registers than this"));
 
+static cl::opt<bool> EnableShiftRecurrences(
+    "riscv-ns-swp-shift-recurrences", cl::Hidden, cl::init(false),
+    cl::desc("Also compute ahead conditions on values shifted by a constant "
+             "every iteration, such as x >>= 1"));
+
 static cl::opt<bool> EnableSpeculativePipelining(
     "riscv-ns-swp-speculative", cl::Hidden, cl::init(false),
     cl::desc("Also pipeline loops without a computable trip count when the "
@@ -158,9 +163,16 @@ namespace {
 struct InductionVar {
   PHINode *Phi;
   Value *Start;
+  /// Null for a shift recurrence.
   const SCEV *Step;
   /// Step, materialized in the preheader.
   Value *StepV = nullptr;
+  /// For a shift recurrence, whose value in iteration I is Start shifted by
+  /// I * ShiftAmount: the shift (LShr, AShr or Shl) and its amount.
+  Instruction::BinaryOps ShiftOp = Instruction::BinaryOpsEnd;
+  unsigned ShiftAmount = 0;
+
+  bool isShift() const { return ShiftOp != Instruction::BinaryOpsEnd; }
 };
 
 /// A branch whose condition the pipelined loop computes ahead of it.
@@ -383,8 +395,32 @@ RISCVBranchConditionPipelining::findInductionVar(LoopPlan &P, PHINode *Phi) {
   if (Phi->getParent() != P.Header || !SE->isSCEVable(Phi->getType()))
     return std::nullopt;
   auto *AR = dyn_cast<SCEVAddRecExpr>(SE->getSCEV(Phi));
-  if (!AR || AR->getLoop() != P.L || !AR->isAffine())
-    return std::nullopt;
+  if (!AR || AR->getLoop() != P.L || !AR->isAffine()) {
+    // x = x >> c (or x << c), the same constant every iteration: in iteration
+    // I it is x shifted by I * c, so it can be advanced like an affine one.
+    using namespace PatternMatch;
+    Value *Next = Phi->getNumIncomingValues() == 2
+                      ? Phi->getIncomingValueForBlock(P.Latch)
+                      : nullptr;
+    auto *Shift = dyn_cast_or_null<BinaryOperator>(Next);
+    const APInt *C;
+    unsigned Width = Phi->getType()->getScalarSizeInBits();
+    if (!EnableShiftRecurrences || !Phi->getType()->isIntegerTy() || !Shift ||
+        !P.L->contains(Shift) ||
+        (Shift->getOpcode() != Instruction::LShr &&
+         Shift->getOpcode() != Instruction::AShr &&
+         Shift->getOpcode() != Instruction::Shl) ||
+        Shift->getOperand(0) != Phi ||
+        !match(Shift->getOperand(1), m_APInt(C)) || C->isZero() ||
+        C->uge(Width))
+      return std::nullopt;
+    InductionVar IV = {Phi, Phi->getIncomingValueForBlock(P.Preheader),
+                       nullptr, nullptr};
+    IV.ShiftOp = Shift->getOpcode();
+    IV.ShiftAmount = C->getZExtValue();
+    P.IVs.push_back(IV);
+    return P.IVs.size() - 1;
+  }
   const SCEV *Step = AR->getStepRecurrence(*SE);
   SCEVExpander Expander(*SE, *DL, "swp");
   if (!isa<SCEVConstant>(Step) &&
@@ -873,7 +909,8 @@ void RISCVBranchConditionPipelining::materializeValues(LoopPlan &P) {
   for (const PipelinedBranch &PB : P.Branches)
     Used.insert(PB.IVs.begin(), PB.IVs.end());
   for (auto [Idx, IV] : enumerate(P.IVs)) {
-    if (!Used.contains(Idx))
+    // A shift recurrence has no step to materialize.
+    if (!Used.contains(Idx) || IV.isShift())
       continue;
     if (auto *C = dyn_cast<SCEVConstant>(IV.Step))
       IV.StepV = C->getValue();
@@ -889,6 +926,22 @@ static Value *advanceInductionVar(IRBuilder<> &B, const InductionVar &IV,
                                   const Twine &Name) {
   if (Iterations == 0)
     return Base;
+  if (IV.isShift()) {
+    // Shifting by a then by b is shifting by a + b, and a shift by the width
+    // or more leaves nothing of a logical shift and only the sign of an
+    // arithmetic one. The shift emitted is therefore always less than the
+    // width, which keeps it safe to compute for any iteration.
+    Type *Ty = Base->getType();
+    unsigned Width = Ty->getScalarSizeInBits();
+    uint64_t Total = uint64_t(IV.ShiftAmount) * Iterations;
+    if (Total >= Width) {
+      if (IV.ShiftOp != Instruction::AShr)
+        return Constant::getNullValue(Ty);
+      Total = Width - 1;
+    }
+    assert(Total > 0 && Total < Width && "shift out of range");
+    return B.CreateBinOp(IV.ShiftOp, Base, ConstantInt::get(Ty, Total), Name);
+  }
   Value *Offset = B.CreateMul(
       IV.StepV, ConstantInt::get(IV.StepV->getType(), Iterations));
   if (Base->getType()->isPointerTy())
