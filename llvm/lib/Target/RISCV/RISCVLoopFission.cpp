@@ -243,12 +243,23 @@ bool RISCVLoopFissionDecomposedBranch::buildSlice(
   SmallPtrSet<MachineInstr *, 16> Seen;
   SmallVector<Register, 8> Work;
   BatchAAResults BAA(*AA);
-  auto push = [&](MachineInstr &MI) {
-    for (MachineOperand &MO : MI.uses())
-      if (MO.isReg() && MO.getReg().isVirtual())
-        Work.push_back(MO.getReg());
+  auto enqueue = [&](Register Reg) {
+    if (Reg.isPhysical())
+      return Reg == RISCV::X0;
+    if (Reg.isVirtual())
+      Work.push_back(Reg);
+    return true;
   };
-  push(Br);
+  auto push = [&](MachineInstr &MI) {
+    for (const MachineOperand &MO : MI.uses())
+      if (MO.isReg() && !enqueue(MO.getReg()))
+        return false;
+    return true;
+  };
+  // The compute loop cannot reuse a physical value produced during the
+  // consume loop (for example, a call result still in a0).
+  if (!push(Br))
+    return false;
   while (!Work.empty()) {
     MachineInstr *Def = MRI.getVRegDef(Work.pop_back_val());
 
@@ -268,8 +279,9 @@ bool RISCVLoopFissionDecomposedBranch::buildSlice(
         return false; // merge inside body
       // follow only the latch operand
       for (unsigned i = 1; i < Def->getNumOperands(); i += 2)
-        if (Def->getOperand(i + 1).getMBB() == Latch)
-          Work.push_back(Def->getOperand(i).getReg());
+        if (Def->getOperand(i + 1).getMBB() == Latch &&
+            !enqueue(Def->getOperand(i).getReg()))
+          return false;
     } else {
       if (Def->mayStore() || Def->isCall() || Def->hasUnmodeledSideEffects())
         return false;
@@ -278,7 +290,8 @@ bool RISCVLoopFissionDecomposedBranch::buildSlice(
           for (MachineInstr &S : *B)
             if (S.mayStore() && S.mayAlias(AA, *Def, /*UseTBAA=*/true))
               return false; // memory dependence
-      push(*Def);
+      if (!push(*Def))
+        return false;
     }
     Slice.push_back(Def);
   }
