@@ -46,6 +46,11 @@ static cl::opt<unsigned> MaxHoistFreqRatio(
              "than this many times as often as its own (0 for no limit)"),
     cl::init(2));
 
+static cl::opt<bool> DisableHoistFreqFromBest(
+    "riscv-ns-disable-hoist-freq-from-best", cl::Hidden, cl::init(false),
+    cl::desc("Compare a hoist point's frequency with the setup's own block, "
+             "instead of with the coolest point it was already hoisted to"));
+
 static cl::opt<bool> DisableBranchRegHints(
     "riscv-ns-disable-branch-reg-hints", cl::Hidden,
     cl::desc("Leave the B-register of each branch to the register allocator, "
@@ -56,6 +61,9 @@ STATISTIC(NumBMOVHoisted, "Number of BMOV instructions able to be hoisted");
 STATISTIC(NumBMOVSLimited,
           "Number of BMOVS hoisted less far to keep enough B-registers free");
 STATISTIC(NumBRegHints, "Number of branches given a preferred B-register");
+STATISTIC(NumHoistPointsTooHotFromBest,
+          "Number of hoist points rejected for running too often compared "
+          "with a point the setup was already hoisted to");
 
 namespace {
 
@@ -1092,6 +1100,10 @@ RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
   SmallVector<HoistPoint, 8> Points;
   MachineBasicBlock *CurBB = SetupMI.getParent();
   MachineBasicBlock::iterator SafePoint;
+  // How often the setup runs where it is, so far: its own block, then the
+  // coolest point it has been hoisted to. Out of a loop body, that is the
+  // preheader, not the body, whose frequency includes the trip count.
+  BlockFrequency Ref = MBFI->getBlockFreq(CurBB);
 
   bool HazardFound = false;
 
@@ -1144,10 +1156,17 @@ RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
     // such as the test before a rarely taken path, as the setups of that path
     // would then run whether it is taken or not.
     bool TooHot = false;
-    if (MaxHoistFreqRatio)
-      if (std::optional<BlockFrequency> Limit =
-              MBFI->getBlockFreq(CurBB).mul(MaxHoistFreqRatio))
+    if (MaxHoistFreqRatio) {
+      BlockFrequency Base =
+          DisableHoistFreqFromBest ? MBFI->getBlockFreq(CurBB) : Ref;
+      if (std::optional<BlockFrequency> Limit = Base.mul(MaxHoistFreqRatio))
         TooHot = MBFI->getBlockFreq(IDom) > *Limit;
+      if (TooHot && !DisableHoistFreqFromBest)
+        if (std::optional<BlockFrequency> Own =
+                MBFI->getBlockFreq(CurBB).mul(MaxHoistFreqRatio))
+          if (MBFI->getBlockFreq(IDom) <= *Own)
+            ++NumHoistPointsTooHotFromBest;
+    }
 
     MachineBasicBlock::reverse_iterator IDomScanStart = IDom->rbegin();
     while (IDomScanStart != IDom->rend() && IDomScanStart->isTerminator())
@@ -1187,7 +1206,23 @@ RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
     } else {
       LLVM_DEBUG(dbgs() << "  [Cross-BB] Can hoist into BB#"
                         << IDom->getNumber() << "\n");
+#ifndef NDEBUG
+      // Recomputed from the points themselves, not from Ref: a point accepted
+      // runs at most MaxHoistFreqRatio times as often as the setup's own
+      // block and as every point accepted before it.
+      if (MaxHoistFreqRatio && !DisableHoistFreqFromBest) {
+        BlockFrequency Coolest = MBFI->getBlockFreq(CurBB);
+        for (const HoistPoint &P : Points)
+          Coolest = std::min(Coolest, MBFI->getBlockFreq(P.first));
+        if (std::optional<BlockFrequency> Limit =
+                Coolest.mul(MaxHoistFreqRatio))
+          assert(MBFI->getBlockFreq(IDom) <= *Limit &&
+                 "Hoist point runs too often for an earlier point");
+      }
+#endif
       Points.push_back({IDom, IDomSafePoint});
+      if (MBFI->getBlockFreq(IDom) < Ref)
+        Ref = MBFI->getBlockFreq(IDom);
     }
     BB = IDom;
 

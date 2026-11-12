@@ -21,9 +21,21 @@
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/MC/MCContext.h"
+#include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
+
+#define DEBUG_TYPE "riscv-expand-pseudo"
+
+static cl::opt<bool> DisableSplitExitJumps(
+    "riscv-ns-disable-split-exit-jumps", cl::Hidden, cl::init(false),
+    cl::desc("Leave the setup and jump that follow a conditional PB in the "
+             "conditional's block, instead of giving them a block of their own"));
+
+STATISTIC(NumExitJumpsSplit,
+          "Number of jumps after a conditional PB moved to their own block");
 
 #define RISCV_EXPAND_PSEUDO_NAME "RISC-V pseudo instruction expansion pass"
 #define RISCV_PRERA_EXPAND_PSEUDO_NAME "RISC-V Pre-RA pseudo instruction expansion pass"
@@ -71,6 +83,7 @@ private:
                       MachineBasicBlock::iterator MBBI, bool IsCall) const;
   bool expandLoopEnd(MachineBasicBlock &MBB,
                      MachineBasicBlock::iterator MBBI);
+  bool splitJumpsAfterCondBranches(MachineFunction &MF);
   void collectLoopSetups(MachineFunction &MF);
   void collectCondQueues(MachineFunction &MF);
   bool expandCondQueueOp(MachineBasicBlock &MBB,
@@ -158,11 +171,93 @@ bool RISCVExpandPseudo::runOnMachineFunction(MachineFunction &MF) {
   bool Modified = false;
   for (auto &MBB : MF)
     Modified |= expandMBB(MBB);
+  if (!DisableSplitExitJumps)
+    Modified |= splitJumpsAfterCondBranches(MF);
 
 #ifndef NDEBUG
   const unsigned NewSize = getInstSizeInBytes(MF);
   assert(OldSize >= NewSize);
 #endif
+  return Modified;
+}
+
+/// A block that ends in a conditional branch and a jump expands to
+///
+///   PseudoPBC %a, %bb.taken
+///   %b = BMOVS_J ; %b = BMOVT_J %b, %bb.other
+///   PseudoPBU %b, %bb.other
+///
+/// The jump's setup comes after a terminator, which is not valid MIR, and the
+/// hoisting pass would move it above the PseudoPBC, where it runs whenever the
+/// block runs. In a loop latch, that is every iteration, while the jump runs
+/// once, when the loop exits. Moving the setup and the jump into a block of
+/// their own, placed right after, keeps them on the path that takes the jump:
+/// the emitted code is in the same order, and the hoisting pass then judges
+/// the setup by how often the jump runs.
+bool RISCVExpandPseudo::splitJumpsAfterCondBranches(MachineFunction &MF) {
+  SmallVector<MachineBasicBlock *, 16> Blocks;
+  for (MachineBasicBlock &MBB : MF)
+    Blocks.push_back(&MBB);
+
+  bool Modified = false;
+  for (MachineBasicBlock *MBB : Blocks) {
+    // From the end: the jump, its BMOVT_J and BMOVS_J, and right before them
+    // the conditional branch. getFirstTerminator() cannot find that one: it
+    // only sees the terminators at the very end, and the setup is in between.
+    MachineBasicBlock::iterator Jump = MBB->getLastNonDebugInstr();
+    if (Jump == MBB->end() || Jump->getOpcode() != RISCV::PseudoPBU ||
+        Jump == MBB->begin())
+      continue;
+    MachineBasicBlock::iterator T = prev_nodbg(Jump, MBB->begin());
+    if (T->getOpcode() != RISCV::BMOVT_J || T == MBB->begin())
+      continue;
+    MachineBasicBlock::iterator S = prev_nodbg(T, MBB->begin());
+    if (S->getOpcode() != RISCV::BMOVS_J || S == MBB->begin())
+      continue;
+    MachineBasicBlock::iterator CondBr = prev_nodbg(S, MBB->begin());
+    if (CondBr->getOpcode() != RISCV::PseudoPBC)
+      continue;
+    Register BReg = Jump->getOperand(0).getReg();
+    MachineBasicBlock *Dest = Jump->getOperand(1).getMBB();
+    if (S->getOperand(0).getReg() != BReg ||
+        T->getOperand(0).getReg() != BReg || T->getOperand(2).getMBB() != Dest)
+      continue;
+    // Both edges to one block share a successor entry, which could not be
+    // given to the new block alone.
+    MachineBasicBlock *Taken = CondBr->getOperand(1).getMBB();
+    if (Taken == Dest || Dest->isEHPad() || !MBB->isSuccessor(Dest))
+      continue;
+
+    MachineBasicBlock *JumpMBB = MF.CreateMachineBasicBlock(MBB->getBasicBlock());
+    MF.insert(std::next(MBB->getIterator()), JumpMBB);
+    JumpMBB->splice(JumpMBB->end(), MBB, S, MBB->end());
+    // The fall-through edge keeps its probability; the new block always jumps.
+    MBB->replaceSuccessor(Dest, JumpMBB);
+    JumpMBB->addSuccessor(Dest);
+    // The new block uses and defines no physical register: what is live into
+    // the jump's destination is live through it.
+    for (const MachineBasicBlock::RegisterMaskPair &LI : Dest->liveins())
+      JumpMBB->addLiveIn(LI);
+    JumpMBB->sortUniqueLiveIns();
+    assert(MBB->succ_size() == 2 && MBB->isSuccessor(Taken) &&
+           MBB->isSuccessor(JumpMBB) && !MBB->isSuccessor(Dest) &&
+           "the conditional's block must branch to its target and fall "
+           "through to the jump's block");
+    assert(MBB->isLayoutSuccessor(JumpMBB) &&
+           "the jump's block must follow the conditional's block");
+    assert(JumpMBB->succ_size() == 1 && JumpMBB->isSuccessor(Dest) &&
+           JumpMBB->pred_size() == 1 &&
+           "the jump's block must only be entered from the conditional's "
+           "block and only lead to the jump's destination");
+    assert(llvm::count_if(*JumpMBB, [](const MachineInstr &MI) {
+             return !MI.isDebugInstr();
+           }) == 3 &&
+           JumpMBB->getFirstNonDebugInstr()->getOpcode() == RISCV::BMOVS_J &&
+           JumpMBB->getLastNonDebugInstr()->getOpcode() == RISCV::PseudoPBU &&
+           "the jump's block must hold only the jump and its setup");
+    ++NumExitJumpsSplit;
+    Modified = true;
+  }
   return Modified;
 }
 
