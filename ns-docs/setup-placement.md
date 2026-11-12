@@ -1,4 +1,4 @@
-# Branch setup placement (`-riscv-ns-disable-split-exit-jumps`, ...)
+# Branch setup placement (`-riscv-ns-disable-split-exit-jumps`, `-riscv-ns-disable-hoist-freq-from-best`)
 
 Record of changes to where branch setups end up, and of how each was verified. Branch `setup-placement`, on top of `non-spec` at `23c5fa3fc5cb`. Started 2026-11-11.
 
@@ -23,8 +23,9 @@ Two placement problems cause much of this:
 1. **The exit jump of a loop runs its setup on every iteration** (this change, change 3). When a loop's branch does not lead to the block placed after the loop, the loop leaves through a jump. Its setup ends up in the loop's last block, which runs every iteration, while the jump runs once.
    - `bitcount`'s `main`: 1.05M of its 2.10M extra instructions.
    - `dijkstra`'s relax loop: about 3M.
-2. **A rarely entered loop's setups are hoisted to the function entry** (change 4, next). The hoisting pass's frequency guard compares against the frequency of the setup's own block, which inside a loop includes the trip count.
+2. **A rarely entered loop's setups are hoisted to the function entry** (change 4). The hoisting pass's frequency guard compares against the frequency of the setup's own block, which inside a loop includes the trip count.
    - musl's `memcpy` sets up the branches of its unaligned-copy loops on every call: about 18 wasted setups per call, 3.6M instructions in `qsort`.
+   - Most of those turned out to be exit-jump setups, which change 3 already keeps out of the entry, so change 4 has much less left to do than this estimate (section 9).
 
 ## 2. Change 3: the exit jump and its setup get a block of their own
 
@@ -76,7 +77,7 @@ In `RISCVExpandPseudoInsts.cpp`, about 90 lines, a new step `splitJumpsAfterCond
 - `cmpall.sh A B` compares every musl object and archive, compiler-rt object and program, with `.comment` removed.
 
 **Results:**
-- **Unmodified compiler against the new one with `-riscv-ns-disable-split-exit-jumps`:** 1,536 of 1,536 files identical.
+- **Unmodified compiler against the new one with `-riscv-ns-disable-split-exit-jumps`:** 1,544 of 1,544 files identical.
 - **The new compiler with the change on:**
   - the 13 non-spec tests pass;
   - the RISC-V suite fails the same 1,684 of 2,223 tests, by name, as the unmodified compiler (the fork's branches break upstream tests; see `swp-speculative.md` 4.3);
@@ -175,7 +176,7 @@ The baseline (`bse`) and change-3 (`on3`) builds of musl, compiler-rt and the 8 
 
 ## 7. Change 3, layer 5: checks inside the pass
 
-- With the asserts active, musl, compiler-rt and the 8 programs are rebuilt: 1,536 of 1,536 files are identical to the build without them, so none fires.
+- With the asserts active, musl, compiler-rt and the 8 programs are rebuilt: 1,544 of 1,544 files are identical to the build without them, so none fires.
 - **Do they fire:**
 
   | Mistake | Result |
@@ -185,9 +186,119 @@ The baseline (`bse`) and change-3 (`on3`) builds of musl, compiler-rt and the 8 
 
 - The pass was restored byte-identical from `l5/pass.layer5.cpp`; 15 of 15 non-spec tests pass.
 
-## 8. Files
+**Correction (found during change 4).** `cmpall.sh` selected the programs with `-path '*/apps/*'`, which never matches the relative paths it lists, so the 8 programs were left out of every comparison above, and the totals said 1,536. With the pattern fixed to `apps/*`, the comparisons of sections 3 and 7 were redone: 1,544 of 1,544 identical in both (the numbers above are the corrected ones).
 
-- `llvm/lib/Target/RISCV/RISCVExpandPseudoInsts.cpp`
+## 8. Change 4: compare a hoist point with the coolest point reached
+
+### 8.1 What happened before
+
+`RISCVBranchSetupHoisting::findHoistPoints` walks up the dominator tree from the setup and accepts each dominator as a hoist point, unless it runs more than `-riscv-ns-hoist-max-freq-ratio` (2) times as often as **the setup's own block**. The setup goes to the furthest point accepted.
+
+For a setup in a loop body, that block's frequency includes the trip count. A loop entered 1 time in 16 with 32 iterations has a body frequency of 2 per call, against the entry's 1, so the entry is accepted, and the setup runs on every call, whether or not the loop is entered. The preheader in between runs 1/16 per call.
+
+### 8.2 What was changed
+
+In `RISCVBranchSetupHoisting.cpp`, about 20 lines. On unless `-riscv-ns-disable-hoist-freq-from-best` is given, with the statistic `NumHoistPointsTooHotFromBest` (points this change rejects that the old rule would have accepted).
+
+- `findHoistPoints` keeps `Ref`, the lowest frequency among the setup's own block and every point accepted so far, and compares each candidate with `Ref` instead of with the setup's block.
+- In the example, the preheader (1/16) is accepted and becomes `Ref`. The entry (1) is more than twice that, so it is passed, and the setup stays in the preheader.
+- A point that is passed does not end the walk, as before. A cooler block further up can still be accepted.
+- `Ref` only goes down, so a point accepted later is never more than twice as hot as any earlier one.
+- **Check in assertion builds:** when a point is accepted, the lowest frequency is recomputed from the setup's block and the points already in the list, independently of `Ref`, and the new point must be within the ratio of it.
+
+## 9. Change 4, layer 1: nothing changes with the flag given
+
+All with the final compiler (assertion build):
+
+| Comparison | Result |
+|---|---|
+| Change 3 (`on3`) against change 4 with `-riscv-ns-disable-hoist-freq-from-best` | 1,544 of 1,544 files identical |
+| RISC-V lit suite | the same 1,684 of 2,227 failing tests, by name, as the unmodified compiler; the two new tests pass |
+| Non-spec tests (`ns-*`, `branch-setup-*`) | 17 of 17 pass |
+| Change 3 against change 4 on | 86 files differ (73 musl objects, and all 8 programs) |
+
+Over musl, the change rejects 1,956 hoist points that the old rule accepted.
+
+What the 86 files show: only setups moving between neighbouring blocks. In `memcpy`, which motivated the change, it does nothing: change 3 had already moved the exit-jump setups that reached its entry.
+
+## 10. Change 4, layer 2: tests
+
+Two new files.
+
+**`ns-hoist-freq-from-best.mir`** runs `riscv-branch-setup-hoisting` alone, with the change on and off:
+
+| Function | Checks |
+|---|---|
+| `rare_loop` (loop entered 1 time in 16, 32 iterations) | The loop's `BMOVS`/`BMOVT` go to the preheader, not the entry, and none are left in the body. Off: they go to the entry. |
+| `common_loop` (the same loop, entered 3 times in 4) | The setups still go to the entry: the entry is within twice the preheader. |
+| `coolest_not_last` (a chain: entry 1, `bb.1` 0.25, `bb.2` 0.15, preheader 0.09) | The setups end in `bb.2`. `bb.1` is within twice `bb.2`, the last point accepted, but not twice the preheader, the coolest. Off: the entry. |
+
+**`ns-hoist-freq-from-best-asm.ll`** runs full `llc -O2 -mattr=+m` on the same two loops, written in IR with branch weights and with a data-dependent branch in the body. The loop itself is a hardware loop, whose setups the hardware-loop pass already puts in the preheader, so the test checks the inner branch's setup (`.Lns_bge_`):
+- `rare_loop`: in the preheader, not the entry. Off: in the entry.
+- `common_loop`: in the entry, both ways.
+
+**Mutation testing.** The pass was broken three ways, `llc` rebuilt each time, and lit's exit code used:
+
+| Mistake | `.mir` test | asm test |
+|---|---|---|
+| Compare with the setup's own block (the old rule) | caught | caught |
+| `Ref` is the last point accepted, not the coolest | caught | not caught (only one step in it) |
+| `Ref` never updated | caught | caught |
+
+The pass was restored byte-identical from `l2c4/pass.layer2.cpp`.
+
+**What did not go as planned:**
+- The mutation script printed `$?` after a `$(basename ...)` in the same `echo`, which reset it, so the first run reported every mutation as passing. Checked by hand, fixed to save the exit code first, and rerun; the table is from the rerun.
+- The first asm test used a loop without an inner branch; its setups start in the preheader (hardware loop), so the change had nothing to move.
+
+## 11. Change 4, layer 3: interplay
+
+- **Queues:** `ns-branch-condition-pipelining-speculative-asm.ll` and `-shift-asm.ll` still pass (among the 17 above).
+- **Machine verifier**, on all of musl with `-mllvm -verify-machineinstrs` (`hoistfix/l3/verify.sh`, now with `make -O` so the logs of parallel compiles are not interleaved):
+
+  | | Change 4 off | Change 4 on |
+  |---|---|---|
+  | "Expected implicit register after groups" (the inline-asm problem of section 5) | 602, in 329 files | 602, in the same functions |
+  | Any other error | 0 | 0 |
+
+## 12. Change 4, layer 4: gem5
+
+Built and run as in section 6, change 4 (`on4`) against change 3 (`on3`), on gem5 `a4485a886e` with that commit's core config (before the L1-I prefetcher and the 32-entry fetch queue of `5a358108ea`).
+
+**Outputs:** identical to vanilla in all 8 programs (sha as always). The leak is unchanged (0, or 2 in bitcount).
+
+| Program | Committed instructions | Cycles |
+|---|---|---|
+| stringsearch | -1.43% | -2.11% |
+| basicmath | -0.41% | -0.36% |
+| patricia | -0.33% | +0.59% |
+| qsort | -0.09% | -0.53% |
+| dijkstra | -0.06% | +0.34% |
+| bitcount | -0.00% | -0.00% |
+| susan | -0.01% | +0.02% |
+| sha | -0.00% | -0.00% (unreliable) |
+
+- Committed instructions go down or stay flat in every program; cycle changes under about 1.5% are within the code-placement noise described in section 6.
+- The final compiler's build (`on6`, with the assertion) is byte-identical to `on4`, so these numbers hold for it.
+
+## 13. Change 4, layer 5: checks inside the pass
+
+- With the assertion active, musl, compiler-rt and the 8 programs are rebuilt (`on6`): 1,544 of 1,544 files are identical to the build without it (`on4`), and it does not fire.
+- **Does it fire:**
+
+  | Mistake | Result |
+  |---|---|
+  | `Ref` is the last point accepted, not the coolest | The assertion fires (on `coolest_not_last`) |
+  | `Ref` never updated | The assertion fires (on `rare_loop`) |
+
+- The pass was restored byte-identical from `l2c4/l5/pass.layer5.cpp`; 17 of 17 non-spec tests pass.
+
+## 14. Files
+
+- `llvm/lib/Target/RISCV/RISCVExpandPseudoInsts.cpp` (change 3)
+- `llvm/lib/Target/RISCV/RISCVBranchSetupHoisting.cpp` (change 4)
 - `llvm/test/CodeGen/RISCV/ns-split-exit-jumps.mir`
 - `llvm/test/CodeGen/RISCV/ns-split-exit-jumps-asm.ll`
+- `llvm/test/CodeGen/RISCV/ns-hoist-freq-from-best.mir`
+- `llvm/test/CodeGen/RISCV/ns-hoist-freq-from-best-asm.ll`
 - `ns-docs/setup-placement.md`

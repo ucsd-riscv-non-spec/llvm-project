@@ -1,0 +1,165 @@
+# RUN: llc -mtriple=riscv64 -verify-machineinstrs \
+# RUN:   -run-pass=riscv-branch-setup-hoisting -o - %s | FileCheck %s
+# RUN: llc -mtriple=riscv64 -verify-machineinstrs \
+# RUN:   -run-pass=riscv-branch-setup-hoisting \
+# RUN:   -riscv-ns-disable-hoist-freq-from-best -o - %s \
+# RUN:   | FileCheck %s --check-prefix=OFF
+
+# The frequency guard compares a hoist point with the coolest point the setup
+# was already hoisted to, not with the setup's own block. A loop body's
+# frequency includes the trip count, so measured against it, a loop that is
+# rarely entered would have its setups hoisted to the function entry, and run
+# on every call.
+
+# Entered 1 time in 16, 32 iterations: the body runs twice per call, the
+# preheader 1/16. The entry is more than twice as hot as the preheader.
+# CHECK-LABEL: name: rare_loop
+# CHECK:       bb.0:
+# CHECK-NOT:     .Lrare_body
+# CHECK:         PseudoPBC
+# CHECK:       bb.1:
+# CHECK:         %[[R:[0-9]+]]:pbr = BMOVS_J <mcsymbol .Lrare_body>
+# CHECK-NEXT:    %[[R]]:pbr = BMOVT_J %[[R]], %bb.2
+# CHECK:       bb.2:
+# CHECK-NOT:     BMOVS
+# CHECK-NOT:     BMOVT
+# CHECK:         PseudoPBC %[[R]], %bb.2
+# OFF-LABEL:   name: rare_loop
+# OFF:         bb.0:
+# OFF:           %[[R:[0-9]+]]:pbr = BMOVS_J <mcsymbol .Lrare_body>
+# OFF-NEXT:      %[[R]]:pbr = BMOVT_J %[[R]], %bb.2
+# OFF:         bb.1:
+# OFF-NOT:       BMOVS
+# OFF:         bb.2:
+# OFF-NOT:       BMOVS
+# OFF:           PseudoPBC %[[R]], %bb.2
+---
+name: rare_loop
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.3(0x78000000), %bb.1(0x08000000)
+    liveins: $x10, $x11
+    %9:pbr = BMOVS_J <mcsymbol .Lrare_skip>
+    %9:pbr = BMOVT_J %9, %bb.3
+    %9:pbr = BMOVC_BEQ %9, $x11, $x0
+    PseudoPBC %9, %bb.3
+
+  bb.1:
+    successors: %bb.2
+    liveins: $x10
+
+  bb.2:
+    successors: %bb.2(0x7c000000), %bb.3(0x04000000)
+    liveins: $x10
+    $x10 = ADDI $x10, -1
+    %0:pbr = BMOVS_J <mcsymbol .Lrare_body>
+    %0:pbr = BMOVT_J %0, %bb.2
+    %0:pbr = BMOVC_BNE %0, $x10, $x0
+    PseudoPBC %0, %bb.2
+
+  bb.3:
+...
+
+# The same loop, entered 3 times in 4: the entry is within twice the
+# preheader, so the setups still go to the entry.
+# CHECK-LABEL: name: common_loop
+# CHECK:       bb.0:
+# CHECK:         %[[R:[0-9]+]]:pbr = BMOVS_J <mcsymbol .Lcommon_body>
+# CHECK-NEXT:    %[[R]]:pbr = BMOVT_J %[[R]], %bb.2
+# CHECK:       bb.1:
+# CHECK-NOT:     BMOVS
+# CHECK:       bb.2:
+# CHECK-NOT:     BMOVS
+# CHECK:         PseudoPBC %[[R]], %bb.2
+---
+name: common_loop
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.3(0x20000000), %bb.1(0x60000000)
+    liveins: $x10, $x11
+    %9:pbr = BMOVS_J <mcsymbol .Lcommon_skip>
+    %9:pbr = BMOVT_J %9, %bb.3
+    %9:pbr = BMOVC_BEQ %9, $x11, $x0
+    PseudoPBC %9, %bb.3
+
+  bb.1:
+    successors: %bb.2
+    liveins: $x10
+
+  bb.2:
+    successors: %bb.2(0x7c000000), %bb.3(0x04000000)
+    liveins: $x10
+    $x10 = ADDI $x10, -1
+    %0:pbr = BMOVS_J <mcsymbol .Lcommon_body>
+    %0:pbr = BMOVT_J %0, %bb.2
+    %0:pbr = BMOVC_BNE %0, $x10, $x0
+    PseudoPBC %0, %bb.2
+
+  bb.3:
+...
+
+# The reference is the coolest point so far, not the last one. Frequencies:
+# bb.0 1, bb.1 0.25, bb.2 0.15, bb.3 (preheader) 0.09, bb.4 (body) 2.9.
+# bb.3 and bb.2 are accepted (0.15 <= 2 x 0.09). bb.1 is within twice bb.2
+# but not twice bb.3, so it is passed; so is bb.0. The setups end in bb.2.
+# CHECK-LABEL: name: coolest_not_last
+# CHECK:       bb.0:
+# CHECK-NOT:     .Lchain_body
+# CHECK:       bb.1:
+# CHECK-NOT:     .Lchain_body
+# CHECK:       bb.2:
+# CHECK:         %[[R:[0-9]+]]:pbr = BMOVS_J <mcsymbol .Lchain_body>
+# CHECK-NEXT:    %[[R]]:pbr = BMOVT_J %[[R]], %bb.4
+# CHECK:       bb.3:
+# CHECK-NOT:     BMOVS
+# CHECK:       bb.4:
+# CHECK-NOT:     BMOVS
+# CHECK:         PseudoPBC %[[R]], %bb.4
+# OFF-LABEL:   name: coolest_not_last
+# OFF:         bb.0:
+# OFF:           %[[R:[0-9]+]]:pbr = BMOVS_J <mcsymbol .Lchain_body>
+---
+name: coolest_not_last
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.5(0x60000000), %bb.1(0x20000000)
+    liveins: $x10, $x11, $x12, $x13
+    %7:pbr = BMOVS_J <mcsymbol .Lchain_0>
+    %7:pbr = BMOVT_J %7, %bb.5
+    %7:pbr = BMOVC_BEQ %7, $x11, $x0
+    PseudoPBC %7, %bb.5
+
+  bb.1:
+    successors: %bb.5(0x33333333), %bb.2(0x4ccccccd)
+    liveins: $x10, $x12, $x13
+    %8:pbr = BMOVS_J <mcsymbol .Lchain_1>
+    %8:pbr = BMOVT_J %8, %bb.5
+    %8:pbr = BMOVC_BEQ %8, $x12, $x0
+    PseudoPBC %8, %bb.5
+
+  bb.2:
+    successors: %bb.5(0x33333333), %bb.3(0x4ccccccd)
+    liveins: $x10, $x13
+    %9:pbr = BMOVS_J <mcsymbol .Lchain_2>
+    %9:pbr = BMOVT_J %9, %bb.5
+    %9:pbr = BMOVC_BEQ %9, $x13, $x0
+    PseudoPBC %9, %bb.5
+
+  bb.3:
+    successors: %bb.4
+    liveins: $x10
+
+  bb.4:
+    successors: %bb.4(0x7c000000), %bb.5(0x04000000)
+    liveins: $x10
+    $x10 = ADDI $x10, -1
+    %0:pbr = BMOVS_J <mcsymbol .Lchain_body>
+    %0:pbr = BMOVT_J %0, %bb.4
+    %0:pbr = BMOVC_BNE %0, $x10, $x0
+    PseudoPBC %0, %bb.4
+
+  bb.5:
+...
