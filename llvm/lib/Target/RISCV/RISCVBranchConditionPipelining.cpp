@@ -58,6 +58,13 @@
 // entered. The clones drop flags such as nsw, which an iteration that never
 // runs could violate.
 //
+// With -riscv-ns-swp-toggles, a value flipped every iteration (x = !x, or
+// x ^= m for an invariant m) can be computed ahead like an induction
+// variable, and a branch may test it directly. Such a value repeats every two
+// iterations whether or not those iterations run, so a loop whose pipelined
+// conditions read nothing else is also pipelined in place, even if it has a
+// trip count. Its latch stays a counted exit.
+//
 // The queue operations are the llvm.riscv.ns.cond.* intrinsics. Instruction
 // selection turns them into PseudoNSQ* instructions, which RISCVExpandPseudo
 // assigns a branch register.
@@ -142,6 +149,12 @@ static cl::opt<bool> EnableShiftRecurrences(
     cl::desc("Also compute ahead conditions on values shifted by a constant "
              "every iteration, such as x >>= 1"));
 
+static cl::opt<bool> EnableToggles(
+    "riscv-ns-swp-toggles", cl::Hidden, cl::init(false),
+    cl::desc("Also compute ahead conditions on values flipped every "
+             "iteration, such as x = !x, in place when a loop's conditions "
+             "read nothing else"));
+
 static cl::opt<bool> EnableSpeculativePipelining(
     "riscv-ns-swp-speculative", cl::Hidden, cl::init(false),
     cl::desc("Also pipeline loops without a computable trip count when the "
@@ -160,6 +173,9 @@ STATISTIC(NumBranchesPipelined, "Number of branches given a condition queue");
 STATISTIC(NumLoopsPipelinedSpeculatively,
           "Number of loops without a trip count whose conditions were "
           "pipelined");
+STATISTIC(NumToggleLoopsPipelined,
+          "Number of loops with a trip count whose toggle conditions were "
+          "pipelined in place");
 
 /// The FIFO of a branch register holds 63 conditions, and a pipelined
 /// branch's holds its distance plus the one pushed before it is popped.
@@ -171,7 +187,7 @@ namespace {
 struct InductionVar {
   PHINode *Phi;
   Value *Start;
-  /// Null for a shift recurrence.
+  /// Null for a shift recurrence or a toggle.
   const SCEV *Step;
   /// Step, materialized in the preheader.
   Value *StepV = nullptr;
@@ -180,7 +196,12 @@ struct InductionVar {
   Instruction::BinaryOps ShiftOp = Instruction::BinaryOpsEnd;
   unsigned ShiftAmount = 0;
 
+  /// For a toggle, whose value in iteration I is Start for even I and
+  /// Start ^ ToggleMask for odd I: the loop-invariant mask.
+  Value *ToggleMask = nullptr;
+
   bool isShift() const { return ShiftOp != Instruction::BinaryOpsEnd; }
+  bool isToggle() const { return ToggleMask != nullptr; }
 };
 
 /// A branch whose condition the pipelined loop computes ahead of it.
@@ -203,14 +224,15 @@ struct LoopPlan {
   BasicBlock *Latch;
   /// The loop's blocks in reverse post-order.
   SmallVector<BasicBlock *, 8> Blocks;
-  /// The trip count, as an XLen integer, materialized in the preheader.
-  /// Null when Speculative.
+  /// The trip count, as an XLen integer. Null if it is not computable.
   const SCEV *TripCount = nullptr;
+  /// TripCount, materialized in the preheader. Null when Speculative.
   Value *TripCountV = nullptr;
-  /// Whether the loop has no computable trip count, so its conditions are
-  /// computed for iterations that may never run. The loop is then pipelined
-  /// in place, without a kernel copy, a guard or a drain loop, and every
-  /// condition must be safe to compute for any iteration.
+  /// Whether the loop's conditions are computed for iterations that may
+  /// never run: it has no computable trip count, or its conditions read only
+  /// toggles. The loop is then pipelined in place, without a kernel copy, a
+  /// guard or a drain loop, and every condition must be safe to compute for
+  /// any iteration.
   bool Speculative = false;
   SmallVector<InductionVar, 4> IVs;
   SmallVector<PipelinedBranch, 2> Branches;
@@ -400,7 +422,26 @@ RISCVBranchConditionPipelining::findInductionVar(LoopPlan &P, PHINode *Phi) {
     if (IV.Phi == Phi)
       return Idx;
 
-  if (Phi->getParent() != P.Header || !SE->isSCEVable(Phi->getType()))
+  if (Phi->getParent() != P.Header)
+    return std::nullopt;
+
+  // x = x ^ m, the same m every iteration: two iterations on, x is what it
+  // is now. An i1 toggle is also an affine recurrence of step 1, so this
+  // comes first.
+  Value *Mask;
+  if (EnableToggles && Phi->getType()->isIntegerTy() &&
+      Phi->getNumIncomingValues() == 2 &&
+      match(Phi->getIncomingValueForBlock(P.Latch),
+            m_c_Xor(m_Specific(Phi), m_Value(Mask))) &&
+      P.L->isLoopInvariant(Mask)) {
+    InductionVar IV = {Phi, Phi->getIncomingValueForBlock(P.Preheader),
+                       nullptr, nullptr};
+    IV.ToggleMask = Mask;
+    P.IVs.push_back(IV);
+    return P.IVs.size() - 1;
+  }
+
+  if (!SE->isSCEVable(Phi->getType()))
     return std::nullopt;
   auto *AR = dyn_cast<SCEVAddRecExpr>(SE->getSCEV(Phi));
   if (!AR || AR->getLoop() != P.L || !AR->isAffine()) {
@@ -481,9 +522,11 @@ bool RISCVBranchConditionPipelining::buildSlice(LoopPlan &P,
         return false;
   }
 
-  // An invariant condition gains nothing from being queued early, and a phi
-  // condition is rare enough not to handle.
-  if (InSlice.empty() || InSlice.size() > MaxSliceSize)
+  if (InSlice.size() > MaxSliceSize)
+    return false;
+  // An invariant condition gains nothing from being queued early, and a
+  // condition that is itself a header phi is only handled if it is a toggle.
+  if (InSlice.empty() && (IVs.empty() || !P.IVs[IVs[0]].isToggle()))
     return false;
 
   // Everything in the slice dominates the branch, so program order puts
@@ -492,7 +535,7 @@ bool RISCVBranchConditionPipelining::buildSlice(LoopPlan &P,
     for (Instruction &I : *BB)
       if (InSlice.contains(&I))
         PB.Slice.push_back(&I);
-  assert(PB.Slice.back() == PB.Br->getCondition());
+  assert(PB.Slice.empty() || PB.Slice.back() == PB.Br->getCondition());
   PB.IVs.assign(IVs.begin(), IVs.end());
   return true;
 }
@@ -888,6 +931,30 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
 
   if (P.Branches.empty())
     return std::nullopt;
+
+  // A toggle repeats every two iterations whether or not they run, so a
+  // counted loop whose conditions read nothing else needs no kernel that
+  // stops early: it is pipelined in place, like a loop without a trip count
+  // and at the same distance. Its latch was skipped above and stays a
+  // counted exit.
+  unsigned InPlaceDistance =
+      std::min<unsigned>(SpeculativePipelineDistance, MaxDistance);
+  if (!P.Speculative && InPlaceDistance &&
+      all_of(P.Branches, [&](const PipelinedBranch &PB) {
+        return !PB.IVs.empty() &&
+               all_of(PB.IVs,
+                      [&](unsigned Idx) { return P.IVs[Idx].isToggle(); }) &&
+               all_of(PB.Slice, [](const Instruction *I) {
+                 return !isa<LoadInst>(I) && isSafeToSpeculativelyExecute(I);
+               });
+      })) {
+    P.Speculative = true;
+    for (PipelinedBranch &PB : P.Branches)
+      PB.Distance = std::min(PB.Distance, InPlaceDistance);
+    LLVM_DEBUG(dbgs() << "  every condition reads only toggles, pipelining "
+                         "in place "
+                      << P.maxDistance() << " iterations ahead\n");
+  }
   return P;
 }
 
@@ -919,8 +986,8 @@ void RISCVBranchConditionPipelining::materializeValues(LoopPlan &P) {
   for (const PipelinedBranch &PB : P.Branches)
     Used.insert(PB.IVs.begin(), PB.IVs.end());
   for (auto [Idx, IV] : enumerate(P.IVs)) {
-    // A shift recurrence has no step to materialize.
-    if (!Used.contains(Idx) || IV.isShift())
+    // A shift recurrence or a toggle has no step to materialize.
+    if (!Used.contains(Idx) || IV.isShift() || IV.isToggle())
       continue;
     if (auto *C = dyn_cast<SCEVConstant>(IV.Step))
       IV.StepV = C->getValue();
@@ -995,6 +1062,9 @@ static Value *advanceInductionVar(IRBuilder<> &B, const InductionVar &IV,
                                   const Twine &Name) {
   if (Iterations == 0)
     return Base;
+  // Flipping the same bits twice restores them.
+  if (IV.isToggle())
+    return Iterations % 2 ? B.CreateXor(Base, IV.ToggleMask, Name) : Base;
   if (IV.isShift()) {
     // Shifting by a then by b is shifting by a + b, and a shift by the width
     // or more leaves nothing of a logical shift and only the sign of an
@@ -1050,7 +1120,9 @@ Value *RISCVBranchConditionPipelining::cloneCondition(
            "speculative condition clone is not safe to execute anywhere");
     Map[I] = C;
   }
-  return Map[PB.Slice.back()];
+  // A condition that is a toggle itself has no slice: it is the toggle's
+  // value in the iteration Map describes.
+  return Map.lookup(PB.Br->getCondition());
 }
 
 void RISCVBranchConditionPipelining::emitPush(IRBuilder<> &B, unsigned Queue,
@@ -1090,15 +1162,15 @@ void RISCVBranchConditionPipelining::emitPush(IRBuilder<> &B, unsigned Queue,
     RecursivelyDeleteTriviallyDeadInstructions(Cmp);
 }
 
-/// Pipelines a loop without a trip count where it is: the preheader queues
-/// each branch's conditions for its first iterations, and each branch
-/// consumes the condition queued Distance iterations ago and queues the one
-/// for Distance iterations ahead. The loop runs until it exits as before, so
-/// up to Distance conditions per branch are left queued for iterations that
-/// never run; init empties the queue the next time the loop is entered. No
-/// block is added or removed.
+/// Pipelines a loop where it is, when its conditions can be computed for
+/// iterations that never run: the preheader queues each branch's conditions
+/// for its first iterations, and each branch consumes the condition queued
+/// Distance iterations ago and queues the one for Distance iterations ahead.
+/// The loop runs until it exits as before, so up to Distance conditions per
+/// branch are left queued for iterations that never run; init empties the
+/// queue the next time the loop is entered. No block is added or removed.
 void RISCVBranchConditionPipelining::transformLoopInPlace(LoopPlan &P) {
-  assert(P.Speculative && !P.TripCountV && "loop has a trip count");
+  assert(P.Speculative && !P.TripCountV && "loop has a kernel to count");
   unsigned Distance = P.maxDistance();
 
   // The preheader runs once each time the loop is entered.
@@ -1343,7 +1415,10 @@ bool RISCVBranchConditionPipelining::runOnFunction(Function &F) {
       // tree and loop info the other plans rely on stay valid.
       assert(F.size() == NumBlocks &&
              "speculative pipelining changed the control flow");
-      ++NumLoopsPipelinedSpeculatively;
+      if (P.TripCount)
+        ++NumToggleLoopsPipelined;
+      else
+        ++NumLoopsPipelinedSpeculatively;
     } else {
       transformLoop(P);
     }
