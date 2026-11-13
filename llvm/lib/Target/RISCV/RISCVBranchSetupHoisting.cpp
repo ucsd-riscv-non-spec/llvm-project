@@ -46,6 +46,12 @@ static cl::opt<unsigned> MaxHoistFreqRatio(
              "than this many times as often as its own (0 for no limit)"),
     cl::init(2));
 
+static cl::opt<unsigned> MaxCallTargetHoistFreqRatio(
+    "riscv-ns-hoist-call-target-max-freq-ratio", cl::Hidden,
+    cl::desc("The limit of -riscv-ns-hoist-max-freq-ratio for the BMOVT of a "
+             "direct call, which is hoisted together with its AUIPC"),
+    cl::init(1));
+
 static cl::opt<bool> DisableHoistFreqFromBest(
     "riscv-ns-disable-hoist-freq-from-best", cl::Hidden, cl::init(false),
     cl::desc("Compare a hoist point's frequency with the setup's own block, "
@@ -55,6 +61,12 @@ static cl::opt<bool> DisableBranchRegHints(
     "riscv-ns-disable-branch-reg-hints", cl::Hidden,
     cl::desc("Leave the B-register of each branch to the register allocator, "
              "without giving it a preferred one"),
+    cl::init(false));
+
+static cl::opt<bool> DisableCallTargetHoisting(
+    "riscv-ns-disable-call-target-hoisting", cl::Hidden,
+    cl::desc("Leave the BMOVT of a direct call next to the call, instead of "
+             "hoisting it together with the AUIPC that computes its target"),
     cl::init(false));
 
 STATISTIC(NumBMOVHoisted, "Number of BMOV instructions able to be hoisted");
@@ -124,6 +136,25 @@ private:
   SmallVector<BitVector, 0> LiveIn, LiveOut;
 };
 
+/// The instructions moved to hoist one setup: the setup itself and, for the
+/// BMOVT of a direct call, tail call or long jump, the AUIPC that computes its
+/// target.
+struct SetupGroup {
+  MachineInstr *Setup;
+  /// The AUIPC right before Setup that it takes its target from, if any. The
+  /// AUIPC's call relocation also patches the instruction after it, so the two
+  /// have to stay next to each other.
+  MachineInstr *Lead = nullptr;
+
+  explicit SetupGroup(MachineInstr &SetupMI);
+
+  /// The first instruction moved.
+  MachineInstr &front() const { return Lead ? *Lead : *Setup; }
+  bool contains(const MachineInstr &MI) const {
+    return &MI == Setup || &MI == Lead;
+  }
+};
+
 /// A place to move a setup to: a block and the instruction to insert before,
 /// which may be that block's end().
 using HoistPoint = std::pair<MachineBasicBlock *, MachineBasicBlock::iterator>;
@@ -162,23 +193,36 @@ public:
                            MachineInstr *C, BRegLiveness &Liveness,
                            bool LimitPressure);
   bool repairBranchTargets(const MachineFunction &MF) const;
-  /// Returns the places \p SetupMI can be hoisted to, nearest first; each one
+  /// Returns the places \p G can be hoisted to, nearest first; each one
   /// dominates the one before it. The iterators may be their block's end(),
   /// so they must not be dereferenced to recover the block.
-  /// \p OwnBranch, if set, is the branch reading \p SetupMI, which does not
-  /// stop it from being hoisted.
-  SmallVector<HoistPoint, 8> findHoistPoints(MachineInstr &SetupMI,
+  /// \p OwnBranch, if set, is the branch reading the setup of \p G, which
+  /// does not stop it from being hoisted.
+  SmallVector<HoistPoint, 8> findHoistPoints(const SetupGroup &G,
                                              const MachineInstr *OwnBranch);
   /// Returns how many of \p Points \p S can be hoisted through while the
   /// B-registers live at once still fit in those that may be assigned.
   unsigned countFittingPoints(MachineInstr &S, ArrayRef<HoistPoint> Points,
                               BRegLiveness &Liveness) const;
-  bool isSafeToHoistTo(const MachineInstr &SetupMI, MachineBasicBlock &DestBB,
+  bool isSafeToHoistTo(const SetupGroup &G, MachineBasicBlock &DestBB,
                        MachineBasicBlock::const_iterator InsertPt,
                        const MachineInstr *OwnBranch) const;
 };
 
 char RISCVBranchSetupHoisting::ID = 0;
+
+SetupGroup::SetupGroup(MachineInstr &SetupMI) : Setup(&SetupMI) {
+  if (DisableCallTargetHoisting || SetupMI.getOpcode() != RISCV::BMOVT_I)
+    return;
+  MachineBasicBlock &MBB = *SetupMI.getParent();
+  MachineBasicBlock::iterator I = SetupMI.getIterator();
+  if (I == MBB.begin())
+    return;
+  I = prev_nodbg(I, MBB.begin());
+  if (I->getOpcode() == RISCV::AUIPC &&
+      I->getOperand(0).getReg() == SetupMI.getOperand(2).getReg())
+    Lead = &*I;
+}
 
 bool RISCVBranchSetupHoisting::repairBranchTargets(
     const MachineFunction &MF) const {
@@ -850,7 +894,10 @@ bool RISCVBranchSetupHoisting::scheduleBranchSetup(
 
     LLVM_DEBUG(dbgs() << "Hoisting: " << *SetupMI);
 
-    SmallVector<HoistPoint, 8> Points = findHoistPoints(*SetupMI, OwnBranch);
+    SetupGroup G(*SetupMI);
+    LLVM_DEBUG(if (G.Lead) dbgs() << "  together with: " << *G.Lead);
+
+    SmallVector<HoistPoint, 8> Points = findHoistPoints(G, OwnBranch);
     unsigned NumPoints = Points.size();
     // The BMOVS starts the live range of the B-register, and the setups
     // after it cannot move above it, so only the BMOVS can lengthen it.
@@ -867,7 +914,8 @@ bool RISCVBranchSetupHoisting::scheduleBranchSetup(
       continue;
 
     auto [DestBB, InsertPt] = Points[NumPoints - 1];
-    DestBB->splice(InsertPt, SetupMI->getParent(), SetupMI);
+    DestBB->splice(InsertPt, SetupMI->getParent(), G.front().getIterator(),
+                   std::next(SetupMI->getIterator()));
     ++NumBMOVHoisted;
     Changed = true;
   }
@@ -924,31 +972,67 @@ RISCVBranchSetupHoisting::countFittingPoints(MachineInstr &S,
   return Lo;
 }
 
-static bool hasRegisterDependency(const MachineInstr &MI,
-                                  const MachineInstr &SetupMI,
+static bool hasRegisterDependency(const MachineInstr &MI, const SetupGroup &G,
                                   const TargetRegisterInfo &TRI) {
-  for (const MachineOperand &MO : SetupMI.all_uses()) {
-    if (MO.isReg() && MO.getReg() && MI.modifiesRegister(MO.getReg(), &TRI))
-      return true;
-  }
-
-  for (const MachineOperand &MO : SetupMI.all_defs()) {
-    if (!MO.isReg() || !MO.getReg())
+  // The register an AUIPC writes for its BMOVT counts as one \p G writes:
+  // \p MI may neither read nor write it.
+  for (const MachineInstr *SetupMI : {G.Lead, G.Setup}) {
+    if (!SetupMI)
       continue;
-    if (MI.modifiesRegister(MO.getReg(), &TRI) ||
-        MI.readsRegister(MO.getReg(), &TRI))
-      return true;
+
+    for (const MachineOperand &MO : SetupMI->all_uses()) {
+      if (MO.isReg() && MO.getReg() && MI.modifiesRegister(MO.getReg(), &TRI))
+        return true;
+    }
+
+    for (const MachineOperand &MO : SetupMI->all_defs()) {
+      if (!MO.isReg() || !MO.getReg())
+        continue;
+      if (MI.modifiesRegister(MO.getReg(), &TRI) ||
+          MI.readsRegister(MO.getReg(), &TRI))
+        return true;
+    }
   }
 
   return false;
 }
 
-static bool isHoistHazard(const MachineInstr &MI, const MachineInstr &SetupMI,
+/// Whether \p Reg may be read on a path that leaves \p MBB.
+static bool isLiveOut(Register Reg, const MachineBasicBlock &MBB,
+                      const TargetRegisterInfo &TRI) {
+  if (!MBB.getParent()->getRegInfo().tracksLiveness())
+    return !MBB.succ_empty();
+  for (const MachineBasicBlock *Succ : MBB.successors())
+    for (const MachineBasicBlock::RegisterMaskPair &LI : Succ->liveins())
+      if (TRI.regsOverlap(LI.PhysReg, Reg))
+        return true;
+  return false;
+}
+
+/// Whether the AUIPC of \p G cannot be hoisted above \p MI, for a reason
+/// other than the registers \p MI names.
+static bool isLeadHazard(const MachineInstr &MI, const SetupGroup &G,
+                         const TargetRegisterInfo &TRI) {
+  // The unwind information describes a callee-saved register as holding the
+  // caller's value until the directives that follow the prologue's saves.
+  if (MI.getFlag(MachineInstr::FrameSetup))
+    return true;
+  // Above a terminator, the AUIPC also runs on the paths that leave there
+  // without reaching the BMOVT's old place, which may still need the value it
+  // overwrites. Every instruction on the paths that do reach it is checked,
+  // so only the other successors could be reading the register.
+  return MI.isTerminator() &&
+         isLiveOut(G.Lead->getOperand(0).getReg(), *MI.getParent(), TRI);
+}
+
+static bool isHoistHazard(const MachineInstr &MI, const SetupGroup &G,
                           const TargetRegisterInfo &TRI,
                           const MachineInstr *OwnBranch) {
   if (&MI == OwnBranch)
     return false;
-  return isHoistBarrier(MI) || hasRegisterDependency(MI, SetupMI, TRI);
+  if (G.Lead && isLeadHazard(MI, G, TRI))
+    return true;
+  return isHoistBarrier(MI) || hasRegisterDependency(MI, G, TRI);
 }
 
 /// Scan `BB` backwards from `From`, returning the earliest safe
@@ -957,7 +1041,7 @@ static bool isHoistHazard(const MachineInstr &MI, const MachineInstr &SetupMI,
 static MachineBasicBlock::iterator
 scanBlockBackward(MachineBasicBlock *BB,
                   MachineBasicBlock::reverse_iterator From,
-                  const MachineInstr &SetupMI, const TargetRegisterInfo &TRI,
+                  const SetupGroup &G, const TargetRegisterInfo &TRI,
                   const MachineInstr *OwnBranch, bool &HazardFound) {
   HazardFound = false;
 
@@ -970,7 +1054,7 @@ scanBlockBackward(MachineBasicBlock *BB,
     if (CurrMI.isPHI())
       break;
 
-    if (isHoistHazard(CurrMI, SetupMI, TRI, OwnBranch)) {
+    if (isHoistHazard(CurrMI, G, TRI, OwnBranch)) {
       LLVM_DEBUG(dbgs() << "  [Hazard] Cannot cross: " << CurrMI);
       LLVM_DEBUG(if (CurrMI.isCall()) dbgs() << "    - reason: Call");
       LLVM_DEBUG(if (CurrMI.isIndirectBranch()) dbgs()
@@ -990,23 +1074,26 @@ scanBlockBackward(MachineBasicBlock *BB,
   return SafePoint;
 }
 
-/// Whether \p MI, in a cycle that \p SetupMI would be hoisted out of, keeps
-/// the setup in that cycle. The other setups of the same B-register do not:
-/// they are hoisted with it, or checked on their own.
-static bool isCycleHazard(const MachineInstr &MI, const MachineInstr &SetupMI,
+/// Whether \p MI, in a cycle that \p G would be hoisted out of, keeps it in
+/// that cycle. The other setups of the same B-register do not: they are
+/// hoisted with it, or checked on their own.
+static bool isCycleHazard(const MachineInstr &MI, const SetupGroup &G,
                           const TargetRegisterInfo &TRI,
                           const MachineInstr *OwnBranch) {
-  if (MI.isBMOV() &&
-      MI.getOperand(0).getReg() == SetupMI.getOperand(0).getReg())
+  if (G.contains(MI))
     return false;
-  return isHoistHazard(MI, SetupMI, TRI, OwnBranch);
+  if (MI.isBMOV() &&
+      MI.getOperand(0).getReg() == G.Setup->getOperand(0).getReg())
+    return false;
+  return isHoistHazard(MI, G, TRI, OwnBranch);
 }
 
 bool RISCVBranchSetupHoisting::isSafeToHoistTo(
-    const MachineInstr &SetupMI, MachineBasicBlock &DestBB,
+    const SetupGroup &G, MachineBasicBlock &DestBB,
     MachineBasicBlock::const_iterator InsertPt,
     const MachineInstr *OwnBranch) const {
-  const MachineBasicBlock *SrcBB = SetupMI.getParent();
+  const MachineInstr &First = G.front(), &Last = *G.Setup;
+  const MachineBasicBlock *SrcBB = Last.getParent();
   if (SrcBB == &DestBB || !MDT->dominates(&DestBB, SrcBB))
     return false;
   bool SrcInCycle = false;
@@ -1015,8 +1102,7 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
                             MachineBasicBlock::const_iterator End) {
     return llvm::any_of(
         llvm::make_range(Begin, End), [&](const MachineInstr &MI) {
-          return &MI != &SetupMI &&
-                 isHoistHazard(MI, SetupMI, *TRI, OwnBranch);
+          return !G.contains(MI) && isHoistHazard(MI, G, *TRI, OwnBranch);
         });
   };
 
@@ -1043,7 +1129,7 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
 
     MachineBasicBlock::const_iterator End = BB->end();
     if (BB == SrcBB)
-      End = SetupMI.getIterator();
+      End = First.getIterator();
     if (rangeHasHazard(BB->begin(), End))
       return false;
 
@@ -1061,12 +1147,12 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
   // through on every trip round. MachineLoopInfo reports only natural loops,
   // so loopHasHazard() does not see an irreducible cycle, such as one left by
   // tail duplication giving a loop a second entry.
-  MachineBasicBlock::const_iterator AfterSetup = SetupMI.getIterator();
+  MachineBasicBlock::const_iterator AfterSetup = Last.getIterator();
   ++AfterSetup;
   if (ReachedDest && SrcInCycle &&
       llvm::any_of(llvm::make_range(AfterSetup, SrcBB->end()),
                    [&](const MachineInstr &MI) {
-                     return isCycleHazard(MI, SetupMI, *TRI, OwnBranch);
+                     return isCycleHazard(MI, G, *TRI, OwnBranch);
                    })) {
     LLVM_DEBUG(dbgs() << "  [Stop] Hazard after the setup in BB#"
                       << SrcBB->getNumber() << ", in a cycle not through BB#"
@@ -1077,12 +1163,12 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
   return ReachedDest;
 }
 
-static bool loopHasHazard(const MachineLoop &L, const MachineInstr &SetupMI,
+static bool loopHasHazard(const MachineLoop &L, const SetupGroup &G,
                           const TargetRegisterInfo &TRI,
                           const MachineInstr *OwnBranch) {
   for (MachineBasicBlock *MBB : L.getBlocks()) {
     for (const MachineInstr &MI : *MBB) {
-      bool IsHazard = isCycleHazard(MI, SetupMI, TRI, OwnBranch);
+      bool IsHazard = isCycleHazard(MI, G, TRI, OwnBranch);
       LLVM_DEBUG(dbgs() << "  Checking loop MI (isHazard=" << IsHazard << "): " << MI);
       if (IsHazard) {
         return true;
@@ -1095,27 +1181,32 @@ static bool loopHasHazard(const MachineLoop &L, const MachineInstr &SetupMI,
 }
 
 SmallVector<HoistPoint, 8>
-RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
+RISCVBranchSetupHoisting::findHoistPoints(const SetupGroup &G,
                                           const MachineInstr *OwnBranch) {
   SmallVector<HoistPoint, 8> Points;
-  MachineBasicBlock *CurBB = SetupMI.getParent();
+  MachineBasicBlock *CurBB = G.Setup->getParent();
   MachineBasicBlock::iterator SafePoint;
   // How often the setup runs where it is, so far: its own block, then the
   // coolest point it has been hoisted to. Out of a loop body, that is the
   // preheader, not the body, whose frequency includes the trip count.
   BlockFrequency Ref = MBFI->getBlockFreq(CurBB);
 
+  // A call's target is two instructions, so it is not left anywhere that runs
+  // more often than the call: above a branch that often skips the call, the
+  // pair costs more than it saves.
+  unsigned MaxFreqRatio = G.Lead ? unsigned(MaxCallTargetHoistFreqRatio)
+                                 : unsigned(MaxHoistFreqRatio);
+
   bool HazardFound = false;
 
-  auto IntraStart = std::next(SetupMI.getReverseIterator());
+  auto IntraStart = std::next(G.front().getReverseIterator());
   if (IntraStart != CurBB->rend())
     SafePoint =
-        scanBlockBackward(CurBB, IntraStart, SetupMI, *TRI, OwnBranch,
-                          HazardFound);
+        scanBlockBackward(CurBB, IntraStart, G, *TRI, OwnBranch, HazardFound);
   else
     SafePoint = CurBB->getFirstNonPHI();
 
-  if (SafePoint != SetupMI.getIterator())
+  if (SafePoint != G.front().getIterator())
     Points.push_back({CurBB, SafePoint});
   if (HazardFound)
     return Points;
@@ -1156,14 +1247,14 @@ RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
     // such as the test before a rarely taken path, as the setups of that path
     // would then run whether it is taken or not.
     bool TooHot = false;
-    if (MaxHoistFreqRatio) {
+    if (MaxFreqRatio) {
       BlockFrequency Base =
           DisableHoistFreqFromBest ? MBFI->getBlockFreq(CurBB) : Ref;
-      if (std::optional<BlockFrequency> Limit = Base.mul(MaxHoistFreqRatio))
+      if (std::optional<BlockFrequency> Limit = Base.mul(MaxFreqRatio))
         TooHot = MBFI->getBlockFreq(IDom) > *Limit;
       if (TooHot && !DisableHoistFreqFromBest)
         if (std::optional<BlockFrequency> Own =
-                MBFI->getBlockFreq(CurBB).mul(MaxHoistFreqRatio))
+                MBFI->getBlockFreq(CurBB).mul(MaxFreqRatio))
           if (MBFI->getBlockFreq(IDom) <= *Own)
             ++NumHoistPointsTooHotFromBest;
     }
@@ -1178,13 +1269,13 @@ RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
       HazardFound = false;
     } else {
       IDomSafePoint =
-          scanBlockBackward(IDom, IDomScanStart, SetupMI, *TRI, OwnBranch,
+          scanBlockBackward(IDom, IDomScanStart, G, *TRI, OwnBranch,
                             HazardFound);
     }
 
     // The dominator tree chooses candidates; the inverse-CFG walk proves that
-    // every actual path from the candidate to SetupMI is free of hazards.
-    if (!isSafeToHoistTo(SetupMI, *IDom, IDomSafePoint, OwnBranch)) {
+    // every actual path from the candidate to the setup is free of hazards.
+    if (!isSafeToHoistTo(G, *IDom, IDomSafePoint, OwnBranch)) {
       LLVM_DEBUG(dbgs() << "  [Stop] Hazard on a CFG path from BB#"
                         << CurBB->getNumber() << " to BB#" << IDom->getNumber()
                         << "\n");
@@ -1194,7 +1285,7 @@ RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
     for (MachineLoop *L = MLI->getLoopFor(BB); L && !L->contains(IDom);
          L = L->getParentLoop()) {
       LLVM_DEBUG(dbgs() << "  Checking loop hazard...\n");
-      if (loopHasHazard(*L, SetupMI, *TRI, OwnBranch))
+      if (loopHasHazard(*L, G, *TRI, OwnBranch))
         return Points;
     }
 
@@ -1208,14 +1299,14 @@ RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
                         << IDom->getNumber() << "\n");
 #ifndef NDEBUG
       // Recomputed from the points themselves, not from Ref: a point accepted
-      // runs at most MaxHoistFreqRatio times as often as the setup's own
+      // runs at most MaxFreqRatio times as often as the setup's own
       // block and as every point accepted before it.
-      if (MaxHoistFreqRatio && !DisableHoistFreqFromBest) {
+      if (MaxFreqRatio && !DisableHoistFreqFromBest) {
         BlockFrequency Coolest = MBFI->getBlockFreq(CurBB);
         for (const HoistPoint &P : Points)
           Coolest = std::min(Coolest, MBFI->getBlockFreq(P.first));
         if (std::optional<BlockFrequency> Limit =
-                Coolest.mul(MaxHoistFreqRatio))
+                Coolest.mul(MaxFreqRatio))
           assert(MBFI->getBlockFreq(IDom) <= *Limit &&
                  "Hoist point runs too often for an earlier point");
       }

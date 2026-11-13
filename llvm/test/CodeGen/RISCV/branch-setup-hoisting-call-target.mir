@@ -1,0 +1,196 @@
+# RUN: llc -mtriple=riscv64 -verify-machineinstrs \
+# RUN:   -riscv-ns-hoist-call-target-max-freq-ratio=2 \
+# RUN:   -run-pass=riscv-branch-setup-hoisting -o - %s | FileCheck %s
+# RUN: llc -mtriple=riscv64 -verify-machineinstrs \
+# RUN:   -riscv-ns-hoist-call-target-max-freq-ratio=2 \
+# RUN:   -run-pass=riscv-branch-setup-hoisting,riscv-branch-setup-hoisting \
+# RUN:   -o - %s | FileCheck %s
+# RUN: llc -mtriple=riscv64 -verify-machineinstrs \
+# RUN:   -riscv-ns-hoist-call-target-max-freq-ratio=2 \
+# RUN:   -run-pass=riscv-branch-setup-hoisting,greedy,virtregrewriter \
+# RUN:   -o /dev/null %s
+# RUN: llc -mtriple=riscv64 -verify-machineinstrs \
+# RUN:   -run-pass=riscv-branch-setup-hoisting -o - %s \
+# RUN:   | FileCheck %s --check-prefix=DEFAULT
+# RUN: llc -mtriple=riscv64 -verify-machineinstrs \
+# RUN:   -riscv-ns-disable-call-target-hoisting \
+# RUN:   -run-pass=riscv-branch-setup-hoisting -o - %s \
+# RUN:   | FileCheck %s --check-prefix=DISABLED
+
+# The BMOVT of a direct call reads the register that the AUIPC before it
+# writes, and the AUIPC's call relocation patches both instructions, so the two
+# are hoisted as one.
+
+--- |
+  declare void @g()
+  define void @call_in_block() { ret void }
+  define void @scratch_in_use() { ret void }
+  define void @across_blocks() { ret void }
+  define void @scratch_live_on_other_path() { ret void }
+  define void @below_prologue() { ret void }
+...
+
+# DISABLED-LABEL: name: call_in_block
+# DISABLED:         $x10 = ADD $x10, $x12
+# DISABLED-NEXT:    $x1 = AUIPC target-flags(riscv-call) @g
+# DISABLED-NEXT:    %0:pbr = BMOVT_I %0, $x1, 0
+# DISABLED-NEXT:    PseudoPBCALL %0
+# CHECK-LABEL: name: call_in_block
+# CHECK:       bb.0:
+# CHECK:         %0:pbr = BMOVS_J <mcsymbol .Lcall>
+# CHECK-NEXT:    $x1 = AUIPC target-flags(riscv-call) @g
+# CHECK-NEXT:    %0:pbr = BMOVT_I %0, $x1, 0
+# CHECK-NEXT:    $x12 = ADDI $x11, 1
+# CHECK-NEXT:    $x10 = ADD $x10, $x12
+# CHECK-NEXT:    PseudoPBCALL %0
+---
+name: call_in_block
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $x10, $x11
+    $x12 = ADDI $x11, 1
+    $x10 = ADD $x10, $x12
+    %0:pbr = BMOVS_J <mcsymbol .Lcall>
+    $x1 = AUIPC target-flags(riscv-call) @g
+    %0:pbr = BMOVT_I %0, $x1, 0
+    PseudoPBCALL %0, csr_ilp32d_lp64d, implicit-def $x1, implicit $x10
+...
+
+# The pair stays below the last instruction to read or write the register the
+# AUIPC uses.
+# CHECK-LABEL: name: scratch_in_use
+# CHECK:       bb.0:
+# CHECK:         %0:pbr = BMOVS_J <mcsymbol .Ltail>
+# CHECK-NEXT:    $x6 = ADDI $x10, 1
+# CHECK-NEXT:    $x11 = ADD $x11, $x6
+# CHECK-NEXT:    $x6 = AUIPC target-flags(riscv-call) @g
+# CHECK-NEXT:    %0:pbr = BMOVT_I %0, $x6, 0
+# CHECK-NEXT:    $x10 = ADDI $x11, 1
+# CHECK-NEXT:    PseudoPBI %0
+---
+name: scratch_in_use
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $x10, $x11
+    $x6 = ADDI $x10, 1
+    $x11 = ADD $x11, $x6
+    $x10 = ADDI $x11, 1
+    %0:pbr = BMOVS_J <mcsymbol .Ltail>
+    $x6 = AUIPC target-flags(riscv-call) @g
+    %0:pbr = BMOVT_I %0, $x6, 0
+    PseudoPBI %0, implicit $x10
+...
+
+# By default the pair is not left in a block that runs more often than the
+# call, here the one that branches around it.
+# DEFAULT-LABEL: name: across_blocks
+# DEFAULT:       bb.0:
+# DEFAULT:         %1:pbr = BMOVS_J <mcsymbol .Lcall>
+# DEFAULT-NOT:     AUIPC
+# DEFAULT:       bb.1:
+# DEFAULT:         $x1 = AUIPC target-flags(riscv-call) @g
+# DEFAULT-NEXT:    %1:pbr = BMOVT_I %1, $x1, 0
+# DEFAULT-NEXT:    $x10 = ADD $x10, $x12
+# DEFAULT-NEXT:    PseudoPBCALL %1
+# CHECK-LABEL: name: across_blocks
+# CHECK:       bb.0:
+# CHECK:         %1:pbr = BMOVS_J <mcsymbol .Lcall>
+# CHECK-NEXT:    $x1 = AUIPC target-flags(riscv-call) @g
+# CHECK-NEXT:    %1:pbr = BMOVT_I %1, $x1, 0
+# CHECK:       bb.1:
+# CHECK-NOT:     AUIPC
+# CHECK-NOT:     BMOVT_I
+# CHECK:         PseudoPBCALL %1
+---
+name: across_blocks
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x10, $x11
+    $x12 = ADDI $x11, 1
+    %0:pbr = BMOVS_J <mcsymbol .Lif>
+    %0:pbr = BMOVT_J %0, %bb.2
+    %0:pbr = BMOVC_BEQ %0, $x10, $x0
+    PseudoPBC %0, %bb.2
+
+  bb.1:
+    successors: %bb.2
+    liveins: $x10, $x12
+    $x10 = ADD $x10, $x12
+    %1:pbr = BMOVS_J <mcsymbol .Lcall>
+    $x1 = AUIPC target-flags(riscv-call) @g
+    %1:pbr = BMOVT_I %1, $x1, 0
+    PseudoPBCALL %1, csr_ilp32d_lp64d, implicit-def $x1, implicit $x10
+
+  bb.2:
+...
+
+# The path that skips the call still reads the register, so the AUIPC cannot
+# move above the branch to it.
+# CHECK-LABEL: name: scratch_live_on_other_path
+# CHECK:       bb.0:
+# CHECK:         %1:pbr = BMOVS_J <mcsymbol .Lcall>
+# CHECK-NOT:     AUIPC
+# CHECK-NOT:     BMOVT_I
+# CHECK:       bb.1:
+# CHECK:         $x1 = AUIPC target-flags(riscv-call) @g
+# CHECK-NEXT:    %1:pbr = BMOVT_I %1, $x1, 0
+# CHECK-NEXT:    $x10 = ADD $x10, $x12
+# CHECK-NEXT:    PseudoPBCALL %1
+---
+name: scratch_live_on_other_path
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    liveins: $x1, $x10, $x11
+    $x12 = ADDI $x11, 1
+    %0:pbr = BMOVS_J <mcsymbol .Lif>
+    %0:pbr = BMOVT_J %0, %bb.2
+    %0:pbr = BMOVC_BEQ %0, $x10, $x0
+    PseudoPBC %0, %bb.2
+
+  bb.1:
+    successors:
+    liveins: $x10, $x12
+    $x10 = ADD $x10, $x12
+    %1:pbr = BMOVS_J <mcsymbol .Lcall>
+    $x1 = AUIPC target-flags(riscv-call) @g
+    %1:pbr = BMOVT_I %1, $x1, 0
+    PseudoPBCALL %1, csr_ilp32d_lp64d, implicit-def $x1, implicit $x10
+
+  bb.2:
+    liveins: $x1, $x10
+    $x10 = ADD $x10, $x1
+...
+
+# The return address is described as still in its register until the CFI
+# after its save, so the AUIPC stays below the whole prologue.
+# CHECK-LABEL: name: below_prologue
+# CHECK:       bb.0:
+# CHECK:         %0:pbr = BMOVS_J <mcsymbol .Lcall>
+# CHECK:         frame-setup SD killed $x1, $x2, 8
+# CHECK-NEXT:    frame-setup CFI_INSTRUCTION offset $x1, -8
+# CHECK-NEXT:    $x1 = AUIPC target-flags(riscv-call) @g
+# CHECK-NEXT:    %0:pbr = BMOVT_I %0, $x1, 0
+# CHECK-NEXT:    $x10 = ADDI $x10, 1
+# CHECK-NEXT:    PseudoPBCALL %0
+---
+name: below_prologue
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $x1, $x10
+    $x2 = frame-setup ADDI $x2, -16
+    frame-setup CFI_INSTRUCTION def_cfa_offset 16
+    frame-setup SD killed $x1, $x2, 8
+    frame-setup CFI_INSTRUCTION offset $x1, -8
+    $x10 = ADDI $x10, 1
+    %0:pbr = BMOVS_J <mcsymbol .Lcall>
+    $x1 = AUIPC target-flags(riscv-call) @g
+    %0:pbr = BMOVT_I %0, $x1, 0
+    PseudoPBCALL %0, csr_ilp32d_lp64d, implicit-def $x1, implicit $x10
+...
