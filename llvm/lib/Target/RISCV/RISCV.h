@@ -16,6 +16,7 @@
 
 #include "MCTargetDesc/RISCVBaseInfo.h"
 #include "llvm/Target/TargetMachine.h"
+#include "llvm/IR/PassManager.h"
 
 namespace llvm {
 class FunctionPass;
@@ -131,6 +132,14 @@ void initializeRISCVIRLoopFissionPass(PassRegistry &);
 
 FunctionPass *createRISCVLoopDecideActPass();
 void initializeRISCVLoopDecideActPass(PassRegistry &);
+
+/// Non-Spec: versions a loop on a runtime memory-overlap check to keep the
+/// loop-invariant memory its branch conditions read in registers.
+class RISCVNSVersionPromotePass
+    : public PassInfoMixin<RISCVNSVersionPromotePass> {
+public:
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+};
 
 FunctionPass *createRISCVNSLoopMetadataPass();
 void initializeRISCVNSLoopMetadataPass(PassRegistry &);

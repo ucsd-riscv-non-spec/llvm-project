@@ -688,6 +688,24 @@ void RISCVTargetMachine::registerPassBuilderCallbacks(PassBuilder &PB) {
         if (Level.isOptimizingForSpeed())
           FPM.addPass(createFunctionToLoopPassAdaptor(EVLIndVarSimplifyPass()));
       });
+
+  // Non-Spec: keep the memory loop branch conditions read in registers,
+  // versioning the loop on a runtime overlap check (after inlining; the
+  // vectorizer passes' InstCombine and SimplifyCFG then turn the promoted
+  // conditional updates into selects).
+  PB.registerVectorizerStartEPCallback(
+      [](FunctionPassManager &FPM, OptimizationLevel Level) {
+        if (Level != OptimizationLevel::O0)
+          FPM.addPass(RISCVNSVersionPromotePass());
+      });
+  PB.registerPipelineParsingCallback(
+      [](StringRef Name, FunctionPassManager &FPM,
+         ArrayRef<PassBuilder::PipelineElement>) {
+        if (Name != "riscv-ns-version-promote")
+          return false;
+        FPM.addPass(RISCVNSVersionPromotePass());
+        return true;
+      });
 }
 
 yaml::MachineFunctionInfo *

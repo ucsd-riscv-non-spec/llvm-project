@@ -51,6 +51,7 @@ add_llvm_target(RISCVCodeGen
   RISCVInterleavedAccess.cpp
   RISCVIRLoopFission.cpp
   RISCVLoopDecideAct.cpp
+  RISCVNSVersionPromote.cpp
   RISCVISelDAGToDAG.cpp
   RISCVISelLowering.cpp
   RISCVLandingPadSetup.cpp
