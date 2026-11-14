@@ -12,7 +12,9 @@
 
 #include "RISCVMachineFunctionInfo.h"
 
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Module.h"
 #include "llvm/MC/MCContext.h"
 
@@ -21,13 +23,24 @@ using namespace llvm;
 yaml::RISCVMachineFunctionInfo::RISCVMachineFunctionInfo(
     const llvm::RISCVMachineFunctionInfo &MFI)
     : VarArgsFrameIndex(MFI.getVarArgsFrameIndex()),
-      VarArgsSaveSize(MFI.getVarArgsSaveSize()) {}
+      VarArgsSaveSize(MFI.getVarArgsSaveSize()) {
+  for (const MachineBasicBlock *BB : MFI.getNSFissionedBlocks())
+    NSFissionedBlocks.push_back(BB->getNumber());
+  llvm::sort(NSFissionedBlocks);
+}
 
 MachineFunctionInfo *RISCVMachineFunctionInfo::clone(
     BumpPtrAllocator &Allocator, MachineFunction &DestMF,
     const DenseMap<MachineBasicBlock *, MachineBasicBlock *> &Src2DstMBB)
     const {
-  return DestMF.cloneInfo<RISCVMachineFunctionInfo>(*this);
+  auto *Info = DestMF.cloneInfo<RISCVMachineFunctionInfo>(*this);
+  Info->NSFissionedBlocks.clear();
+  for (const MachineBasicBlock *BB : NSFissionedBlocks) {
+    auto It = Src2DstMBB.find(const_cast<MachineBasicBlock *>(BB));
+    if (It != Src2DstMBB.end())
+      Info->NSFissionedBlocks.insert(It->second);
+  }
+  return Info;
 }
 
 RISCVMachineFunctionInfo::RISCVMachineFunctionInfo(const Function &F,
@@ -56,6 +69,50 @@ RISCVMachineFunctionInfo::RISCVMachineFunctionInfo(const Function &F,
     ProbeKind = PS->getString();
   if (ProbeKind.size()) {
     StackProbeSize = ProbeSize;
+  }
+
+  // Snapshot after the IR transformations, before instruction selection can
+  // split or merge a latch. This also works when loading MIR with embedded IR.
+  for (const BasicBlock &BB : F)
+    HasNSLoopControls |= RISCVNS::hasLoopControls(
+        BB.getTerminator()->getMetadata(LLVMContext::MD_loop));
+  if (HasNSLoopControls) {
+    // Also record known unannotated regions. Instruction selection can create
+    // loops there (for example while expanding a memory operation).
+    NSLoops.emplace_back();
+    for (const BasicBlock &BB : F) {
+      unsigned Index = 0;
+      if (RISCVNS::hasLoopControls(
+              BB.getTerminator()->getMetadata(LLVMContext::MD_loop))) {
+        // A controlled block with no recoverable natural loop must not look
+        // unannotated. Natural loop records below replace this placeholder.
+        Index = NSLoops.size();
+        NSLoops.emplace_back();
+        NSLoops.back().Recoverable = false;
+      }
+      NSLoopForIRBlock[&BB] = Index;
+    }
+    DominatorTree DT(const_cast<Function &>(F));
+    LoopInfo LI(DT);
+    for (Loop *L : LI.getLoopsInPreorder()) {
+      auto Options = RISCVNS::parseLoopOptions(
+          L->getLoopID(), *L->getHeader()->getTerminator());
+      if (!Options)
+        continue;
+      unsigned Index = NSLoops.size();
+      NSLoops.push_back({*Options, RISCVNS::isIRFissioned(L->getLoopID()),
+                         RISCVNS::getSWPApplied(L->getLoopID()).str()});
+      if (!L->getLoopID())
+        for (const BasicBlock *BB : L->blocks())
+          if (LI.getLoopFor(BB) == L &&
+              RISCVNS::hasLoopControls(
+                  BB->getTerminator()->getMetadata(LLVMContext::MD_loop)))
+            NSLoops.back().Recoverable = false;
+      // Inner loops overwrite the outer loop's block membership: controls do
+      // not apply recursively to nested loops.
+      for (const BasicBlock *BB : L->blocks())
+        NSLoopForIRBlock[BB] = Index;
+    }
   }
 }
 

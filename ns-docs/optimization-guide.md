@@ -42,7 +42,11 @@ Everything is on by default except the three `-riscv-ns-swp-*` extensions (`spec
 - All of them are hidden `cl::opt`s, so `llc --help-hidden` lists them.
 - With `llc`, pass them directly. With `clang`, pass each one through `-mllvm`:
   `clang -O2 -mllvm -riscv-ns-swp-speculative -mllvm -riscv-ns-swp-speculative-distance=3 ...`
-- A flag applies to the whole compile. There is no per-function or per-loop control.
+- A flag supplies defaults for the whole compile. The backend also accepts
+  [per-loop IR metadata](loop-annotations.md) for independent pass controls,
+  distances, feature gates, size limits, fission depth and force. Explicit
+  pass-disable flags remain compile-wide kill switches. The proposed Clang
+  pragma spelling is not implemented yet.
 - **At `-O0`,** IR loop fission and branch condition pipelining are not added to the pipeline. Hardware loops, machine fission, exit-jump splitting and hoisting still run.
 - **With GlobalISel** (`-global-isel`), IR loop fission and branch condition pipelining do nothing. Only SelectionDAG selects the queue intrinsics.
 
@@ -50,6 +54,7 @@ Everything is on by default except the three `-riscv-ns-swp-*` extensions (`spec
 
 | | Pass (`-debug-only` name) | File | Its flags |
 |---|---|---|---|
+| IR | Non-Spec metadata validation (`riscv-ns-loop-metadata`) | `RISCVNSLoopOptions.cpp` | [Per-loop metadata](loop-annotations.md) |
 | IR | IR loop fission (`riscv-ir-loop-fission`) | `RISCVIRLoopFission.cpp` | 3.1 |
 | IR | Branch condition pipelining (`riscv-branch-condition-pipelining`) | `RISCVBranchConditionPipelining.cpp` | 2.x |
 | IR | Generic `HardwareLoops`, which asks `RISCVTTIImpl::isHardwareLoopProfitable` | `RISCVTargetTransformInfo.cpp` | 4 |
@@ -67,7 +72,8 @@ The order matters in two places:
 | Tool | What it shows |
 |---|---|
 | `-pass-remarks=riscv-branch-condition-pipelining` | Each pipelined loop and its distance. Without `-g`, the location prints as `<unknown>:0:0`. |
-| `-pass-remarks-missed=riscv-branch-condition-pipelining` | Loops skipped because of `-riscv-ns-swp-max-function-branches`. |
+| `-pass-remarks-missed=riscv-branch-condition-pipelining` | Branch-budget rejections and reasons annotated requests were blocked. |
+| `-pass-remarks-analysis=riscv-branch-condition-pipelining` | Annotated settings, their origin, force and distance reductions. |
 | `-debug-only=<name>` | Why each loop or setup was taken or skipped. The names are in 1.3. Needs an assertion build such as `llc-dev`. |
 | `-stats` | The counters below. Also needs an assertion build. |
 | `-stop-after=<name>` | The IR or MIR right after one pass. |
@@ -158,7 +164,10 @@ Loop for.body:
 ### 2.2 `-riscv-ns-swp-distance=N`
 
 - **Default:** 16. Values above 62 are cut to 62, because the FIFO holds 63 conditions, the distance plus the one pushed just before the pop.
-- **Applies to loops with a trip count only.** Loops pipelined in place use 2.4. The two never affect each other.
+- **Counted loops use this distance.** Loops pipelined in place use 2.4;
+  counted toggle analysis can also cap that distance by the counted distance.
+  A value of zero disables every SWP path on loops that inherit it. A positive
+  local `llvm.loop.riscv.ns.swp.distance` can override that zero.
 - **A larger N** gives the condition more time to arrive, but:
   - the prologue computes N conditions on every entry to the loop (32 instructions for `clamp_below` at 16);
   - an entry with `tc <= N` runs only the original loop and pays for the guard;
@@ -334,15 +343,18 @@ Note there is no `riscv-ns-` prefix.
   - It is not a loop IR fission marked, and the function is not `_start` or `_exit`.
 - **Tiling:** a trip count above the queue depth (3.3) is split into tiles. The first tile takes `trip % depth` iterations, or the full depth if that is 0, and every later tile takes `depth`.
 - **At the defaults, it mostly sees what pipelining leaves behind.** With 200 iterations of the 3.1 loop:
-  - at the defaults, pipelining takes the loop. Machine fission rejects the kernel (`data branch count is not 1`), but splits the drain loop, whose trip count is now the constant 16;
+  - at the defaults, pipelining takes the loop. Machine fission skips the marked
+    kernel, but can split the drain loop, whose trip count is the constant 16;
   - with `-riscv-ns-disable-software-pipelining`, it splits the whole loop into a tile of 8 and three of 64.
 - **It does nothing with `-riscv-ns-disable-hardware-loops`.**
-- **Misleading debug output:** after every loop it looks at, including the ones it splits, it prints `fission: reject <function>: trip count`. Use `-stats` to see what it actually did.
 
 ### 3.3 `-loop-fission-queue-depth=N`
 
-- **Default:** 64. Values above 64 are cut to 64, and 0 makes 3.2 reject every loop.
-- **This is the tile size of 3.2 only.** IR fission's limit is fixed at 64.
+- **Default:** 64. Values above 64 are cut to 64, and 0 disables machine fission
+  on loops that inherit it. A positive local depth overrides that zero.
+- **This flag is the tile size of 3.2 only.** Without metadata, IR fission's
+  limit is 64. Per-loop `llvm.loop.riscv.ns.fission.queue_depth` overrides the
+  whole-loop cutoff in IR fission and the maximum tile size in machine fission.
 - **Lower it** to model a smaller queue in hardware. Each extra tile reruns the tile's setup. For example, `=16` turns the 200-iteration loop into one tile of 8 and twelve of 16.
 
 ---

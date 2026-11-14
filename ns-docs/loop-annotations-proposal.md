@@ -1,6 +1,8 @@
 # Proposal: per-loop controls for Non-Spec branch transformations
 
-**Status: draft; none of the new annotations below are implemented.** Written
+**Status: backend metadata support implemented; Clang syntax remains a draft.**
+See [the backend interface and verification instructions](loop-annotations.md).
+Originally written
 against `50c7eab35402`, 2026-11-13. Existing behavior and flags are described in
 [the optimization guide](optimization-guide.md).
 

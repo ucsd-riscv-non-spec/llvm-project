@@ -31,6 +31,8 @@ void _start(void) {
 #include "RISCV.h"
 #include "RISCVBranchSetupAnalysis.h"
 #include "RISCVInstrInfo.h"
+#include "RISCVMachineFunctionInfo.h"
+#include "RISCVNSLoopOptions.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
@@ -41,6 +43,7 @@ void _start(void) {
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCSymbol.h"
 #include "llvm/Support/CommandLine.h"
@@ -107,34 +110,15 @@ private:
                                    MachineInstr &CondBranch) const;
 
   bool buildSlice(MachineLoop &L, MachineInstr &Br,
-                  SmallVectorImpl<MachineInstr *> &Slice);
+                  SmallVectorImpl<MachineInstr *> &Slice, bool Force);
 
   /// Splits \p L into a compute loop (condition only, BMOVC enqueue)
   /// and a consume loop (original body, PB dequeue), tiled to
   /// LoopFissionQueueDepth if the trip count exceeds it.
-  bool fissionLoop(MachineLoop &L);
+  bool fissionLoop(MachineLoop &L, RISCVNS::FissionSettings Settings);
 };
 
 char RISCVLoopFissionDecomposedBranch::ID = 0;
-
-static bool isIRFissioned(const MachineLoop &L) {
-  const MachineBasicBlock *Latch = L.getLoopLatch();
-  const BasicBlock *IRLatch = Latch ? Latch->getBasicBlock() : nullptr;
-  const Instruction *Term = IRLatch ? IRLatch->getTerminator() : nullptr;
-  const MDNode *LoopID = Term ? Term->getMetadata(LLVMContext::MD_loop)
-                              : nullptr;
-  if (!LoopID)
-    return false;
-  for (unsigned I = 1; I < LoopID->getNumOperands(); ++I) {
-    auto *Option = dyn_cast<MDNode>(LoopID->getOperand(I));
-    if (!Option || Option->getNumOperands() != 1)
-      continue;
-    auto *Name = dyn_cast<MDString>(Option->getOperand(0));
-    if (Name && Name->getString() == "riscv.loop-fissioned")
-      return true;
-  }
-  return false;
-}
 
 bool RISCVLoopFissionDecomposedBranch::isFissionCandidate(
     MachineLoop &L) const {
@@ -237,7 +221,8 @@ bool RISCVLoopFissionDecomposedBranch::hasCrossIterationDependence(
 }
 
 bool RISCVLoopFissionDecomposedBranch::buildSlice(
-    MachineLoop &L, MachineInstr &Br, SmallVectorImpl<MachineInstr *> &Slice) {
+    MachineLoop &L, MachineInstr &Br, SmallVectorImpl<MachineInstr *> &Slice,
+    bool Force) {
   MachineRegisterInfo &MRI = Br.getMF()->getRegInfo();
   MachineBasicBlock *Header = L.getHeader(), *Latch = L.getLoopLatch();
   SmallPtrSet<MachineInstr *, 16> Seen;
@@ -283,9 +268,10 @@ bool RISCVLoopFissionDecomposedBranch::buildSlice(
             !enqueue(Def->getOperand(i).getReg()))
           return false;
     } else {
-      if (Def->mayStore() || Def->isCall() || Def->hasUnmodeledSideEffects())
+      if (!Force &&
+          (Def->mayStore() || Def->isCall() || Def->hasUnmodeledSideEffects()))
         return false;
-      if (Def->mayLoad())
+      if (Def->mayLoad() && !Force)
         for (MachineBasicBlock *B : L.blocks())
           for (MachineInstr &S : *B)
             if (S.mayStore() && S.mayAlias(AA, *Def, /*UseTBAA=*/true))
@@ -328,7 +314,8 @@ static std::pair<unsigned, const char *> bmovcFor(unsigned Opc) {
   llvm_unreachable("not a data branch");
 }
 
-bool RISCVLoopFissionDecomposedBranch::fissionLoop(MachineLoop &L) {
+bool RISCVLoopFissionDecomposedBranch::fissionLoop(
+    MachineLoop &L, RISCVNS::FissionSettings Settings) {
   MachineBasicBlock *Pre = L.getLoopPreheader(), *Header = L.getHeader(),
                     *Latch = L.getLoopLatch();
   MachineFunction &MF = *Header->getParent();
@@ -378,7 +365,7 @@ bool RISCVLoopFissionDecomposedBranch::fissionLoop(MachineLoop &L) {
     return Reject("trip count is not a positive constant");
 
   // The hardware queue holds 64 outcomes. A tile must not exceed it.
-  int64_t Depth = std::min<unsigned>(LoopFissionQueueDepth, 64);
+  int64_t Depth = Settings.QueueDepth;
   if (Depth < 1)
     return Reject("queue depth is below 1");
   const bool Tiled = Trip > Depth;
@@ -393,7 +380,7 @@ bool RISCVLoopFissionDecomposedBranch::fissionLoop(MachineLoop &L) {
     return Reject("latch has no explicit branch to the exit block");
 
   SmallVector<MachineInstr *, 16> Slice;
-  if (!buildSlice(L, *Br, Slice))
+  if (!buildSlice(L, *Br, Slice, Settings.Force))
     return Reject("slice has a dependence that blocks fission");
   SmallPtrSet<MachineInstr *, 16> InSlice(Slice.begin(), Slice.end());
 
@@ -631,6 +618,13 @@ bool RISCVLoopFissionDecomposedBranch::fissionLoop(MachineLoop &L) {
       .addMBB(TBB);
   Br->eraseFromParent();
 
+  // Keep generated compute, consume and tile loops out of future invocations.
+  // In particular, never mark a shared IR loop ID through a machine block.
+  auto *MFI = MF.getInfo<RISCVMachineFunctionInfo>();
+  MFI->markNSFissioned(Compute);
+  MFI->markNSFissioned(Header);
+  if (TileHeader)
+    MFI->markNSFissioned(TileHeader);
   MDT->recalculate(MF);
   MLI->releaseMemory();
   MLI->analyze(*MDT);
@@ -640,7 +634,8 @@ bool RISCVLoopFissionDecomposedBranch::fissionLoop(MachineLoop &L) {
 
 bool RISCVLoopFissionDecomposedBranch::runOnMachineFunction(
     MachineFunction &MF) {
-  if (DisableLoopFissionDecomposedBranch)
+  if (!RISCVNS::validateLoopOptions(MF.getFunction()) ||
+      skipFunction(MF.getFunction()))
     return false;
   if (MF.getName() == "_start" || MF.getName() == "_exit")
     return false;
@@ -652,7 +647,7 @@ bool RISCVLoopFissionDecomposedBranch::runOnMachineFunction(
   // Snapshot headers first. fissionLoop rebuilds MLI, which frees MachineLoops.
   SmallVector<MachineBasicBlock *, 4> Headers;
   for (MachineLoop *L : MLI->getLoopsInPreorder())
-    if (L->isInnermost() && !isIRFissioned(*L))
+    if (L->isInnermost())
       Headers.push_back(L->getHeader());
 
   bool Changed = false;
@@ -660,9 +655,53 @@ bool RISCVLoopFissionDecomposedBranch::runOnMachineFunction(
     MachineLoop *L = MLI->getLoopFor(H);
     if (!L || L->getHeader() != H)
       continue;
-    Changed |= fissionLoop(*L);
-    LLVM_DEBUG(dbgs() << "fission: reject " << MF.getName()
-                      << ": trip count\n");
+    auto *MFI = MF.getInfo<RISCVMachineFunctionInfo>();
+    if (MFI->isNSFissioned(H))
+      continue;
+    RISCVNS::LoopOptions Options;
+    bool IRFissioned = false;
+    StringRef SWPRole;
+    if (MDNode *ID = L->getLoopID()) {
+      SmallVector<MachineBasicBlock *, 4> Latches;
+      L->getLoopLatches(Latches);
+      const BasicBlock *BB = Latches.front()->getBasicBlock();
+      auto Parsed = RISCVNS::parseLoopOptions(ID, *BB->getTerminator());
+      if (!Parsed)
+        continue;
+      Options = *Parsed;
+      IRFissioned = RISCVNS::isIRFissioned(ID);
+      SWPRole = RISCVNS::getSWPApplied(ID);
+    } else if (MFI->hasNSLoopControls()) {
+      const RISCVMachineFunctionInfo::NSLoopRecord *Record = nullptr;
+      bool Ambiguous = false;
+      bool Controlled = false;
+      for (MachineBasicBlock *BB : L->blocks()) {
+        const auto *R = MFI->getNSLoopRecord(BB->getBasicBlock());
+        if (!R)
+          continue;
+        if (Record && Record != R)
+          Ambiguous = true;
+        Controlled |= !R->Recoverable || R->Options.hasRequests() ||
+                      R->IRFissioned || !R->SWPRole.empty();
+        Record = R;
+      }
+      if (!Record || !Record->Recoverable || (Ambiguous && Controlled)) {
+        MF.getFunction().getContext().diagnose(DiagnosticInfoUnsupported(
+            MF.getFunction(),
+            "cannot recover Non-Spec controls for machine loop bb." +
+                Twine(H->getNumber()) + " in function '" + MF.getName() + "'"));
+        continue;
+      }
+      Options = Record->Options;
+      IRFissioned = Record->IRFissioned;
+      SWPRole = Record->SWPRole;
+    }
+    const auto Settings = Options.resolveMachineFission(
+        LoopFissionQueueDepth, DisableLoopFissionDecomposedBranch);
+    if (!Settings.Enable || IRFissioned || SWPRole == "kernel" ||
+        SWPRole == "inplace")
+      continue;
+    Changed |= fissionLoop(*L, Settings);
   }
   return Changed;
 }

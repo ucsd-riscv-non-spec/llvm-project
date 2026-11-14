@@ -13,10 +13,15 @@
 #ifndef LLVM_LIB_TARGET_RISCV_RISCVMACHINEFUNCTIONINFO_H
 #define LLVM_LIB_TARGET_RISCV_RISCVMACHINEFUNCTIONINFO_H
 
+#include "RISCVNSLoopOptions.h"
 #include "RISCVSubtarget.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/CodeGen/MIRYamlMapping.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineFunction.h"
+#include <string>
+#include <vector>
 
 namespace llvm {
 
@@ -26,6 +31,7 @@ namespace yaml {
 struct RISCVMachineFunctionInfo final : public yaml::MachineFunctionInfo {
   int VarArgsFrameIndex;
   int VarArgsSaveSize;
+  std::vector<unsigned> NSFissionedBlocks;
 
   RISCVMachineFunctionInfo() = default;
   RISCVMachineFunctionInfo(const llvm::RISCVMachineFunctionInfo &MFI);
@@ -38,6 +44,8 @@ template <> struct MappingTraits<RISCVMachineFunctionInfo> {
   static void mapping(IO &YamlIO, RISCVMachineFunctionInfo &MFI) {
     YamlIO.mapOptional("varArgsFrameIndex", MFI.VarArgsFrameIndex);
     YamlIO.mapOptional("varArgsSaveSize", MFI.VarArgsSaveSize);
+    YamlIO.mapOptional("nsFissionedBlocks", MFI.NSFissionedBlocks,
+                       std::vector<unsigned>());
   }
 };
 } // end namespace yaml
@@ -45,7 +53,21 @@ template <> struct MappingTraits<RISCVMachineFunctionInfo> {
 /// RISCVMachineFunctionInfo - This class is derived from MachineFunctionInfo
 /// and contains private RISCV-specific information for each MachineFunction.
 class RISCVMachineFunctionInfo : public MachineFunctionInfo {
+public:
+  /// A lowering provenance record, indexed by the source loop's blocks. The
+  /// controls are copied by value; metadata pointers are not loop identities.
+  struct NSLoopRecord {
+    RISCVNS::LoopOptions Options;
+    bool IRFissioned = false;
+    std::string SWPRole;
+    bool Recoverable = true;
+  };
+
 private:
+  bool HasNSLoopControls = false;
+  SmallVector<NSLoopRecord, 4> NSLoops;
+  DenseMap<const BasicBlock *, unsigned> NSLoopForIRBlock;
+  SmallPtrSet<const MachineBasicBlock *, 8> NSFissionedBlocks;
   /// FrameIndex for start of varargs area
   int VarArgsFrameIndex = 0;
   /// Size of the save area used for varargs
@@ -88,6 +110,21 @@ private:
 
 public:
   RISCVMachineFunctionInfo(const Function &F, const RISCVSubtarget *STI);
+
+  bool hasNSLoopControls() const { return HasNSLoopControls; }
+  const NSLoopRecord *getNSLoopRecord(const BasicBlock *BB) const {
+    auto It = NSLoopForIRBlock.find(BB);
+    return It == NSLoopForIRBlock.end() ? nullptr : &NSLoops[It->second];
+  }
+  bool isNSFissioned(const MachineBasicBlock *BB) const {
+    return NSFissionedBlocks.contains(BB);
+  }
+  void markNSFissioned(const MachineBasicBlock *BB) {
+    NSFissionedBlocks.insert(BB);
+  }
+  const SmallPtrSetImpl<const MachineBasicBlock *> &getNSFissionedBlocks() const {
+    return NSFissionedBlocks;
+  }
 
   MachineFunctionInfo *
   clone(BumpPtrAllocator &Allocator, MachineFunction &DestMF,
