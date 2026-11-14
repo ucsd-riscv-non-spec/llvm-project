@@ -1,11 +1,43 @@
-# Non-Spec backend loop metadata
+# Non-Spec loop annotations
 
-The backend accepts the IR metadata from [the loop annotations proposal](loop-annotations-proposal.md).
-Clang's proposed `riscv_ns_*` pragma syntax is not implemented by this patch.
-IR producers can attach the properties directly to distinct, self-referencing
-`!llvm.loop` IDs on latch branches. Properties apply only to that loop.
+Clang supports the `riscv_ns_*` family of `#pragma clang loop` hints from
+[the loop annotations proposal](loop-annotations-proposal.md). The RISC-V
+backend consumes their IR metadata. Other IR producers can attach the same
+properties directly to distinct, self-referencing `!llvm.loop` IDs on latch
+branches. Properties apply only to that loop.
 
-For example, request SWP at distance 8 while disabling both fission passes:
+## Clang source interface
+
+Place the pragma immediately before a `for`, C++ range-for, `while` or `do`
+loop. Multiple hints can share a pragma or appear on consecutive pragma lines.
+The hints do not propagate to nested or sibling loops. For example, request
+SWP at distance 8 while disabling both fission passes:
+
+```c
+#pragma clang loop riscv_ns_swp(enable) riscv_ns_swp_distance(8)
+#pragma clang loop riscv_ns_ir_fission(disable) riscv_ns_machine_fission(disable)
+for (long i = 0; i < n; ++i)
+  if (a[i] < threshold)
+    out[i] = threshold;
+```
+
+All source names below have the prefix `riscv_ns_`. State hints accept only
+`enable` or `disable`; numeric hints require integer constant expressions in
+the listed ranges, including after C++ template substitution. Invalid arguments
+and duplicate hints are errors, even when repeated values agree and even at
+`-O0`. These hints can coexist with generic loop hints such as `unroll(disable)`.
+Clang preserves them through PCH serialization and generic transformation
+follow-up metadata.
+
+An absent hint inherits the backend setting. Numeric hints and
+`riscv_ns_force(enable)` do not enable a disabled pass or an opt-in feature.
+Disabling a pass while specifying its tuning values is valid. The existing
+`pipeline` and `pipeline_initiation_interval` hints control machine scheduling,
+not Non-Spec condition lookahead.
+
+## LLVM IR interface
+
+The source example above emits these properties:
 
 ```llvm
 !0 = distinct !{!0, !1, !2, !3}
@@ -17,21 +49,21 @@ For example, request SWP at distance 8 while disabling both fission passes:
 Every key below has the prefix `llvm.loop.riscv.ns.`. Emit only explicitly
 supplied options; an absent boolean inherits its default and differs from false.
 
-| Suffix | Encoding | Default |
-|---|---|---|
-| `swp.enable` | `i1` | enabled |
-| `fission.ir.enable` | `i1` | enabled |
-| `fission.machine.enable` | `i1` | enabled |
-| `force` | `i1` | false |
-| `swp.distance` | `i32`, 1–62 | `-riscv-ns-swp-distance` (16) |
-| `swp.speculative_distance` | `i32`, 1–62 | `-riscv-ns-swp-speculative-distance` (4) |
-| `swp.speculative` | `i1` | `-riscv-ns-swp-speculative` (false) |
-| `swp.shift_recurrences` | `i1` | `-riscv-ns-swp-shift-recurrences` (false) |
-| `swp.toggles` | `i1` | `-riscv-ns-swp-toggles` (false) |
-| `swp.max_slice_size` | `i32`, 1–2147483647 | `-riscv-ns-swp-max-slice-size` (16) |
-| `swp.max_loop_size` | `i32`, 1–2147483647 | `-riscv-ns-swp-max-loop-size` (256) |
-| `swp.max_prologue_size` | `i32`, 1–2147483647 | `-riscv-ns-swp-max-prologue-size` (512) |
-| `fission.queue_depth` | `i32`, 1–64 | IR: 64; machine: `-loop-fission-queue-depth` (64) |
+| Source hint | Metadata suffix | Encoding / range | Default |
+|---|---|---|---|
+| `swp` | `swp.enable` | `i1` | enabled |
+| `ir_fission` | `fission.ir.enable` | `i1` | enabled |
+| `machine_fission` | `fission.machine.enable` | `i1` | enabled |
+| `force` | `force` | `i1` | false |
+| `swp_distance` | `swp.distance` | `i32`, 1–62 | `-riscv-ns-swp-distance` (16) |
+| `swp_speculative_distance` | `swp.speculative_distance` | `i32`, 1–62 | `-riscv-ns-swp-speculative-distance` (4) |
+| `swp_speculative` | `swp.speculative` | `i1` | `-riscv-ns-swp-speculative` (false) |
+| `swp_shift_recurrences` | `swp.shift_recurrences` | `i1` | `-riscv-ns-swp-shift-recurrences` (false) |
+| `swp_toggles` | `swp.toggles` | `i1` | `-riscv-ns-swp-toggles` (false) |
+| `swp_max_slice_size` | `swp.max_slice_size` | `i32`, 1–2147483647 | `-riscv-ns-swp-max-slice-size` (16) |
+| `swp_max_loop_size` | `swp.max_loop_size` | `i32`, 1–2147483647 | `-riscv-ns-swp-max-loop-size` (256) |
+| `swp_max_prologue_size` | `swp.max_prologue_size` | `i32`, 1–2147483647 | `-riscv-ns-swp-max-prologue-size` (512) |
+| `fission_queue_depth` | `fission.queue_depth` | `i32`, 1–64 | IR: 64; machine: `-loop-fission-queue-depth` (64) |
 
 Metadata overrides matching command-line tuning values, including explicitly
 supplied values. The three explicit disable flags remain compile-wide kill
@@ -48,9 +80,10 @@ machine fission uses it as the maximum tile size, including partial tiles.
 
 ## Force and retained requirements
 
-`!{!"llvm.loop.riscv.ns.force", i1 true}` bypasses size and profitability limits,
-SWP's `optsize` exclusion and shared function branch budget, memory dependence
-proofs, speculative safety checks, and semantic instruction exclusions. This
+`riscv_ns_force(enable)` (`!{!"llvm.loop.riscv.ns.force", i1 true}`) bypasses size
+and profitability limits, SWP's `optsize` exclusion and shared function branch
+budget, memory dependence proofs, speculative safety checks, and semantic
+instruction exclusions. This
 includes explicitly supplied local soft limits. Force may change program
 behavior or introduce traps when those assumptions do not hold.
 
@@ -114,7 +147,12 @@ rotation, peeling, vectorization, distribution, ordinary optimization and LTO pi
 Build an assertion-enabled compiler and run the regression tests:
 
 ```sh
-ninja -C llvm/cmake-build-debug llc opt FileCheck
+ninja -C llvm/cmake-build-debug clang llc opt FileCheck
+llvm/cmake-build-debug/bin/llvm-lit -v \
+  clang/test/Parser/pragma-loop-riscv-ns.cpp \
+  clang/test/CodeGen/pragma-loop-riscv-ns.c \
+  clang/test/CodeGenCXX/pragma-loop-riscv-ns.cpp \
+  clang/test/CodeGen/RISCV/pragma-loop-riscv-ns.c
 llvm/cmake-build-debug/bin/llvm-lit -v llvm/test/CodeGen/RISCV/ns-*.ll
 llvm/cmake-build-debug/bin/llvm-lit -v llvm/test/Transforms/LoopUnroll/
 ```

@@ -4558,7 +4558,8 @@ specified for the subsequent loop. The directive allows pipelining to be
 disabled, or vectorization, vector predication, interleaving, and unrolling to
 be enabled or disabled. Vector width, vector predication, interleave count,
 unrolling count, and the initiation interval for pipelining can be explicitly
-specified. See `language extensions
+specified. The ``riscv_ns_*`` hints control RISC-V Non-Spec branch condition
+pipelining and loop fission. See `language extensions
 <http://clang.llvm.org/docs/LanguageExtensions.html#extensions-for-loop-hint-optimizations>`_
 for details.
   }];

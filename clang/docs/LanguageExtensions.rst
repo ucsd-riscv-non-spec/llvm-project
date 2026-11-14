@@ -5288,12 +5288,14 @@ Extensions for loop hint optimizations
 The ``#pragma clang loop`` directive is used to specify hints for optimizing the
 subsequent for, while, do-while, or c++11 range-based for loop. The directive
 provides options for vectorization, interleaving, predication, unrolling and
-distribution. Loop hints can be specified before any loop and will be ignored if
-the optimization is not safe to apply.
+distribution. These hints can be specified before any loop and will be ignored
+if the optimization is not safe to apply. RISC-V Non-Spec controls are also
+available, including an explicit force mode described below.
 
-There are loop hints that control transformations (e.g. vectorization, loop
-unrolling) and there are loop hints that set transformation options (e.g.
-``vectorize_width``, ``unroll_count``).  Pragmas setting transformation options
+For the generic optimizations, there are loop hints that control transformations
+(e.g. vectorization, loop unrolling) and there are loop hints that set
+transformation options (e.g. ``vectorize_width``, ``unroll_count``). Pragmas
+setting transformation options
 imply the transformation is enabled, as if it was enabled via the corresponding
 transformation pragma (e.g. ``vectorize(enable)``). If the transformation is
 disabled  (e.g. ``vectorize(disable)``), that takes precedence over
@@ -5451,6 +5453,68 @@ statements S1 and S2 above.
 If Loop Distribution is turned on globally with
 ``-mllvm -enable-loop-distribution``, specifying ``distribute(disable)`` can
 be used the disable it on a per-loop basis.
+
+RISC-V Non-Spec transformations
+-------------------------------
+
+The ``riscv_ns_*`` hints control Non-Spec branch condition pipelining (SWP),
+IR loop fission, and machine loop fission. They apply only to the immediately
+following loop, including C++ range-for loops. Nested and sibling loops inherit
+the compile-wide defaults independently. The RISC-V backend consumes these
+hints; other targets may ignore them.
+
+.. code-block:: c++
+
+  #pragma clang loop riscv_ns_swp(enable) riscv_ns_swp_distance(8)
+  #pragma clang loop riscv_ns_ir_fission(disable) riscv_ns_machine_fission(disable)
+  for (long i = 0; i < n; ++i) {
+    if (a[i] < threshold)
+      out[i] = threshold;
+  }
+
+All names in this table have the prefix ``riscv_ns_``:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Hint
+     - Argument
+   * - ``swp``, ``ir_fission``, ``machine_fission``
+     - ``enable`` or ``disable``
+   * - ``force``
+     - ``enable`` or ``disable``
+   * - ``swp_speculative``, ``swp_shift_recurrences``, ``swp_toggles``
+     - ``enable`` or ``disable``
+   * - ``swp_distance``, ``swp_speculative_distance``
+     - Integer constant expression in [1, 62]
+   * - ``swp_max_slice_size``, ``swp_max_loop_size``, ``swp_max_prologue_size``
+     - Integer constant expression in [1, 2147483647]
+   * - ``fission_queue_depth``
+     - Integer constant expression in [1, 64]
+
+Invalid arguments and duplicate hints are errors, including identical repeats.
+Numeric expressions are checked again after template substitution. Only
+explicitly supplied hints are emitted, using ``llvm.loop.riscv.ns.*`` metadata
+with ``i1`` state values and ``i32`` numeric values. An absent hint inherits the
+backend's default, which differs from an explicit ``disable``. These hints may
+be combined with the generic loop hints.
+
+Numeric hints and ``riscv_ns_force(enable)`` do not enable disabled passes or
+opt-in features. In particular, ``riscv_ns_swp_speculative_distance(3)`` does
+not imply ``riscv_ns_swp_speculative(enable)``. Metadata overrides matching
+command-line tuning values. Explicit global pass disables still take precedence.
+Fission queue depth is the maximum whole-loop trip count for IR fission and
+the maximum tile size for machine fission. The generic ``pipeline`` hints
+control machine scheduling rather than Non-Spec condition lookahead.
+
+``riscv_ns_force(enable)`` bypasses profitability and size limits, memory
+dependence proofs, speculative safety checks, and semantic instruction
+exclusions. It can change program behavior or introduce traps when the user's
+assumptions do not hold. Structural requirements for valid code, hardware
+bounds, explicit disables, opt-in feature gates, and ``optnone`` still apply.
+Force does not change register allocation or make unavailable passes run.
+Backend transformation support at ``-O0`` is not guaranteed; Clang still
+checks source arguments at that optimization level.
 
 Additional Information
 ----------------------

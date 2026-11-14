@@ -38,6 +38,10 @@ LoopInfo::createPipeliningMetadata(const LoopAttributes &Attrs,
                                    bool &HasUserTransforms) {
   LLVMContext &Ctx = Header->getContext();
 
+  // Keep target controls in follow-up IDs even if no generic transformation
+  // remains after the current one.
+  HasUserTransforms |= !Attrs.RISCVNSProperties.empty();
+
   std::optional<bool> Enabled;
   if (Attrs.PipelineDisabled)
     Enabled = false;
@@ -424,6 +428,7 @@ SmallVector<Metadata *, 4> LoopInfo::createMetadata(
     LoopProperties.push_back(MDNode::get(Ctx, Vals));
   }
 
+  llvm::append_range(LoopProperties, Attrs.RISCVNSProperties);
   llvm::append_range(LoopProperties, AdditionalLoopProperties);
   return createFullUnrollMetadata(Attrs, LoopProperties, HasUserTransforms);
 }
@@ -454,6 +459,7 @@ void LoopAttributes::clear() {
   PipelineInitiationInterval = 0;
   CodeAlign = 0;
   MustProgress = false;
+  RISCVNSProperties.clear();
 }
 
 LoopInfo::LoopInfo(BasicBlock *Header, const LoopAttributes &Attrs,
@@ -478,7 +484,8 @@ LoopInfo::LoopInfo(BasicBlock *Header, const LoopAttributes &Attrs,
       Attrs.UnrollEnable == LoopAttributes::Unspecified &&
       Attrs.UnrollAndJamEnable == LoopAttributes::Unspecified &&
       Attrs.DistributeEnable == LoopAttributes::Unspecified &&
-      Attrs.CodeAlign == 0 && !StartLoc && !EndLoc && !Attrs.MustProgress)
+      Attrs.CodeAlign == 0 && !StartLoc && !EndLoc && !Attrs.MustProgress &&
+      Attrs.RISCVNSProperties.empty())
     return;
 
   TempLoopID = MDNode::getTemporary(Header->getContext(), {});
@@ -503,6 +510,8 @@ void LoopInfo::finish() {
     LoopAttributes BeforeJam, AfterJam;
 
     BeforeJam.IsParallel = AfterJam.IsParallel = Attrs.IsParallel;
+    BeforeJam.RISCVNSProperties = AfterJam.RISCVNSProperties =
+        Attrs.RISCVNSProperties;
 
     BeforeJam.VectorizeWidth = Attrs.VectorizeWidth;
     BeforeJam.VectorizeScalable = Attrs.VectorizeScalable;
@@ -637,6 +646,19 @@ void LoopInfoStack::push(BasicBlock *Header, clang::ASTContext &Ctx,
 
       Option = LH->getOption();
       State = LH->getState();
+      if (LoopHintAttr::isRISCVNSOption(Option)) {
+        LLVMContext &LLVMCtx = Header->getContext();
+        bool IsNumeric = State == LoopHintAttr::Numeric;
+        Metadata *Vals[] = {
+            MDString::get(LLVMCtx,
+                          LoopHintAttr::getRISCVNSMetadataName(Option)),
+            ConstantAsMetadata::get(ConstantInt::get(
+                IsNumeric ? llvm::Type::getInt32Ty(LLVMCtx)
+                          : llvm::Type::getInt1Ty(LLVMCtx),
+                IsNumeric ? ValueInt : State == LoopHintAttr::Enable))};
+        StagedAttrs.RISCVNSProperties.push_back(MDNode::get(LLVMCtx, Vals));
+        continue;
+      }
     }
     switch (State) {
     case LoopHintAttr::Disable:
@@ -670,6 +692,7 @@ void LoopInfoStack::push(BasicBlock *Header, clang::ASTContext &Ctx,
       case LoopHintAttr::VectorizeWidth:
       case LoopHintAttr::InterleaveCount:
       case LoopHintAttr::PipelineInitiationInterval:
+      default:
         llvm_unreachable("Options cannot be disabled.");
         break;
       }
@@ -698,6 +721,7 @@ void LoopInfoStack::push(BasicBlock *Header, clang::ASTContext &Ctx,
       case LoopHintAttr::InterleaveCount:
       case LoopHintAttr::PipelineDisabled:
       case LoopHintAttr::PipelineInitiationInterval:
+      default:
         llvm_unreachable("Options cannot enabled.");
         break;
       }
@@ -720,6 +744,7 @@ void LoopInfoStack::push(BasicBlock *Header, clang::ASTContext &Ctx,
       case LoopHintAttr::Distribute:
       case LoopHintAttr::PipelineDisabled:
       case LoopHintAttr::PipelineInitiationInterval:
+      default:
         llvm_unreachable("Options cannot be used to assume mem safety.");
         break;
       }
@@ -742,6 +767,7 @@ void LoopInfoStack::push(BasicBlock *Header, clang::ASTContext &Ctx,
       case LoopHintAttr::PipelineDisabled:
       case LoopHintAttr::PipelineInitiationInterval:
       case LoopHintAttr::VectorizePredicate:
+      default:
         llvm_unreachable("Options cannot be used with 'full' hint.");
         break;
       }
@@ -783,6 +809,7 @@ void LoopInfoStack::push(BasicBlock *Header, clang::ASTContext &Ctx,
       case LoopHintAttr::Interleave:
       case LoopHintAttr::Distribute:
       case LoopHintAttr::PipelineDisabled:
+      default:
         llvm_unreachable("Options cannot be assigned a value.");
         break;
       }

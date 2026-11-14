@@ -1,7 +1,7 @@
 # Proposal: per-loop controls for Non-Spec branch transformations
 
-**Status: backend metadata support implemented; Clang syntax remains a draft.**
-See [the backend interface and verification instructions](loop-annotations.md).
+**Status: backend metadata and Clang source hints implemented.**
+See [the source and backend interfaces and verification instructions](loop-annotations.md).
 Originally written
 against `50c7eab35402`, 2026-11-13. Existing behavior and flags are described in
 [the optimization guide](optimization-guide.md).
@@ -40,7 +40,7 @@ takes responsibility for the resulting program behavior. Structural requirements
 needed to construct the transformation, hardware bounds and target/pipeline
 availability still apply; section 4 defines that boundary.
 
-## 2. Proposed source interface
+## 2. Source interface
 
 Extend `#pragma clang loop` with a `riscv_ns_` family. It applies to the immediately
 following `for`, range-for, `while` or `do` loop, using Clang's existing loop-hint

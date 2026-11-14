@@ -3697,6 +3697,24 @@ bool Sema::CheckLoopHintExpr(Expr *E, SourceLocation Loc, bool AllowZero) {
   return false;
 }
 
+bool Sema::CheckRISCVNSLoopHintExpr(Expr *E, LoopHintAttr::OptionType Option) {
+  if (CheckLoopHintExpr(E, E->getExprLoc(), /*AllowZero=*/false))
+    return true;
+  if (E->isValueDependent())
+    return false;
+
+  unsigned Maximum = LoopHintAttr::getRISCVNSMaximum(Option);
+  assert(Maximum && "Expected a numeric Non-Spec loop hint");
+  llvm::APSInt Value = E->EvaluateKnownConstInt(Context);
+  if (Value > Maximum) {
+    Diag(E->getExprLoc(), diag::err_pragma_loop_riscv_ns_invalid_value)
+        << toString(Value, 10) << LoopHintAttr::getOptionName(Option)
+        << Maximum;
+    return true;
+  }
+  return false;
+}
+
 ExprResult Sema::ActOnNumericConstant(const Token &Tok, Scope *UDLScope) {
   // Fast path for a single digit (which is quite common).  A single digit
   // cannot have a trigraph, escaped newline, radix prefix, or suffix.

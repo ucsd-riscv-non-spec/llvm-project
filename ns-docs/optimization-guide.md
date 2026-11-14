@@ -42,11 +42,11 @@ Everything is on by default except the three `-riscv-ns-swp-*` extensions (`spec
 - All of them are hidden `cl::opt`s, so `llc --help-hidden` lists them.
 - With `llc`, pass them directly. With `clang`, pass each one through `-mllvm`:
   `clang -O2 -mllvm -riscv-ns-swp-speculative -mllvm -riscv-ns-swp-speculative-distance=3 ...`
-- A flag supplies defaults for the whole compile. The backend also accepts
-  [per-loop IR metadata](loop-annotations.md) for independent pass controls,
+- A flag supplies defaults for the whole compile. Clang also accepts
+  [`#pragma clang loop riscv_ns_*` hints](loop-annotations.md), lowered to
+  per-loop IR metadata, for independent pass controls,
   distances, feature gates, size limits, fission depth and force. Explicit
-  pass-disable flags remain compile-wide kill switches. The proposed Clang
-  pragma spelling is not implemented yet.
+  pass-disable flags remain compile-wide kill switches.
 - **At `-O0`,** IR loop fission and branch condition pipelining are not added to the pipeline. Hardware loops, machine fission, exit-jump splitting and hoisting still run.
 - **With GlobalISel** (`-global-isel`), IR loop fission and branch condition pipelining do nothing. Only SelectionDAG selects the queue intrinsics.
 
