@@ -16,6 +16,7 @@
 #include "clang/Sema/DelayedDiagnostic.h"
 #include "clang/Sema/ParsedAttr.h"
 #include "clang/Sema/ScopeInfo.h"
+#include "llvm/ADT/DenseMap.h"
 #include <optional>
 
 using namespace clang;
@@ -130,21 +131,23 @@ static Attr *handleLoopHintAttr(Sema &S, Stmt *St, const ParsedAttr &A,
     // #pragma clang loop ...
     assert(OptionLoc && OptionLoc->getIdentifierInfo() &&
            "Attribute must have valid option info.");
-    Option = llvm::StringSwitch<LoopHintAttr::OptionType>(
-                 OptionLoc->getIdentifierInfo()->getName())
-                 .Case("vectorize", LoopHintAttr::Vectorize)
-                 .Case("vectorize_width", LoopHintAttr::VectorizeWidth)
-                 .Case("interleave", LoopHintAttr::Interleave)
-                 .Case("vectorize_predicate", LoopHintAttr::VectorizePredicate)
-                 .Case("interleave_count", LoopHintAttr::InterleaveCount)
-                 .Case("unroll", LoopHintAttr::Unroll)
-                 .Case("unroll_count", LoopHintAttr::UnrollCount)
-                 .Case("pipeline", LoopHintAttr::PipelineDisabled)
-                 .Case("pipeline_initiation_interval",
-                       LoopHintAttr::PipelineInitiationInterval)
-                 .Case("distribute", LoopHintAttr::Distribute)
-                 .Default(LoopHintAttr::Vectorize);
-    if (Option == LoopHintAttr::VectorizeWidth) {
+    if (!LoopHintAttr::ConvertStrToOptionType(
+            OptionLoc->getIdentifierInfo()->getName(), Option))
+      llvm_unreachable("bad loop hint");
+    if (LoopHintAttr::isRISCVNSOption(Option)) {
+      if (LoopHintAttr::getRISCVNSMaximum(Option)) {
+        assert(ValueExpr && "Attribute must have a valid value expression");
+        if (S.CheckRISCVNSLoopHintExpr(ValueExpr, Option))
+          return nullptr;
+        State = LoopHintAttr::Numeric;
+      } else {
+        assert(StateLoc && StateLoc->getIdentifierInfo() &&
+               "Loop hint must have an argument");
+        State = StateLoc->getIdentifierInfo()->isStr("enable")
+                    ? LoopHintAttr::Enable
+                    : LoopHintAttr::Disable;
+      }
+    } else if (Option == LoopHintAttr::VectorizeWidth) {
       assert((ValueExpr || (StateLoc && StateLoc->getIdentifierInfo())) &&
              "Attribute must have a valid value expression or argument.");
       if (ValueExpr && S.CheckLoopHintExpr(ValueExpr, St->getBeginLoc(),
@@ -483,6 +486,8 @@ CheckForIncompatibleAttributes(Sema &S,
     const LoopHintAttr *StateAttr;
     const LoopHintAttr *NumericAttr;
   } HintAttrs[CategoryType::NumberOfCategories] = {};
+  llvm::SmallDenseMap<LoopHintAttr::OptionType, const LoopHintAttr *, 16>
+      RISCVNSAttrs;
 
   for (const auto *I : Attrs) {
     const LoopHintAttr *LH = dyn_cast<LoopHintAttr>(I);
@@ -493,6 +498,19 @@ CheckForIncompatibleAttributes(Sema &S,
 
     CategoryType Category = CategoryType::NumberOfCategories;
     LoopHintAttr::OptionType Option = LH->getOption();
+    if (LoopHintAttr::isRISCVNSOption(Option)) {
+      // Every Non-Spec property is independent. In particular, a disable and
+      // a numeric tuning hint can coexist without enabling the transformation.
+      auto Inserted = RISCVNSAttrs.try_emplace(Option, LH);
+      if (!Inserted.second) {
+        PrintingPolicy Policy(S.Context.getLangOpts());
+        S.Diag(LH->getLocation(), diag::err_pragma_loop_compatibility)
+            << /*Duplicate=*/true
+            << Inserted.first->second->getDiagnosticName(Policy)
+            << LH->getDiagnosticName(Policy);
+      }
+      continue;
+    }
     switch (Option) {
     case LoopHintAttr::Vectorize:
     case LoopHintAttr::VectorizeWidth:
@@ -521,6 +539,8 @@ CheckForIncompatibleAttributes(Sema &S,
     case LoopHintAttr::VectorizePredicate:
       Category = VectorizePredicate;
       break;
+    default:
+      llvm_unreachable("Unhandled loop hint option");
     };
 
     assert(Category != NumberOfCategories && "Unhandled loop hint option");

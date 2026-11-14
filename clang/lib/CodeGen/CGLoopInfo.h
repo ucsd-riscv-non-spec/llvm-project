@@ -24,6 +24,7 @@ namespace llvm {
 class BasicBlock;
 class Instruction;
 class MDNode;
+class Metadata;
 } // end namespace llvm
 
 namespace clang {
@@ -84,6 +85,9 @@ struct LoopAttributes {
 
   /// Value for whether the loop is required to make progress.
   bool MustProgress;
+
+  /// Explicit RISC-V Non-Spec properties, including explicit false values.
+  llvm::SmallVector<llvm::Metadata *, 1> RISCVNSProperties;
 };
 
 /// Information used when generating a structured loop.

@@ -4462,6 +4462,7 @@ def LoopHint : Attr {
   /// distribute: attempt to distribute loop if State == Enable.
   /// pipeline: disable pipelining loop if State == Disable.
   /// pipeline_initiation_interval: create loop schedule with initiation interval equal to 'Value'.
+  /// riscv_ns_*: loop-local controls for RISC-V Non-Spec transformations.
 
   /// #pragma unroll <argument> directive
   /// <no arg>: fully unrolls loop.
@@ -4477,11 +4478,23 @@ def LoopHint : Attr {
                           ["vectorize", "vectorize_width", "interleave", "interleave_count",
                            "unroll", "unroll_count", "unroll_and_jam", "unroll_and_jam_count",
                            "pipeline", "pipeline_initiation_interval", "distribute",
-                           "vectorize_predicate"],
+                           "vectorize_predicate", "riscv_ns_swp",
+                           "riscv_ns_ir_fission", "riscv_ns_machine_fission",
+                           "riscv_ns_force", "riscv_ns_swp_speculative",
+                           "riscv_ns_swp_shift_recurrences", "riscv_ns_swp_toggles",
+                           "riscv_ns_swp_distance", "riscv_ns_swp_speculative_distance",
+                           "riscv_ns_swp_max_slice_size", "riscv_ns_swp_max_loop_size",
+                           "riscv_ns_swp_max_prologue_size", "riscv_ns_fission_queue_depth"],
                           ["Vectorize", "VectorizeWidth", "Interleave", "InterleaveCount",
                            "Unroll", "UnrollCount", "UnrollAndJam", "UnrollAndJamCount",
                            "PipelineDisabled", "PipelineInitiationInterval", "Distribute",
-                           "VectorizePredicate"]>,
+                           "VectorizePredicate", "RISCVNSSWP",
+                           "RISCVNSIRFission", "RISCVNSMachineFission",
+                           "RISCVNSForce", "RISCVNSSWPSpeculative",
+                           "RISCVNSSWPShiftRecurrences", "RISCVNSSWPToggles",
+                           "RISCVNSSWPDistance", "RISCVNSSWPSpeculativeDistance",
+                           "RISCVNSSWPMaxSliceSize", "RISCVNSSWPMaxLoopSize",
+                           "RISCVNSSWPMaxPrologueSize", "RISCVNSFissionQueueDepth"]>,
               EnumArgument<"State", "LoopHintState", /*is_string=*/false,
                            ["enable", "disable", "numeric", "fixed_width",
                             "scalable_width", "assume_safety", "full"],
@@ -4491,22 +4504,17 @@ def LoopHint : Attr {
 
   let AdditionalMembers = [{
   static const char *getOptionName(int Option) {
-    switch(Option) {
-    case Vectorize: return "vectorize";
-    case VectorizeWidth: return "vectorize_width";
-    case Interleave: return "interleave";
-    case InterleaveCount: return "interleave_count";
-    case Unroll: return "unroll";
-    case UnrollCount: return "unroll_count";
-    case UnrollAndJam: return "unroll_and_jam";
-    case UnrollAndJamCount: return "unroll_and_jam_count";
-    case PipelineDisabled: return "pipeline";
-    case PipelineInitiationInterval: return "pipeline_initiation_interval";
-    case Distribute: return "distribute";
-    case VectorizePredicate: return "vectorize_predicate";
-    }
-    llvm_unreachable("Unhandled LoopHint option.");
+    return ConvertOptionTypeToStr(static_cast<OptionType>(Option));
   }
+
+  static bool isRISCVNSOption(OptionType Option) {
+    return Option >= RISCVNSSWP && Option <= RISCVNSFissionQueueDepth;
+  }
+
+  // Return the upper bound for a numeric Non-Spec hint, or zero for a state hint.
+  static unsigned getRISCVNSMaximum(OptionType Option);
+
+  static const char *getRISCVNSMetadataName(OptionType Option);
 
   void printPrettyPragma(raw_ostream &OS, const PrintingPolicy &Policy) const;
 

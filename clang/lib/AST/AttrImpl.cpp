@@ -17,6 +17,55 @@
 #include <optional>
 using namespace clang;
 
+unsigned LoopHintAttr::getRISCVNSMaximum(OptionType Option) {
+  switch (Option) {
+  case RISCVNSSWPDistance:
+  case RISCVNSSWPSpeculativeDistance:
+    return 62;
+  case RISCVNSFissionQueueDepth:
+    return 64;
+  case RISCVNSSWPMaxSliceSize:
+  case RISCVNSSWPMaxLoopSize:
+  case RISCVNSSWPMaxPrologueSize:
+    return 2147483647;
+  default:
+    return 0;
+  }
+}
+
+const char *LoopHintAttr::getRISCVNSMetadataName(OptionType Option) {
+  switch (Option) {
+  case RISCVNSSWP:
+    return "llvm.loop.riscv.ns.swp.enable";
+  case RISCVNSIRFission:
+    return "llvm.loop.riscv.ns.fission.ir.enable";
+  case RISCVNSMachineFission:
+    return "llvm.loop.riscv.ns.fission.machine.enable";
+  case RISCVNSForce:
+    return "llvm.loop.riscv.ns.force";
+  case RISCVNSSWPSpeculative:
+    return "llvm.loop.riscv.ns.swp.speculative";
+  case RISCVNSSWPShiftRecurrences:
+    return "llvm.loop.riscv.ns.swp.shift_recurrences";
+  case RISCVNSSWPToggles:
+    return "llvm.loop.riscv.ns.swp.toggles";
+  case RISCVNSSWPDistance:
+    return "llvm.loop.riscv.ns.swp.distance";
+  case RISCVNSSWPSpeculativeDistance:
+    return "llvm.loop.riscv.ns.swp.speculative_distance";
+  case RISCVNSSWPMaxSliceSize:
+    return "llvm.loop.riscv.ns.swp.max_slice_size";
+  case RISCVNSSWPMaxLoopSize:
+    return "llvm.loop.riscv.ns.swp.max_loop_size";
+  case RISCVNSSWPMaxPrologueSize:
+    return "llvm.loop.riscv.ns.swp.max_prologue_size";
+  case RISCVNSFissionQueueDepth:
+    return "llvm.loop.riscv.ns.fission.queue_depth";
+  default:
+    llvm_unreachable("Not a RISC-V Non-Spec loop hint");
+  }
+}
+
 void LoopHintAttr::printPrettyPragma(raw_ostream &OS,
                                      const PrintingPolicy &Policy) const {
   unsigned SpellingIndex = getAttributeSpellingListIndex();

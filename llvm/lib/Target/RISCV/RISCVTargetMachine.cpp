@@ -156,6 +156,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVBranchConditionPipeliningPass(*PR);
   initializeRISCVIRLoopFissionPass(*PR);
   initializeRISCVLoopDecideActPass(*PR);
+  initializeRISCVNSLoopMetadataPass(*PR);
   initializeRISCVRedundantCopyEliminationPass(*PR);
   initializeRISCVBranchSetupAnalysisWrapperPass(*PR);
   initializeRISCVLoopFissionDecomposedBranchPass(*PR); // Loop Fission
@@ -488,8 +489,10 @@ void RISCVPassConfig::addIRPasses() {
   }
 
   // Fission the supported conditional loops before SWP changes their shape.
-  if (getOptLevel() != CodeGenOptLevel::None)
+  if (getOptLevel() != CodeGenOptLevel::None) {
+    addPass(createRISCVNSLoopMetadataPass());
     addPass(createRISCVIRLoopFissionPass());
+  }
 
   // Split the guarded loops fission and pipelining give up on (a call or an
   // inner loop in the guarded part): decide every condition first, then act.
@@ -704,5 +707,15 @@ bool RISCVTargetMachine::parseMachineFunctionInfo(
   const auto &YamlMFI =
       static_cast<const yaml::RISCVMachineFunctionInfo &>(MFI);
   PFS.MF.getInfo<RISCVMachineFunctionInfo>()->initializeBaseYamlFields(YamlMFI);
+  for (unsigned Number : YamlMFI.NSFissionedBlocks) {
+    MachineBasicBlock *BB = PFS.MBBSlots.lookup(Number);
+    if (!BB) {
+      Error = PFS.SM->GetMessage(
+          SMLoc(), SourceMgr::DK_Error,
+          "unknown machine basic block in nsFissionedBlocks");
+      return true;
+    }
+    PFS.MF.getInfo<RISCVMachineFunctionInfo>()->markNSFissioned(BB);
+  }
   return false;
 }

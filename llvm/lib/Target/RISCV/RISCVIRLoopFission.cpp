@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "RISCV.h"
+#include "RISCVNSLoopOptions.h"
 #include "RISCVSubtarget.h"
 #include "RISCVTargetMachine.h"
 #include "llvm/ADT/STLExtras.h"
@@ -35,13 +36,13 @@ using namespace llvm;
 
 namespace {
 
-static constexpr unsigned QueueDepth = 64;
-
-static cl::opt<bool> DisableIRLoopFission(
-    "riscv-ns-disable-ir-loop-fission", cl::Hidden, cl::init(false),
-    cl::desc("Disable RISC-V IR loop fission"));
+static cl::opt<bool>
+    DisableIRLoopFission("riscv-ns-disable-ir-loop-fission", cl::Hidden,
+                         cl::init(false),
+                         cl::desc("Disable RISC-V IR loop fission"));
 
 struct LoopCandidate {
+  RISCVNS::FissionSettings Settings;
   Loop *L;
   BasicBlock *Preheader;
   BasicBlock *Header;
@@ -107,19 +108,11 @@ static std::string describe(const Instruction &I) {
 }
 
 static void markFissionedLoop(BranchInst &LatchBranch) {
-  LLVMContext &Context = LatchBranch.getContext();
-  MDNode *OldLoopID = LatchBranch.getMetadata(LLVMContext::MD_loop);
-  SmallVector<Metadata *, 8> Operands;
-  Operands.push_back(nullptr);
-  if (OldLoopID)
-    for (unsigned I = 1; I < OldLoopID->getNumOperands(); ++I)
-      Operands.push_back(OldLoopID->getOperand(I));
-  Metadata *MarkerOps[] = {MDString::get(Context, "riscv.loop-fissioned")};
-  Operands.push_back(MDNode::get(Context, MarkerOps));
-
-  MDNode *LoopID = MDNode::getDistinct(Context, Operands);
-  LoopID->replaceOperandWith(0, LoopID);
-  LatchBranch.setMetadata(LLVMContext::MD_loop, LoopID);
+  LatchBranch.setMetadata(
+      LLVMContext::MD_loop,
+      RISCVNS::makeLoopID(LatchBranch.getContext(),
+                          LatchBranch.getMetadata(LLVMContext::MD_loop),
+                          RISCVNS::LoopRole::Fission));
 }
 
 bool RISCVIRLoopFission::findCandidate(Loop &L, LoopCandidate &C) {
@@ -135,10 +128,10 @@ bool RISCVIRLoopFission::findCandidate(Loop &L, LoopCandidate &C) {
     return reject("the loop has no preheader or no single latch");
   if (C.TripCount == 0)
     return reject("the trip count is not a compile-time constant");
-  if (C.TripCount > QueueDepth)
+  if (C.TripCount > C.Settings.QueueDepth)
     return reject("the trip count (" + Twine(C.TripCount) +
                   ") is more than the condition queue holds (" +
-                  Twine(QueueDepth) + ")");
+                  Twine(C.Settings.QueueDepth) + ")");
   if (L.getExitingBlock() != C.Latch || !L.getExitBlock())
     return reject("the loop can exit other than at its latch");
 
@@ -216,7 +209,12 @@ bool RISCVIRLoopFission::findCandidate(Loop &L, LoopCandidate &C) {
     if (!DT->dominates(I, C.DataBranch))
       return reject("the condition depends on " + describe(*I) +
                     ", which does not run before the branch");
-    if (auto *Load = dyn_cast<LoadInst>(I)) {
+    // The complete loop is cloned, so these are semantic proofs rather than
+    // requirements for mapping the condition into the compute loop.
+    if (C.Settings.Force) {
+      if (isa<PHINode>(I))
+        continue;
+    } else if (auto *Load = dyn_cast<LoadInst>(I)) {
       if (!Load->isSimple())
         return reject("the condition depends on a volatile or atomic load");
     } else if (isa<PHINode>(I)) {
@@ -234,6 +232,10 @@ bool RISCVIRLoopFission::findCandidate(Loop &L, LoopCandidate &C) {
   for (BasicBlock *BB : L.blocks()) {
     for (Instruction &I : *BB) {
       if (isa<DbgInfoIntrinsic>(I) || I.isTerminator() || isa<PHINode>(I))
+        continue;
+      // The compute loop drops the conditional body and clones the remaining
+      // instructions. Force permits their reordered or duplicated effects.
+      if (C.Settings.Force)
         continue;
       if (auto *Store = dyn_cast<StoreInst>(&I)) {
         if (!Store->isSimple())
@@ -256,7 +258,7 @@ bool RISCVIRLoopFission::findCandidate(Loop &L, LoopCandidate &C) {
     }
   }
 
-  if (Stores.empty())
+  if (!C.Settings.Force && Stores.empty())
     return reject("the guarded block stores nothing");
   for (LoadInst *Load : Loads)
     for (StoreInst *Store : Stores)
@@ -364,7 +366,7 @@ bool RISCVIRLoopFission::fission(LoopCandidate &C, unsigned Queue) {
 }
 
 bool RISCVIRLoopFission::runOnFunction(Function &F) {
-  if (skipFunction(F) || DisableIRLoopFission)
+  if (!RISCVNS::validateLoopOptions(F) || skipFunction(F))
     return false;
 
   auto &TM = getAnalysis<TargetPassConfig>().getTM<RISCVTargetMachine>();
@@ -398,6 +400,14 @@ bool RISCVIRLoopFission::runOnFunction(Function &F) {
     if (!L || L->getHeader() != Header)
       continue;
     LoopCandidate Candidate;
+    auto Options = RISCVNS::parseLoopOptions(L->getLoopID(),
+                                             *L->getHeader()->getTerminator());
+    if (!Options)
+      continue;
+    Candidate.Settings = Options->resolveIRFission(DisableIRLoopFission);
+    if (!Candidate.Settings.Enable || RISCVNS::isIRFissioned(L->getLoopID()) ||
+        !RISCVNS::getSWPApplied(L->getLoopID()).empty())
+      continue;
     if (!findCandidate(*L, Candidate)) {
       ORE.emit([&]() {
         return OptimizationRemarkMissed(DEBUG_TYPE, "NotFissioned",

@@ -1715,7 +1715,10 @@ def err_pragma_loop_missing_argument : Error<
 def err_pragma_loop_invalid_option : Error<
   "%select{invalid|missing}0 option%select{ %1|}0; expected vectorize, "
   "vectorize_width, interleave, interleave_count, unroll, unroll_count, "
-  "pipeline, pipeline_initiation_interval, vectorize_predicate, or distribute">;
+  "pipeline, pipeline_initiation_interval, vectorize_predicate, distribute, "
+  "or a riscv_ns_ loop hint">;
+def err_pragma_loop_riscv_ns_extra_tokens : Error<
+  "unexpected tokens in '%0' loop hint argument">;
 def err_pragma_loop_invalid_vectorize_option : Error<
   "vectorize_width loop hint malformed; use vectorize_width(X, fixed) or "
   "vectorize_width(X, scalable) where X is an integer, or vectorize_width('fixed' or 'scalable')">;

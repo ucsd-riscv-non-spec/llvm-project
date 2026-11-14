@@ -25,12 +25,10 @@ Non-speculative RISCV modification to the [LLVM Project](https://github.com/llvm
 | `-riscv-ns-disable-software-pipelining`   | Disables branch condition pipelining                     |
 | `-riscv-ns-swp-distance=N`                | Iterations ahead to compute conditions (default 16, max 62) |
 
-Branch condition pipelining also has tuning limits: `-riscv-ns-swp-max-slice-size`,
-`-riscv-ns-swp-max-loop-size`, `-riscv-ns-swp-max-prologue-size` and
-`-riscv-ns-swp-max-function-branches`. To see which loops it pipelines, use
-`-pass-remarks=riscv-branch-condition-pipelining`, or
-`-debug-only=riscv-branch-condition-pipelining` for why it skips the others.
 From clang, pass these flags through `-mllvm`.
+
+[ns-docs/optimization-guide.md](ns-docs/optimization-guide.md) covers every Non-Spec flag, including
+the ones not listed above: what each one does, its default, when to change it, and what has been measured.
 
 ## Known Issues
 - `RISCVExpandPseudo` claims to preserve every analysis (`AU.setPreservesAll()`), but

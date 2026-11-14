@@ -7213,6 +7213,7 @@ public:
   ExprResult ActOnIntegerConstant(SourceLocation Loc, int64_t Val);
 
   bool CheckLoopHintExpr(Expr *E, SourceLocation Loc, bool AllowZero);
+  bool CheckRISCVNSLoopHintExpr(Expr *E, LoopHintAttr::OptionType Option);
 
   ExprResult ActOnNumericConstant(const Token &Tok, Scope *UDLScope = nullptr);
   ExprResult ActOnCharacterConstant(const Token &Tok,

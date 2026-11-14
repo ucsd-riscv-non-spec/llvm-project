@@ -414,7 +414,13 @@ CloneLoopBlocks(Loop *L, Value *NewIter, const bool UseEpilogRemainder,
         MDBuilder MDB(Builder.getContext());
         BranchWeights = MDB.createBranchWeights(BackEdgeWeight, ExitWeight);
       }
-      Builder.CreateCondBr(IdxCmp, FirstLoopBB, InsertBot, BranchWeights);
+      BranchInst *NewLatchBR =
+          Builder.CreateCondBr(IdxCmp, FirstLoopBB, InsertBot, BranchWeights);
+      // Replacing the latch must not discard persistent loop properties (for
+      // example target loop controls). Follow-up handling below consumes the
+      // unroll requests and gives the remainder its own loop ID.
+      NewLatchBR->setMetadata(LLVMContext::MD_loop,
+                             LatchBR->getMetadata(LLVMContext::MD_loop));
       NewIdx->addIncoming(Zero, InsertTop);
       NewIdx->addIncoming(IdxNext, NewBB);
       LatchBR->eraseFromParent();

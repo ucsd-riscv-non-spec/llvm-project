@@ -132,6 +132,9 @@ void initializeRISCVIRLoopFissionPass(PassRegistry &);
 FunctionPass *createRISCVLoopDecideActPass();
 void initializeRISCVLoopDecideActPass(PassRegistry &);
 
+FunctionPass *createRISCVNSLoopMetadataPass();
+void initializeRISCVNSLoopMetadataPass(PassRegistry &);
+
 FunctionPass *createRISCVBranchSetupAnalysisPass();
 void initializeRISCVBranchSetupAnalysisWrapperPass(PassRegistry &);
 

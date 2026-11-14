@@ -2288,26 +2288,35 @@ TemplateInstantiator::TransformCXXAssumeAttr(const CXXAssumeAttr *AA) {
 
 const LoopHintAttr *
 TemplateInstantiator::TransformLoopHintAttr(const LoopHintAttr *LH) {
-  Expr *TransformedExpr = getDerived().TransformExpr(LH->getValue()).get();
+  ExprResult Result = getDerived().TransformExpr(LH->getValue());
+  if (Result.isInvalid())
+    return LH;
+  Expr *TransformedExpr = Result.get();
 
   if (TransformedExpr == LH->getValue())
     return LH;
 
   // Generate error if there is a problem with the value.
-  if (getSema().CheckLoopHintExpr(TransformedExpr, LH->getLocation(),
-                                  LH->getSemanticSpelling() ==
-                                      LoopHintAttr::Pragma_unroll))
+  bool IsRISCVNS = LoopHintAttr::isRISCVNSOption(LH->getOption());
+  if (IsRISCVNS
+          ? getSema().CheckRISCVNSLoopHintExpr(TransformedExpr, LH->getOption())
+          : getSema().CheckLoopHintExpr(TransformedExpr, LH->getLocation(),
+                                        LH->getSemanticSpelling() ==
+                                            LoopHintAttr::Pragma_unroll))
     return LH;
 
   LoopHintAttr::OptionType Option = LH->getOption();
   LoopHintAttr::LoopHintState State = LH->getState();
 
-  llvm::APSInt ValueAPS =
-      TransformedExpr->EvaluateKnownConstInt(getSema().getASTContext());
   // The values of 0 and 1 block any unrolling of the loop.
-  if (ValueAPS.isZero() || ValueAPS.isOne()) {
-    Option = LoopHintAttr::Unroll;
-    State = LoopHintAttr::Disable;
+  if (LH->getSemanticSpelling() == LoopHintAttr::Pragma_unroll &&
+      !TransformedExpr->isValueDependent()) {
+    llvm::APSInt ValueAPS =
+        TransformedExpr->EvaluateKnownConstInt(getSema().getASTContext());
+    if (ValueAPS.isZero() || ValueAPS.isOne()) {
+      Option = LoopHintAttr::Unroll;
+      State = LoopHintAttr::Disable;
+    }
   }
 
   // Create new LoopHintValueAttr with integral expression in place of the

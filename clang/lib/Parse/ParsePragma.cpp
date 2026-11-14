@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/Attr.h"
 #include "clang/Basic/DiagnosticParse.h"
 #include "clang/Basic/PragmaKinds.h"
 #include "clang/Basic/TargetInfo.h"
@@ -1440,23 +1441,31 @@ bool Parser::HandlePragmaLoopHint(LoopHint &Hint) {
   bool OptionUnrollAndJam = false;
   bool OptionDistribute = false;
   bool OptionPipelineDisabled = false;
+  LoopHintAttr::OptionType RISCVNSOption = LoopHintAttr::RISCVNSSWP;
+  bool OptionRISCVNS = false;
   bool StateOption = false;
   if (OptionInfo) { // Pragma Unroll does not specify an option.
     OptionUnroll = OptionInfo->isStr("unroll");
     OptionUnrollAndJam = OptionInfo->isStr("unroll_and_jam");
     OptionDistribute = OptionInfo->isStr("distribute");
     OptionPipelineDisabled = OptionInfo->isStr("pipeline");
-    StateOption = llvm::StringSwitch<bool>(OptionInfo->getName())
-                      .Case("vectorize", true)
-                      .Case("interleave", true)
-                      .Case("vectorize_predicate", true)
-                      .Default(false) ||
-                  OptionUnroll || OptionUnrollAndJam || OptionDistribute ||
-                  OptionPipelineDisabled;
+    OptionRISCVNS = LoopHintAttr::ConvertStrToOptionType(OptionInfo->getName(),
+                                                         RISCVNSOption) &&
+                    LoopHintAttr::isRISCVNSOption(RISCVNSOption);
+    StateOption =
+        llvm::StringSwitch<bool>(OptionInfo->getName())
+            .Case("vectorize", true)
+            .Case("interleave", true)
+            .Case("vectorize_predicate", true)
+            .Default(false) ||
+        OptionUnroll || OptionUnrollAndJam || OptionDistribute ||
+        OptionPipelineDisabled ||
+        (OptionRISCVNS && !LoopHintAttr::getRISCVNSMaximum(RISCVNSOption));
   }
 
   bool AssumeSafetyArg = !OptionUnroll && !OptionUnrollAndJam &&
-                         !OptionDistribute && !OptionPipelineDisabled;
+                         !OptionDistribute && !OptionPipelineDisabled &&
+                         !OptionRISCVNS;
   // Verify loop hint has an argument.
   if (Toks[0].is(tok::eof)) {
     ConsumeAnnotationToken();
@@ -1488,6 +1497,11 @@ bool Parser::HandlePragmaLoopHint(LoopHint &Hint) {
             << /*FullKeyword=*/(OptionUnroll || OptionUnrollAndJam)
             << /*AssumeSafetyKeyword=*/AssumeSafetyArg;
       }
+      return false;
+    }
+    if (OptionRISCVNS && Toks.size() > 2) {
+      Diag(Toks[1].getLocation(), diag::err_pragma_loop_riscv_ns_extra_tokens)
+          << OptionInfo->getName();
       return false;
     }
     if (Toks.size() > 2)
@@ -1571,18 +1585,26 @@ bool Parser::HandlePragmaLoopHint(LoopHint &Hint) {
 
     // Tokens following an error in an ill-formed constant expression will
     // remain in the token stream and must be removed.
-    if (Tok.isNot(tok::eof)) {
-      Diag(Tok.getLocation(), diag::warn_pragma_extra_tokens_at_eol)
-          << PragmaLoopHintString(Info->PragmaName, Info->Option);
+    bool ExtraTokens = Tok.isNot(tok::eof);
+    if (ExtraTokens) {
+      if (OptionRISCVNS)
+        Diag(Tok.getLocation(), diag::err_pragma_loop_riscv_ns_extra_tokens)
+            << OptionInfo->getName();
+      else
+        Diag(Tok.getLocation(), diag::warn_pragma_extra_tokens_at_eol)
+            << PragmaLoopHintString(Info->PragmaName, Info->Option);
       while (Tok.isNot(tok::eof))
         ConsumeAnyToken();
     }
 
     ConsumeToken(); // Consume the constant expression eof terminator.
 
-    if (R.isInvalid() ||
-        Actions.CheckLoopHintExpr(R.get(), Toks[0].getLocation(),
-                                  /*AllowZero=*/true))
+    if (R.isInvalid() || (OptionRISCVNS && ExtraTokens))
+      return false;
+    if (OptionRISCVNS
+            ? Actions.CheckRISCVNSLoopHintExpr(R.get(), RISCVNSOption)
+            : Actions.CheckLoopHintExpr(R.get(), Toks[0].getLocation(),
+                                        /*AllowZero=*/true))
       return false;
 
     // Argument is a constant expression with an integer type.
@@ -3628,7 +3650,11 @@ void PragmaLoopHintHandler::HandlePragma(Preprocessor &PP,
     Token Option = Tok;
     IdentifierInfo *OptionInfo = Tok.getIdentifierInfo();
 
-    bool OptionValid = llvm::StringSwitch<bool>(OptionInfo->getName())
+    LoopHintAttr::OptionType ParsedOption;
+    bool OptionValid = (LoopHintAttr::ConvertStrToOptionType(
+                            OptionInfo->getName(), ParsedOption) &&
+                        LoopHintAttr::isRISCVNSOption(ParsedOption)) ||
+                       llvm::StringSwitch<bool>(OptionInfo->getName())
                            .Case("vectorize", true)
                            .Case("interleave", true)
                            .Case("unroll", true)

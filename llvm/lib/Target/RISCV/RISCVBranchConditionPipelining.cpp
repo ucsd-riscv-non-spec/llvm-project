@@ -75,12 +75,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "RISCV.h"
+#include "RISCVNSLoopOptions.h"
 #include "RISCVSubtarget.h"
 #include "RISCVTargetMachine.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SetVector.h"
-#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
@@ -94,8 +95,8 @@
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsRISCV.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Verifier.h"
@@ -218,6 +219,8 @@ struct PipelinedBranch {
 };
 
 struct LoopPlan {
+  RISCVNS::SWPSettings Settings;
+  bool Annotated = false;
   Loop *L;
   BasicBlock *Preheader;
   BasicBlock *Header;
@@ -307,8 +310,11 @@ private:
     });
   }
   IntegerType *XLenTy = nullptr;
+  StringRef FailureReason;
 
-  std::optional<LoopPlan> analyzeLoop(Loop *L);
+  std::optional<LoopPlan> analyzeLoop(Loop *L, RISCVNS::SWPSettings Settings,
+                                      bool Annotated);
+  void missed(Loop *L, StringRef Name, StringRef Reason);
   bool canPipelineLoopBody(const LoopPlan &P);
   bool buildSlice(LoopPlan &P, PipelinedBranch &PB);
   std::optional<unsigned> findInductionVar(LoopPlan &P, PHINode *Phi);
@@ -325,7 +331,7 @@ private:
   void transformLoop(LoopPlan &P);
   Value *cloneCondition(IRBuilder<> &B, const PipelinedBranch &PB,
                         ValueToValueMapTy &Map, const Twine &Suffix,
-                        bool Speculative);
+                        bool Speculative, bool Force);
   void transformLoopInPlace(LoopPlan &P);
   void emitPush(IRBuilder<> &B, unsigned Queue, Value *Cond);
 };
@@ -333,6 +339,15 @@ private:
 } // end anonymous namespace
 
 char RISCVBranchConditionPipelining::ID = 0;
+
+static std::string loopName(const Loop &L) {
+  if (L.getHeader()->hasName())
+    return L.getHeader()->getName().str();
+  std::string Name;
+  raw_string_ostream OS(Name);
+  L.getHeader()->printAsOperand(OS, false);
+  return Name;
+}
 
 /// Whether a block of \p L can reach \p To without going around the loop:
 /// whether, in one iteration, something in \p From can run before \p To.
@@ -373,7 +388,11 @@ static std::string describe(const Instruction &I) {
 /// Whether \p I may be evaluated for a later iteration: it computes its
 /// result from its operands alone (or, for a load, from memory the caller
 /// checks), so it can run again elsewhere without changing the program.
-static bool isClonableIntoCondition(const Instruction &I) {
+static bool isClonableIntoCondition(const Instruction &I, bool Force) {
+  // PHIs require a future recurrence (handled separately), and terminators,
+  // EH pads and token results cannot be emitted as a straight-line condition.
+  if (Force)
+    return !I.isTerminator() && !I.isEHPad() && !I.getType()->isTokenTy();
   if (auto *Load = dyn_cast<LoadInst>(&I))
     return Load->isSimple();
   if (auto *II = dyn_cast<IntrinsicInst>(&I))
@@ -394,18 +413,34 @@ bool RISCVBranchConditionPipelining::canPipelineLoopBody(const LoopPlan &P) {
   Loop *L = P.L;
   unsigned Size = 0;
   for (BasicBlock *BB : P.Blocks) {
+    // The cloner does not remap exceptional entries or block addresses.
     if (BB->isEHPad() || BB->hasAddressTaken())
       return reject("a block is an exception handler or has its address taken");
     for (Instruction &I : *BB) {
       if (I.isDebugOrPseudoInst())
         continue;
-      if (++Size > MaxLoopSize) {
+      if (++Size > P.Settings.MaxLoopSize && !P.Settings.Force) {
+        FailureReason = "loop size limit";
         LLVM_DEBUG(dbgs() << "  loop is too large to duplicate\n");
-        return reject("the loop has more than " + Twine(MaxLoopSize) +
+        return reject("the loop has more than " + Twine(P.Settings.MaxLoopSize) +
                       " instructions (-riscv-ns-swp-max-loop-size)");
       }
       // The kernel is a copy of the loop.
-      if (I.getType()->isTokenTy() || isa<AllocaInst>(I))
+      if (I.getType()->isTokenTy())
+        return reject("the loop contains " + describe(I) +
+                      ", which cannot be duplicated");
+      // The emitter only clones branch/switch CFGs. This is a construction
+      // requirement even when force permits duplicated or reordered effects.
+      if (I.isTerminator() && !isa<BranchInst>(I) && !isa<SwitchInst>(I))
+        return reject("the loop contains " + describe(I));
+      if (auto *II = dyn_cast<IntrinsicInst>(&I))
+        if (II->getIntrinsicID() == Intrinsic::riscv_ns_cond_init ||
+            II->getIntrinsicID() == Intrinsic::riscv_ns_cond_push ||
+            II->getIntrinsicID() == Intrinsic::riscv_ns_cond_pop)
+          return reject("the loop already uses a condition queue");
+      if (P.Settings.Force)
+        continue;
+      if (isa<AllocaInst>(I))
         return reject("the loop contains " + describe(I) +
                       ", which cannot be duplicated");
       if (auto *CB = dyn_cast<CallBase>(&I)) {
@@ -443,10 +478,6 @@ bool RISCVBranchConditionPipelining::canPipelineLoopBody(const LoopPlan &P) {
       if (I.mayReadOrWriteMemory() || I.mayHaveSideEffects())
         return reject("the loop contains " + describe(I) +
                       ", which accesses memory or has side effects");
-      // The loop has no exits but its latch, so a terminator can only be a
-      // branch or switch within it.
-      if (I.isTerminator() && !isa<BranchInst>(I) && !isa<SwitchInst>(I))
-        return reject("the loop contains " + describe(I));
     }
   }
 
@@ -478,16 +509,22 @@ RISCVBranchConditionPipelining::findInductionVar(LoopPlan &P, PHINode *Phi) {
   // is now. An i1 toggle is also an affine recurrence of step 1, so this
   // comes first.
   Value *Mask;
-  if (EnableToggles && Phi->getType()->isIntegerTy() &&
+  if (Phi->getType()->isIntegerTy() &&
       Phi->getNumIncomingValues() == 2 &&
       match(Phi->getIncomingValueForBlock(P.Latch),
             m_c_Xor(m_Specific(Phi), m_Value(Mask))) &&
       P.L->isLoopInvariant(Mask)) {
-    InductionVar IV = {Phi, Phi->getIncomingValueForBlock(P.Preheader),
-                       nullptr, nullptr};
-    IV.ToggleMask = Mask;
-    P.IVs.push_back(IV);
-    return P.IVs.size() - 1;
+    // In particular, do not let a forced i1 toggle take the affine fallback:
+    // force cannot turn on the toggle feature when it was explicitly disabled.
+    if (!P.Settings.Toggles && P.Settings.Force)
+      return std::nullopt;
+    if (P.Settings.Toggles) {
+      InductionVar IV = {Phi, Phi->getIncomingValueForBlock(P.Preheader), nullptr,
+                         nullptr};
+      IV.ToggleMask = Mask;
+      P.IVs.push_back(IV);
+      return P.IVs.size() - 1;
+    }
   }
 
   if (!SE->isSCEVable(Phi->getType()))
@@ -503,8 +540,8 @@ RISCVBranchConditionPipelining::findInductionVar(LoopPlan &P, PHINode *Phi) {
     auto *Shift = dyn_cast_or_null<BinaryOperator>(Next);
     const APInt *C;
     unsigned Width = Phi->getType()->getScalarSizeInBits();
-    if (!EnableShiftRecurrences || !Phi->getType()->isIntegerTy() || !Shift ||
-        !P.L->contains(Shift) ||
+    if (!P.Settings.ShiftRecurrences || !Phi->getType()->isIntegerTy() ||
+        !Shift || !P.L->contains(Shift) ||
         (Shift->getOpcode() != Instruction::LShr &&
          Shift->getOpcode() != Instruction::AShr &&
          Shift->getOpcode() != Instruction::Shl) ||
@@ -522,7 +559,9 @@ RISCVBranchConditionPipelining::findInductionVar(LoopPlan &P, PHINode *Phi) {
   const SCEV *Step = AR->getStepRecurrence(*SE);
   SCEVExpander Expander(*SE, *DL, "swp");
   if (!isa<SCEVConstant>(Step) &&
-      !Expander.isSafeToExpandAt(Step, P.Preheader->getTerminator()))
+      !(P.Settings.Force
+            ? SE->dominates(Step, P.Preheader)
+            : Expander.isSafeToExpandAt(Step, P.Preheader->getTerminator())))
     return std::nullopt;
 
   P.IVs.push_back(
@@ -545,24 +584,31 @@ bool RISCVBranchConditionPipelining::buildSlice(LoopPlan &P,
     if (auto *Phi = dyn_cast<PHINode>(I)) {
       // Any other phi carries a value that the slice cannot recompute.
       std::optional<unsigned> IV = findInductionVar(P, Phi);
-      if (!IV)
+      if (!IV) {
+        FailureReason = "cannot construct future recurrence values with the "
+                        "enabled features";
         return reject("it depends on a value carried from the previous "
                       "iteration (" +
                       Phi->getName() + ") that is not an induction variable");
+      }
       IVs.insert(*IV);
       return true;
     }
-    if (!isClonableIntoCondition(*I))
+    if (!isClonableIntoCondition(*I, P.Settings.Force)) {
+      FailureReason = "condition contains an operation that cannot be cloned";
       return reject("it depends on " + describe(*I) +
                     ", which cannot be computed again for a later iteration");
+    }
     // Without a trip count, conditions are also computed for iterations that
     // never run, so each instruction must be safe to execute on any operands.
     // No load is: its address may not be valid in such an iteration.
-    if (P.Speculative &&
-        (isa<LoadInst>(I) || !isSafeToSpeculativelyExecute(I)))
+    if (P.Speculative && !P.Settings.Force &&
+        (isa<LoadInst>(I) || !isSafeToSpeculativelyExecute(I))) {
+      FailureReason = "condition is not safe to speculate";
       return reject("it needs " + describe(*I) +
                     ", and without a trip count conditions are also computed "
                     "for iterations that never run");
+    }
     if (InSlice.insert(I).second)
       WorkList.push_back(I);
     return true;
@@ -577,13 +623,16 @@ bool RISCVBranchConditionPipelining::buildSlice(LoopPlan &P,
         return false;
   }
 
-  if (InSlice.size() > MaxSliceSize)
+  if (InSlice.size() > P.Settings.MaxSliceSize && !P.Settings.Force) {
+    FailureReason = "condition slice size limit";
     return reject("it needs " + Twine(InSlice.size()) +
-                  " instructions, more than " + Twine(MaxSliceSize) +
+                  " instructions, more than " + Twine(P.Settings.MaxSliceSize) +
                   " (-riscv-ns-swp-max-slice-size)");
+  }
   // An invariant condition gains nothing from being queued early, and a
   // condition that is itself a header phi is only handled if it is a toggle.
-  if (InSlice.empty() && (IVs.empty() || !P.IVs[IVs[0]].isToggle()))
+  if (!P.Settings.Force && InSlice.empty() &&
+      (IVs.empty() || !P.IVs[IVs[0]].isToggle()))
     return reject("the condition is loop-invariant or itself a value carried "
                   "between iterations");
 
@@ -846,6 +895,8 @@ bool RISCVBranchConditionPipelining::isLoadMovableAcross(
 /// condition can move ahead of the stores of the iterations it skips, or 0.
 unsigned RISCVBranchConditionPipelining::findSafeDistance(
     const LoopPlan &P, const PipelinedBranch &PB, unsigned Distance) {
+  if (P.Settings.Force)
+    return Distance;
   SmallVector<LoadInst *, 4> Loads;
   for (Instruction *I : PB.Slice)
     if (auto *Load = dyn_cast<LoadInst>(I))
@@ -875,7 +926,7 @@ unsigned RISCVBranchConditionPipelining::findSafeDistance(
 /// the default of a switch that covers every value: if taken, it would leave
 /// conditions evaluated for iterations that never run. The kernel shares
 /// those exits, so they must also have no phis to update.
-static bool exitsOnlyAtLatch(const Loop &L) {
+static bool exitsOnlyAtLatch(const Loop &L, bool Force) {
   SmallVector<BasicBlock *, 4> Exiting;
   L.getExitingBlocks(Exiting);
   for (BasicBlock *BB : Exiting) {
@@ -884,22 +935,30 @@ static bool exitsOnlyAtLatch(const Loop &L) {
     for (BasicBlock *Succ : successors(BB))
       if (!L.contains(Succ) &&
           (!Succ->phis().empty() ||
-           !isa<UnreachableInst>(Succ->getFirstNonPHIOrDbgOrLifetime())))
+           (!Force &&
+            !isa<UnreachableInst>(Succ->getFirstNonPHIOrDbgOrLifetime()))))
         return false;
   }
   return true;
 }
 
-std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
+std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(
+    Loop *L, RISCVNS::SWPSettings Settings, bool Annotated) {
   LLVM_DEBUG(dbgs() << "Loop " << L->getHeader()->getName() << ":\n");
 
   LoopPlan P;
+  P.Settings = Settings;
+  P.Annotated = Annotated;
+  FailureReason = "unsupported loop shape: requires an innermost simplified "
+                  "loop with a latch exit and mappable exit values";
   P.L = L;
   P.Preheader = L->getLoopPreheader();
   P.Header = L->getHeader();
   P.Latch = L->getLoopLatch();
   if (!L->isInnermost() || !L->isLoopSimplifyForm() || !P.Latch ||
-      !L->isLoopExiting(P.Latch) || !exitsOnlyAtLatch(*L)) {
+      !L->isLoopExiting(P.Latch) || !exitsOnlyAtLatch(*L, Settings.Force) ||
+      (Settings.Force && !exitsOnlyAtLatch(*L, false) &&
+       !L->isLCSSAForm(*DT))) {
     LLVM_DEBUG(dbgs() << "  not an innermost loop exiting at its latch\n");
     if (!L->isInnermost())
       missedLoop(L, "NotInnermost", "the loop contains another loop");
@@ -923,6 +982,8 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
   LoopBlocksRPO RPOT(L);
   RPOT.perform(LI);
   P.Blocks.assign(RPOT.begin(), RPOT.end());
+  FailureReason = "loop body cannot be cloned with valid control flow and "
+                  "queue push/pop structure";
   if (!canPipelineLoopBody(P)) {
     LLVM_DEBUG(dbgs() << "  loop body cannot be pipelined\n");
     missedLoop(L, "BodyNotPipelinable", Why);
@@ -932,7 +993,9 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
   const SCEV *BTC = SE->getExitCount(L, P.Latch);
   if (isa<SCEVCouldNotCompute>(BTC) || !BTC->getType()->isIntegerTy() ||
       BTC->getType()->getIntegerBitWidth() > XLenTy->getBitWidth()) {
-    if (!EnableSpeculativePipelining) {
+    if (!P.Settings.Speculative) {
+      FailureReason = "trip count is not computable and speculative pipelining "
+                      "is disabled";
       LLVM_DEBUG(dbgs() << "  trip count is not computable\n");
       missedLoop(L, "NoTripCount",
                  "the trip count cannot be computed (-riscv-ns-swp-speculative "
@@ -950,18 +1013,32 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
     P.TripCount = SE->getAddExpr(SE->getNoopOrZeroExtend(BTC, XLenTy),
                                  SE->getOne(XLenTy));
     SCEVExpander Expander(*SE, *DL, "swp");
-    if (!Expander.isSafeToExpandAt(P.TripCount, P.Preheader->getTerminator())) {
+    if (!(P.Settings.Force ? SE->dominates(P.TripCount, P.Preheader)
+                           : Expander.isSafeToExpandAt(
+                                 P.TripCount, P.Preheader->getTerminator()))) {
+      FailureReason = "cannot materialize the trip count in the preheader";
       missedLoop(L, "TripCountNotExpandable",
                  "the trip count cannot be computed before the loop");
       return std::nullopt;
     }
   }
 
-  unsigned Distance = std::min<unsigned>(
-      P.Speculative ? SpeculativePipelineDistance : PipelineDistance,
-      MaxDistance);
+  unsigned RequestedDistance =
+      P.Speculative ? P.Settings.SpeculativeDistance : P.Settings.Distance;
+  unsigned Distance = std::min(RequestedDistance, MaxDistance);
+  if (P.Annotated && Distance < RequestedDistance)
+    ORE->emit([&]() {
+      return OptimizationRemarkAnalysis(DEBUG_TYPE, "QueueBound",
+                                        L->getStartLoc(), P.Header)
+             << "loop " << ore::NV("Loop", loopName(*P.L))
+             << ": requested distance "
+             << ore::NV("Requested", RequestedDistance)
+             << ", effective distance capped at "
+             << ore::NV("Effective", Distance) << " by the hardware queue bound";
+    });
   unsigned MaxTripCount = SE->getSmallConstantMaxTripCount(L);
-  if (MaxTripCount && MaxTripCount <= Distance) {
+  if (MaxTripCount && MaxTripCount <= Distance && !P.Settings.Force) {
+    FailureReason = "short trip count profitability filter";
     LLVM_DEBUG(dbgs() << "  never runs more than " << MaxTripCount
                       << " iterations\n");
     missedLoop(L, "TooFewIterations",
@@ -971,7 +1048,9 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
     return std::nullopt;
   }
 
-  unsigned PrologueSize = 0;
+  uint64_t PrologueSize = 0;
+  FailureReason = "no branch with the execution structure needed to pair "
+                  "queue pushes and pops";
   for (BasicBlock *BB : P.Blocks) {
     // With a trip count, the kernel counts its iterations in place of the
     // latch's condition. Without one, the latch's condition decides when the
@@ -1003,11 +1082,30 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
     // Each condition the prologue queues costs a copy of the slice and a
     // push.
     unsigned PushSize = PB.Slice.size() + 1;
-    unsigned Fit = std::min(Distance, (MaxPrologueSize - std::min<unsigned>(
-                                           PrologueSize, MaxPrologueSize)) /
-                                          PushSize);
+    unsigned Fit =
+        P.Settings.Force
+            ? Distance
+            : std::min<uint64_t>(
+                  Distance, (P.Settings.MaxPrologueSize -
+                             std::min<uint64_t>(PrologueSize,
+                                                P.Settings.MaxPrologueSize)) /
+                                PushSize);
     PB.Distance = findSafeDistance(P, PB, Fit);
+    if (P.Annotated && PB.Distance < Distance) {
+      StringRef Reason =
+          Fit < Distance ? "prologue size limit" : "memory dependence";
+      ORE->emit([&]() {
+        return OptimizationRemarkAnalysis(DEBUG_TYPE, "DistanceReduced",
+                                          Br->getDebugLoc(), BB)
+               << "loop " << ore::NV("Loop", loopName(*P.L))
+               << ": requested distance " << ore::NV("Requested", Distance)
+               << ", effective distance " << ore::NV("Effective", PB.Distance)
+               << " (" << ore::NV("Reason", Reason) << ")";
+      });
+    }
     if (!PB.Distance) {
+      FailureReason = Fit == 0 ? "prologue size limit or zero in-place distance"
+                               : "memory dependence";
       LLVM_DEBUG(dbgs() << "  a store could clobber what the condition of "
                         << *Br << " reads\n");
       missedBranch(Br, "StoreMayClobber",
@@ -1034,19 +1132,32 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
   // and at the same distance. Its latch was skipped above and stays a
   // counted exit.
   unsigned InPlaceDistance =
-      std::min<unsigned>(SpeculativePipelineDistance, MaxDistance);
+      std::min<unsigned>(P.Settings.SpeculativeDistance, MaxDistance);
   if (!P.Speculative && InPlaceDistance &&
       all_of(P.Branches, [&](const PipelinedBranch &PB) {
-        return !PB.IVs.empty() &&
-               all_of(PB.IVs,
-                      [&](unsigned Idx) { return P.IVs[Idx].isToggle(); }) &&
-               all_of(PB.Slice, [](const Instruction *I) {
-                 return !isa<LoadInst>(I) && isSafeToSpeculativelyExecute(I);
-               });
+        return !PB.IVs.empty() && all_of(PB.IVs, [&](unsigned Idx) {
+          return P.IVs[Idx].isToggle();
+        }) && all_of(PB.Slice, [&](const Instruction *I) {
+          return P.Settings.Force ||
+                 (!isa<LoadInst>(I) && isSafeToSpeculativelyExecute(I));
+        });
       })) {
     P.Speculative = true;
-    for (PipelinedBranch &PB : P.Branches)
+    for (PipelinedBranch &PB : P.Branches) {
       PB.Distance = std::min(PB.Distance, InPlaceDistance);
+      if (P.Annotated && PB.Distance < P.Settings.SpeculativeDistance)
+        ORE->emit([&]() {
+          return OptimizationRemarkAnalysis(DEBUG_TYPE, "ToggleDistance",
+                                            PB.Br->getDebugLoc(),
+                                            PB.Br->getParent())
+                 << "loop " << ore::NV("Loop", loopName(*P.L))
+                 << ": requested in-place distance "
+                 << ore::NV("Requested", P.Settings.SpeculativeDistance)
+                 << ", effective distance " << ore::NV("Effective", PB.Distance)
+                 << "; counted toggle lookahead also respects the counted "
+                    "distance and earlier distance bounds";
+        });
+    }
     LLVM_DEBUG(dbgs() << "  every condition reads only toggles, pipelining "
                          "in place "
                       << P.maxDistance() << " iterations ahead\n");
@@ -1193,7 +1304,7 @@ static Value *advanceInductionVar(IRBuilder<> &B, const InductionVar &IV,
 
 Value *RISCVBranchConditionPipelining::cloneCondition(
     IRBuilder<> &B, const PipelinedBranch &PB, ValueToValueMapTy &Map,
-    const Twine &Suffix, bool Speculative) {
+    const Twine &Suffix, bool Speculative, bool Force) {
   for (Instruction *I : PB.Slice) {
     Instruction *C = I->clone();
     // These describe the accesses of the iteration I belongs to, and the
@@ -1211,14 +1322,15 @@ Value *RISCVBranchConditionPipelining::cloneCondition(
     B.Insert(C, I->hasName() ? I->getName() + Suffix : "");
     // The clone, with its operands and flags as emitted, may run for an
     // iteration that never does, so it must be safe to execute anywhere.
-    assert((!Speculative ||
+    assert((Force || !Speculative ||
             (!isa<LoadInst>(C) && isSafeToSpeculativelyExecute(C))) &&
            "speculative condition clone is not safe to execute anywhere");
     Map[I] = C;
   }
   // A condition that is a toggle itself has no slice: it is the toggle's
   // value in the iteration Map describes.
-  return Map.lookup(PB.Br->getCondition());
+  Value *Condition = Map.lookup(PB.Br->getCondition());
+  return Condition ? Condition : PB.Br->getCondition();
 }
 
 void RISCVBranchConditionPipelining::emitPush(IRBuilder<> &B, unsigned Queue,
@@ -1286,7 +1398,7 @@ void RISCVBranchConditionPipelining::transformLoopInPlace(LoopPlan &P) {
       }
       emitPush(B, PB.Queue,
                cloneCondition(B, PB, Map, ".swp" + Twine(K),
-                              /*Speculative=*/true));
+                              /*Speculative=*/true, P.Settings.Force));
     }
   }
 
@@ -1304,18 +1416,24 @@ void RISCVBranchConditionPipelining::transformLoopInPlace(LoopPlan &P) {
                                         IV.Phi->getName() + ".ahead");
     }
     emitPush(B, PB.Queue,
-             cloneCondition(B, PB, Map, ".ahead", /*Speculative=*/true));
+             cloneCondition(B, PB, Map, ".ahead", /*Speculative=*/true,
+                            P.Settings.Force));
     OldConds.push_back(PB.Br->getCondition());
     PB.Br->setCondition(B.CreateIntrinsic(Intrinsic::riscv_ns_cond_pop, {},
                                           {B.getInt32(PB.Queue)}));
   }
   // A condition the loop still uses elsewhere is left in place.
   RecursivelyDeleteTriviallyDeadInstructionsPermissive(OldConds);
+  P.Latch->getTerminator()->setMetadata(
+      LLVMContext::MD_loop,
+      RISCVNS::makeLoopID(P.Header->getContext(), P.L->getLoopID(),
+                          RISCVNS::LoopRole::InPlace));
 }
 
 void RISCVBranchConditionPipelining::transformLoop(LoopPlan &P) {
   Function *F = P.Header->getParent();
   LLVMContext &Ctx = F->getContext();
+  MDNode *OldLoopID = P.L->getLoopID();
   unsigned Distance = P.maxDistance();
 
   // The kernel: a copy of the loop.
@@ -1355,7 +1473,7 @@ void RISCVBranchConditionPipelining::transformLoop(LoopPlan &P) {
       }
       emitPush(B, PB.Queue,
                cloneCondition(B, PB, Map, ".swp" + Twine(K),
-                              /*Speculative=*/false));
+                              /*Speculative=*/false, P.Settings.Force));
     }
   }
   // The kernel stops Distance iterations early: its last iteration queues
@@ -1377,7 +1495,10 @@ void RISCVBranchConditionPipelining::transformLoop(LoopPlan &P) {
       B.CreateAdd(Counter, ConstantInt::get(XLenTy, 1), "swp.kernel.iv.next",
                   /*HasNUW=*/true);
   Value *Done = B.CreateICmpEQ(CounterNext, KernelCount, "swp.kernel.done");
-  B.CreateCondBr(Done, KernelExit, KHeader);
+  BranchInst *KernelLatch = B.CreateCondBr(Done, KernelExit, KHeader);
+  KernelLatch->setMetadata(
+      LLVMContext::MD_loop,
+      RISCVNS::makeLoopID(Ctx, OldLoopID, RISCVNS::LoopRole::Kernel));
   Counter->addIncoming(ConstantInt::get(XLenTy, 0), PipePH);
   Counter->addIncoming(CounterNext, KLatch);
   Value *OldExitCond = OldLatchBr->getCondition();
@@ -1397,7 +1518,8 @@ void RISCVBranchConditionPipelining::transformLoop(LoopPlan &P) {
                                         IV.Phi->getName() + ".ahead");
     }
     emitPush(B, PB.Queue,
-             cloneCondition(B, PB, Map, ".ahead", /*Speculative=*/false));
+             cloneCondition(B, PB, Map, ".ahead", /*Speculative=*/false,
+                            P.Settings.Force));
     Value *OldCond = KBr->getCondition();
     KBr->setCondition(B.CreateIntrinsic(Intrinsic::riscv_ns_cond_pop, {},
                                         {B.getInt32(PB.Queue)}));
@@ -1428,17 +1550,29 @@ void RISCVBranchConditionPipelining::transformLoop(LoopPlan &P) {
       P.TripCountV, ConstantInt::get(XLenTy, Distance), "swp.long.enough");
   B.CreateCondBr(LongEnough, PipePH, DrainPH);
   PreheaderBr->eraseFromParent();
+  P.Latch->getTerminator()->setMetadata(
+      LLVMContext::MD_loop,
+      RISCVNS::makeLoopID(Ctx, OldLoopID, RISCVNS::LoopRole::Drain));
+}
+
+void RISCVBranchConditionPipelining::missed(Loop *L, StringRef Name,
+                                            StringRef Reason) {
+  ORE->emit([&]() {
+    return OptimizationRemarkMissed(DEBUG_TYPE, Name, L->getStartLoc(),
+                                    L->getHeader())
+           << "not pipelining branch conditions in function "
+           << ore::NV("Function", L->getHeader()->getParent()->getName())
+           << ", loop " << ore::NV("Loop", loopName(*L)) << ": "
+           << ore::NV("Reason", Reason);
+  });
 }
 
 bool RISCVBranchConditionPipelining::runOnFunction(Function &F) {
-  if (skipFunction(F) || DisableSoftwarePipelining || PipelineDistance == 0 ||
-      F.hasOptSize())
+  if (!RISCVNS::validateLoopOptions(F))
     return false;
 
   // Only SelectionDAG knows how to select the queue intrinsics.
   auto &TM = getAnalysis<TargetPassConfig>().getTM<RISCVTargetMachine>();
-  if (TM.Options.EnableGlobalISel)
-    return false;
   const RISCVSubtarget &ST = TM.getSubtarget<RISCVSubtarget>(F);
   DL = &F.getDataLayout();
   XLenTy = IntegerType::get(F.getContext(), ST.getXLen());
@@ -1463,9 +1597,82 @@ bool RISCVBranchConditionPipelining::runOnFunction(Function &F) {
       }
   SmallVector<LoopPlan, 4> Plans;
   for (Loop *L : LI->getLoopsInPreorder()) {
-    std::optional<LoopPlan> P = analyzeLoop(L);
-    if (!P)
+    auto Options = RISCVNS::parseLoopOptions(L->getLoopID(),
+                                             *L->getHeader()->getTerminator());
+    if (!Options)
       continue;
+    const RISCVNS::SWPSettings Settings = Options->resolveSWP(
+        {true, false, PipelineDistance, SpeculativePipelineDistance,
+         EnableSpeculativePipelining, EnableShiftRecurrences, EnableToggles,
+         MaxSliceSize, MaxLoopSize, MaxPrologueSize},
+        DisableSoftwarePipelining);
+    bool Annotated = Options->hasRequests();
+    if (Annotated) {
+      ORE->emit([&]() {
+        std::string Description;
+        raw_string_ostream OS(Description);
+        auto Add = [&](StringRef Name, unsigned Value, bool Local) {
+          OS << ", " << Name << '=' << Value
+             << (Local ? " (metadata)" : " (default)");
+        };
+        OS << "Non-Spec settings for function " << F.getName() << ", loop ";
+        L->getHeader()->printAsOperand(OS, false);
+        Add("swp", Settings.Enable, Options->SWPEnable.has_value());
+        Add("distance", Settings.Distance, Options->Distance.has_value());
+        Add("speculative_distance", Settings.SpeculativeDistance,
+            Options->SpeculativeDistance.has_value());
+        Add("speculative", Settings.Speculative,
+            Options->Speculative.has_value());
+        Add("shift_recurrences", Settings.ShiftRecurrences,
+            Options->ShiftRecurrences.has_value());
+        Add("toggles", Settings.Toggles, Options->Toggles.has_value());
+        Add("max_slice_size", Settings.MaxSliceSize,
+            Options->MaxSliceSize.has_value());
+        Add("max_loop_size", Settings.MaxLoopSize,
+            Options->MaxLoopSize.has_value());
+        Add("max_prologue_size", Settings.MaxPrologueSize,
+            Options->MaxPrologueSize.has_value());
+        Add("force", Settings.Force, Options->Force.has_value());
+        return OptimizationRemarkAnalysis(DEBUG_TYPE, "LoopSettings",
+                                          L->getStartLoc(), L->getHeader())
+               << Description;
+      });
+    }
+    StringRef Blocked;
+    if (skipFunction(F))
+      Blocked = "function is unavailable for optimization (optnone)";
+    else if (TM.Options.EnableGlobalISel)
+      Blocked = "queue lowering is unavailable with GlobalISel";
+    else if (DisableSoftwarePipelining)
+      Blocked = "global software pipelining disable";
+    else if (!Settings.Enable)
+      Blocked = "loop software pipelining disable or inherited zero distance";
+    else if (F.hasOptSize() && !Settings.Force)
+      Blocked = "optsize exclusion";
+    else if (RISCVNS::isIRFissioned(L->getLoopID()) ||
+             !RISCVNS::getSWPApplied(L->getLoopID()).empty())
+      Blocked = "loop already transformed";
+    if (!Blocked.empty()) {
+      if (Annotated)
+        missed(L, "RequestBlocked", Blocked);
+      continue;
+    }
+    if (Annotated && Settings.Force)
+      ORE->emit([&]() {
+        return OptimizationRemarkAnalysis(DEBUG_TYPE, "Force", L->getStartLoc(),
+                                          L->getHeader())
+               << "force active for loop "
+               << ore::NV("Loop", loopName(*L))
+               << ": bypassing size, profitability, optsize and function "
+                  "branch "
+                  "budgets, memory dependence and speculative safety proofs";
+      });
+    std::optional<LoopPlan> P = analyzeLoop(L, Settings, Annotated);
+    if (!P) {
+      if (Annotated)
+        missed(L, "RequestBlocked", FailureReason);
+      continue;
+    }
 
     // The kernel duplicates the loop's branches, and the guard and the
     // kernel exit add some.
@@ -1473,13 +1680,10 @@ bool RISCVBranchConditionPipelining::runOnFunction(Function &F) {
     for (BasicBlock *BB : P->Blocks)
       if (BB->getTerminator()->getNumSuccessors() > 0)
         ++Added;
-    if (Branches + Added > MaxFunctionBranches) {
-      ORE->emit([&]() {
-        return OptimizationRemarkMissed(DEBUG_TYPE, "TooManyBranches",
-                                        L->getStartLoc(), L->getHeader())
-               << "not pipelining branch conditions: the function could run "
-                  "out of branch registers";
-      });
+    if (Branches + Added > MaxFunctionBranches && !Settings.Force) {
+      missed(L, "TooManyBranches",
+             "function branch budget: the function could run out of branch "
+             "registers");
       continue;
     }
     Branches += Added;
@@ -1492,6 +1696,16 @@ bool RISCVBranchConditionPipelining::runOnFunction(Function &F) {
       R << "computing " << ore::NV("Branches", unsigned(P->Branches.size()))
         << " branch condition(s) up to "
         << ore::NV("Distance", P->maxDistance()) << " iterations ahead";
+      if (Annotated)
+        R << " in function " << ore::NV("Function", F.getName())
+          << ", loop " << ore::NV("Loop", loopName(*L))
+          << "; requested distance "
+          << ore::NV("RequestedDistance", P->Speculative
+                                              ? Settings.SpeculativeDistance
+                                              : Settings.Distance)
+          << ", effective distance "
+          << ore::NV("EffectiveDistance", P->maxDistance())
+          << ", force=" << ore::NV("Force", Settings.Force);
       return R;
     });
     Plans.push_back(std::move(*P));
