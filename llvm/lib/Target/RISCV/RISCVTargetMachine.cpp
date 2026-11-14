@@ -155,6 +155,7 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVBranchSetupHoistingPass(*PR);
   initializeRISCVBranchConditionPipeliningPass(*PR);
   initializeRISCVIRLoopFissionPass(*PR);
+  initializeRISCVLoopDecideActPass(*PR);
   initializeRISCVRedundantCopyEliminationPass(*PR);
   initializeRISCVBranchSetupAnalysisWrapperPass(*PR);
   initializeRISCVLoopFissionDecomposedBranchPass(*PR); // Loop Fission
@@ -489,6 +490,11 @@ void RISCVPassConfig::addIRPasses() {
   // Fission the supported conditional loops before SWP changes their shape.
   if (getOptLevel() != CodeGenOptLevel::None)
     addPass(createRISCVIRLoopFissionPass());
+
+  // Split the guarded loops fission and pipelining give up on (a call or an
+  // inner loop in the guarded part): decide every condition first, then act.
+  if (getOptLevel() != CodeGenOptLevel::None)
+    addPass(createRISCVLoopDecideActPass());
 
   // Runs before HardwareLoops, which then converts the loops it creates.
   if (getOptLevel() != CodeGenOptLevel::None)
