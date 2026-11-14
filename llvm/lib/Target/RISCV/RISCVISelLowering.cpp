@@ -87,6 +87,17 @@ static cl::opt<bool>
                                "be combined with a shift"),
                       cl::init(true));
 
+// Non-Spec: without Zicond, a scalar select becomes a branch over a move. That
+// branch skips no work (both values are already computed), but its pb waits at
+// dispatch for a condition usually computed just before it. This option blends
+// the two values with a mask instead. It covers smin/smax and the saturating
+// add/sub too, which reach lowerSELECT as selects when they are expanded.
+static cl::opt<bool> NSBranchlessSelect(
+    "riscv-ns-branchless-select", cl::Hidden,
+    cl::desc("Non-Spec: lower scalar integer selects without a branch, as "
+             "f ^ ((t ^ f) & -c)"),
+    cl::init(false));
+
 RISCVTargetLowering::RISCVTargetLowering(const TargetMachine &TM,
                                          const RISCVSubtarget &STI)
     : TargetLowering(TM), Subtarget(STI) {
@@ -9228,6 +9239,18 @@ SDValue RISCVTargetLowering::lowerSELECT(SDValue Op, SelectionDAG &DAG) const {
 
   if (SDValue V = combineSelectToBinOp(Op.getNode(), DAG, Subtarget))
     return V;
+
+  // (select c, t, f) -> (xor f, (and (xor t, f), (neg c))), for c = 0 or 1
+  if (NSBranchlessSelect && VT.isScalarInteger()) {
+    unsigned Bits = VT.getSizeInBits();
+    SDValue C = DAG.getZExtOrTrunc(CondV, DL, VT);
+    if (!DAG.MaskedValueIsZero(C, APInt::getHighBitsSet(Bits, Bits - 1)))
+      C = DAG.getSetCC(DL, VT, C, DAG.getConstant(0, DL, VT), ISD::SETNE);
+    SDValue Mask = DAG.getNegative(C, DL, VT);
+    SDValue Diff = DAG.getNode(ISD::XOR, DL, VT, TrueV, FalseV);
+    return DAG.getNode(ISD::XOR, DL, VT, FalseV,
+                       DAG.getNode(ISD::AND, DL, VT, Diff, Mask));
+  }
 
   if (Op.hasOneUse()) {
     unsigned UseOpc = Op->user_begin()->getOpcode();
