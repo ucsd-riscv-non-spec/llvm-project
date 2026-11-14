@@ -38,6 +38,7 @@ void _start(void) {
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
@@ -78,6 +79,8 @@ public:
   MachineDominatorTree *MDT;
   MachineLoopInfo *MLI;
   AAResults *AA = nullptr;
+  // Why buildSlice said no, for the missed remark
+  std::string Why;
 
   RISCVLoopFissionDecomposedBranch() : MachineFunctionPass(ID) {}
 
@@ -116,6 +119,31 @@ private:
 };
 
 char RISCVLoopFissionDecomposedBranch::ID = 0;
+
+/// "a call to f at line 12", "LW at line 12": what an instruction is, for
+/// remarks.
+static std::string describe(const MachineInstr &MI) {
+  std::string S;
+  raw_string_ostream OS(S);
+  const MachineOperand *Callee = nullptr;
+  if (MI.isCall())
+    for (const MachineOperand &MO : MI.operands())
+      if (MO.isGlobal() || MO.isSymbol()) {
+        Callee = &MO;
+        break;
+      }
+  if (Callee && Callee->isGlobal())
+    OS << "a call to " << Callee->getGlobal()->getName();
+  else if (Callee)
+    OS << "a call to " << Callee->getSymbolName();
+  else if (MI.isCall())
+    OS << "an indirect call";
+  else
+    OS << MI.getMF()->getSubtarget().getInstrInfo()->getName(MI.getOpcode());
+  if (const DebugLoc &DL = MI.getDebugLoc())
+    OS << " at line " << DL.getLine();
+  return S;
+}
 
 static bool isIRFissioned(const MachineLoop &L) {
   const MachineBasicBlock *Latch = L.getLoopLatch();
@@ -258,14 +286,21 @@ bool RISCVLoopFissionDecomposedBranch::buildSlice(
   };
   // The compute loop cannot reuse a physical value produced during the
   // consume loop (for example, a call result still in a0).
-  if (!push(Br))
+  Why = "unknown";
+  auto fail = [&](const Twine &W) {
+    Why = W.str();
     return false;
+  };
+  if (!push(Br))
+    return fail("the branch reads a physical register other than x0");
   while (!Work.empty()) {
     MachineInstr *Def = MRI.getVRegDef(Work.pop_back_val());
 
     if (!Def)
       continue; // live-in
-    if (Def->getNumDefs() != 1) return false;
+    if (Def->getNumDefs() != 1)
+      return fail("the condition depends on " + describe(*Def) +
+                  ", which defines more than one value");
 
     if (!L.contains(Def->getParent()))
       continue; // loop invariant
@@ -273,29 +308,38 @@ bool RISCVLoopFissionDecomposedBranch::buildSlice(
       continue;
     // Must run every iteration.
     if (!MDT->dominates(Def->getParent(), Latch))
-      return false;
+      return fail("the condition depends on " + describe(*Def) +
+                  ", which does not run in every iteration");
     if (Def->isPHI()) {
       if (Def->getParent() != Header)
-        return false; // merge inside body
+        return fail("the condition depends on a value merged inside the "
+                    "loop body");
       // follow only the latch operand
       for (unsigned i = 1; i < Def->getNumOperands(); i += 2)
         if (Def->getOperand(i + 1).getMBB() == Latch &&
             !enqueue(Def->getOperand(i).getReg()))
-          return false;
+          return fail("the condition depends on a physical register "
+                      "carried around the loop");
     } else {
       if (Def->mayStore() || Def->isCall() || Def->hasUnmodeledSideEffects())
-        return false;
+        return fail("the condition depends on " + describe(*Def) +
+                    ", which stores, calls or has side effects");
       if (Def->mayLoad())
         for (MachineBasicBlock *B : L.blocks())
           for (MachineInstr &S : *B)
             if (S.mayStore() && S.mayAlias(AA, *Def, /*UseTBAA=*/true))
-              return false; // memory dependence
+              return fail("the condition loads (" + describe(*Def) +
+                          ") from memory that a store in the loop (" +
+                          describe(S) + ") may write");
       if (!push(*Def))
-        return false;
+        return fail("the condition depends on " + describe(*Def) +
+                    ", which reads a physical register other than x0");
     }
     Slice.push_back(Def);
   }
-  return MDT->dominates(Br.getParent(), Latch);
+  if (!MDT->dominates(Br.getParent(), Latch))
+    return fail("the branch does not run in every iteration");
+  return true;
 }
 static bool isDataBranch(const MachineInstr &MI) {
   switch (MI.getOpcode()) {
@@ -332,9 +376,17 @@ bool RISCVLoopFissionDecomposedBranch::fissionLoop(MachineLoop &L) {
   MachineBasicBlock *Pre = L.getLoopPreheader(), *Header = L.getHeader(),
                     *Latch = L.getLoopLatch();
   MachineFunction &MF = *Header->getParent();
-  auto Reject = [&](const char *Why) {
+  MachineOptimizationRemarkEmitter ORE(MF, nullptr);
+  DebugLoc LoopLoc = L.getStartLoc();
+  auto Reject = [&](const Twine &Why) {
     LLVM_DEBUG(dbgs() << "fission: reject " << MF.getName() << ": " << Why
                       << "\n");
+    ORE.emit([&]() {
+      return MachineOptimizationRemarkMissed(DEBUG_TYPE, "NotFissioned",
+                                             LoopLoc, Header)
+             << ("not splitting the loop (decomposed-branch fission): " + Why)
+                    .str();
+    });
     return false;
   };
   if (!Pre || !Latch)
@@ -359,7 +411,8 @@ bool RISCVLoopFissionDecomposedBranch::fissionLoop(MachineLoop &L) {
         ++N;
       }
   if (N != 1)
-    return Reject("data branch count is not 1");
+    return Reject("the loop has " + Twine(N) +
+                  " conditional branches besides the latch (one is handled)");
 
   // Constant trip count from PseudoLoopSetup %x, where %x = ADDI $x0, imm.
   MachineInstr *Setup = nullptr;
@@ -373,9 +426,10 @@ bool RISCVLoopFissionDecomposedBranch::fissionLoop(MachineLoop &L) {
         Trip = D->getOperand(2).getImm();
     }
   if (!Setup)
-    return Reject("no PseudoLoopSetup in preheader");
+    return Reject("the loop is not a counted hardware loop (no loop setup in "
+                  "its preheader)");
   if (Trip < 1)
-    return Reject("trip count is not a positive constant");
+    return Reject("the trip count is not a compile-time constant");
 
   // The hardware queue holds 64 outcomes. A tile must not exceed it.
   int64_t Depth = std::min<unsigned>(LoopFissionQueueDepth, 64);
@@ -394,7 +448,8 @@ bool RISCVLoopFissionDecomposedBranch::fissionLoop(MachineLoop &L) {
 
   SmallVector<MachineInstr *, 16> Slice;
   if (!buildSlice(L, *Br, Slice))
-    return Reject("slice has a dependence that blocks fission");
+    return Reject("its condition cannot be computed in a loop of its own: " +
+                  Why);
   SmallPtrSet<MachineInstr *, 16> InSlice(Slice.begin(), Slice.end());
 
   DebugLoc DL = Br->getDebugLoc();
@@ -635,6 +690,11 @@ bool RISCVLoopFissionDecomposedBranch::fissionLoop(MachineLoop &L) {
   MLI->releaseMemory();
   MLI->analyze(*MDT);
   ++NumLoopsFissioned;
+  ORE.emit([&]() {
+    return MachineOptimizationRemark(DEBUG_TYPE, "Fissioned", LoopLoc, Header)
+           << "split the loop: its conditions are computed first and queued"
+           << (Tiled ? " (in tiles)" : "");
+  });
   return true;
 }
 

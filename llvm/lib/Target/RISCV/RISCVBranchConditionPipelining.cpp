@@ -285,6 +285,27 @@ private:
   ScalarEvolution *SE = nullptr;
   AAResults *AA = nullptr;
   OptimizationRemarkEmitter *ORE = nullptr;
+
+  // Why canPipelineLoopBody or buildSlice said no, for the missed remarks
+  std::string Why;
+  bool reject(const Twine &W) {
+    Why = W.str();
+    return false;
+  }
+  void missedLoop(Loop *L, StringRef Name, const Twine &Msg) {
+    ORE->emit([&]() {
+      return OptimizationRemarkMissed(DEBUG_TYPE, Name, L->getStartLoc(),
+                                      L->getHeader())
+             << ("not pipelining branch conditions: " + Msg).str();
+    });
+  }
+  void missedBranch(BranchInst *Br, StringRef Name, const Twine &Msg) {
+    ORE->emit([&]() {
+      return OptimizationRemarkMissed(DEBUG_TYPE, Name, Br->getDebugLoc(),
+                                      Br->getParent())
+             << ("not pipelining this branch's condition: " + Msg).str();
+    });
+  }
   IntegerType *XLenTy = nullptr;
 
   std::optional<LoopPlan> analyzeLoop(Loop *L);
@@ -331,6 +352,24 @@ static bool reachesInIteration(const Loop &L, const BasicBlock *From,
   return false;
 }
 
+/// "a call to f at line 12", "'load' at line 12": what an instruction is, for
+/// remarks.
+static std::string describe(const Instruction &I) {
+  std::string S;
+  raw_string_ostream OS(S);
+  if (auto *CB = dyn_cast<CallBase>(&I)) {
+    if (const Function *F = CB->getCalledFunction())
+      OS << "a call to " << F->getName();
+    else
+      OS << "an indirect call";
+  } else {
+    OS << "'" << I.getOpcodeName() << "'";
+  }
+  if (const DebugLoc &DL = I.getDebugLoc())
+    OS << " at line " << DL.getLine();
+  return S;
+}
+
 /// Whether \p I may be evaluated for a later iteration: it computes its
 /// result from its operands alone (or, for a load, from memory the caller
 /// checks), so it can run again elsewhere without changing the program.
@@ -351,54 +390,63 @@ static bool isClonableIntoCondition(const Instruction &I) {
 }
 
 bool RISCVBranchConditionPipelining::canPipelineLoopBody(const LoopPlan &P) {
+  Why = "unknown";
   Loop *L = P.L;
   unsigned Size = 0;
   for (BasicBlock *BB : P.Blocks) {
     if (BB->isEHPad() || BB->hasAddressTaken())
-      return false;
+      return reject("a block is an exception handler or has its address taken");
     for (Instruction &I : *BB) {
       if (I.isDebugOrPseudoInst())
         continue;
       if (++Size > MaxLoopSize) {
         LLVM_DEBUG(dbgs() << "  loop is too large to duplicate\n");
-        return false;
+        return reject("the loop has more than " + Twine(MaxLoopSize) +
+                      " instructions (-riscv-ns-swp-max-loop-size)");
       }
       // The kernel is a copy of the loop.
       if (I.getType()->isTokenTy() || isa<AllocaInst>(I))
-        return false;
+        return reject("the loop contains " + describe(I) +
+                      ", which cannot be duplicated");
       if (auto *CB = dyn_cast<CallBase>(&I)) {
         // A call could write anything a condition reads, and a call to a
         // pure intrinsic is the only kind certain to stay a non-call.
         auto *II = dyn_cast<IntrinsicInst>(CB);
         if (!II || II->isConvergent() || II->cannotDuplicate())
-          return false;
+          return reject("the loop contains " + describe(I) +
+                        " (a call could write what a condition reads)");
         // A lifetime marker could let a stack slot be reused within an
         // iteration, under a load that now reads it earlier.
         if (II->isLifetimeStartOrEnd())
-          return false;
+          return reject("the loop contains a lifetime marker (a local "
+                        "variable's scope ends inside the loop)");
         if (isa<DbgInfoIntrinsic>(II) || II->isAssumeLikeIntrinsic())
           continue;
         if (!II->doesNotAccessMemory() || II->mayHaveSideEffects())
-          return false;
+          return reject("the loop contains " + describe(I) +
+                        ", which accesses memory");
         continue;
       }
       if (auto *Store = dyn_cast<StoreInst>(&I)) {
         if (!Store->isSimple())
-          return false;
+          return reject("the loop contains a volatile or atomic store (" +
+                        describe(I) + ")");
         continue;
       }
       if (auto *Load = dyn_cast<LoadInst>(&I)) {
         if (!Load->isSimple())
-          return false;
+          return reject("the loop contains a volatile or atomic load (" +
+                        describe(I) + ")");
         continue;
       }
       // Fences, atomics, va_arg...
       if (I.mayReadOrWriteMemory() || I.mayHaveSideEffects())
-        return false;
+        return reject("the loop contains " + describe(I) +
+                      ", which accesses memory or has side effects");
       // The loop has no exits but its latch, so a terminator can only be a
       // branch or switch within it.
       if (I.isTerminator() && !isa<BranchInst>(I) && !isa<SwitchInst>(I))
-        return false;
+        return reject("the loop contains " + describe(I));
     }
   }
 
@@ -412,7 +460,8 @@ bool RISCVBranchConditionPipelining::canPipelineLoopBody(const LoopPlan &P) {
   for (BasicBlock *BB : P.Blocks)
     for (BasicBlock *Succ : successors(BB))
       if (L->contains(Succ) && Succ != P.Header && Order[Succ] <= Order[BB])
-        return false;
+        return reject("a block can run more than once per iteration "
+                      "(irreducible control flow)");
   return true;
 }
 
@@ -483,6 +532,7 @@ RISCVBranchConditionPipelining::findInductionVar(LoopPlan &P, PHINode *Phi) {
 
 bool RISCVBranchConditionPipelining::buildSlice(LoopPlan &P,
                                                 PipelinedBranch &PB) {
+  Why = "unknown";
   Loop *L = P.L;
   SmallPtrSet<Instruction *, 16> InSlice;
   SmallVector<Instruction *, 16> WorkList;
@@ -496,18 +546,23 @@ bool RISCVBranchConditionPipelining::buildSlice(LoopPlan &P,
       // Any other phi carries a value that the slice cannot recompute.
       std::optional<unsigned> IV = findInductionVar(P, Phi);
       if (!IV)
-        return false;
+        return reject("it depends on a value carried from the previous "
+                      "iteration (" +
+                      Phi->getName() + ") that is not an induction variable");
       IVs.insert(*IV);
       return true;
     }
     if (!isClonableIntoCondition(*I))
-      return false;
+      return reject("it depends on " + describe(*I) +
+                    ", which cannot be computed again for a later iteration");
     // Without a trip count, conditions are also computed for iterations that
     // never run, so each instruction must be safe to execute on any operands.
     // No load is: its address may not be valid in such an iteration.
     if (P.Speculative &&
         (isa<LoadInst>(I) || !isSafeToSpeculativelyExecute(I)))
-      return false;
+      return reject("it needs " + describe(*I) +
+                    ", and without a trip count conditions are also computed "
+                    "for iterations that never run");
     if (InSlice.insert(I).second)
       WorkList.push_back(I);
     return true;
@@ -523,11 +578,14 @@ bool RISCVBranchConditionPipelining::buildSlice(LoopPlan &P,
   }
 
   if (InSlice.size() > MaxSliceSize)
-    return false;
+    return reject("it needs " + Twine(InSlice.size()) +
+                  " instructions, more than " + Twine(MaxSliceSize) +
+                  " (-riscv-ns-swp-max-slice-size)");
   // An invariant condition gains nothing from being queued early, and a
   // condition that is itself a header phi is only handled if it is a toggle.
   if (InSlice.empty() && (IVs.empty() || !P.IVs[IVs[0]].isToggle()))
-    return false;
+    return reject("the condition is loop-invariant or itself a value carried "
+                  "between iterations");
 
   // Everything in the slice dominates the branch, so program order puts
   // every operand before its users.
@@ -843,18 +901,31 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
   if (!L->isInnermost() || !L->isLoopSimplifyForm() || !P.Latch ||
       !L->isLoopExiting(P.Latch) || !exitsOnlyAtLatch(*L)) {
     LLVM_DEBUG(dbgs() << "  not an innermost loop exiting at its latch\n");
+    if (!L->isInnermost())
+      missedLoop(L, "NotInnermost", "the loop contains another loop");
+    else if (!L->isLoopSimplifyForm() || !P.Latch)
+      missedLoop(L, "NotSimplified",
+                 "the loop has no preheader or no single latch");
+    else
+      missedLoop(L, "EarlyExit",
+                 "the loop can exit other than at its latch (a break, a "
+                 "return, or a call that does not return)");
     return std::nullopt;
   }
   auto *LatchBr = dyn_cast<BranchInst>(P.Latch->getTerminator());
   if (!LatchBr || !LatchBr->isConditional() ||
-      !isa<BranchInst>(P.Preheader->getTerminator()))
+      !isa<BranchInst>(P.Preheader->getTerminator())) {
+    missedLoop(L, "NotPlainBranches",
+               "the latch or the preheader does not end in a plain branch");
     return std::nullopt;
+  }
 
   LoopBlocksRPO RPOT(L);
   RPOT.perform(LI);
   P.Blocks.assign(RPOT.begin(), RPOT.end());
   if (!canPipelineLoopBody(P)) {
     LLVM_DEBUG(dbgs() << "  loop body cannot be pipelined\n");
+    missedLoop(L, "BodyNotPipelinable", Why);
     return std::nullopt;
   }
 
@@ -863,6 +934,9 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
       BTC->getType()->getIntegerBitWidth() > XLenTy->getBitWidth()) {
     if (!EnableSpeculativePipelining) {
       LLVM_DEBUG(dbgs() << "  trip count is not computable\n");
+      missedLoop(L, "NoTripCount",
+                 "the trip count cannot be computed (-riscv-ns-swp-speculative "
+                 "pipelines such loops in place)");
       return std::nullopt;
     }
     // Without a trip count, the loop is pipelined in place: its conditions
@@ -876,8 +950,11 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
     P.TripCount = SE->getAddExpr(SE->getNoopOrZeroExtend(BTC, XLenTy),
                                  SE->getOne(XLenTy));
     SCEVExpander Expander(*SE, *DL, "swp");
-    if (!Expander.isSafeToExpandAt(P.TripCount, P.Preheader->getTerminator()))
+    if (!Expander.isSafeToExpandAt(P.TripCount, P.Preheader->getTerminator())) {
+      missedLoop(L, "TripCountNotExpandable",
+                 "the trip count cannot be computed before the loop");
       return std::nullopt;
+    }
   }
 
   unsigned Distance = std::min<unsigned>(
@@ -887,6 +964,10 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
   if (MaxTripCount && MaxTripCount <= Distance) {
     LLVM_DEBUG(dbgs() << "  never runs more than " << MaxTripCount
                       << " iterations\n");
+    missedLoop(L, "TooFewIterations",
+               "the loop never runs more than " + Twine(MaxTripCount) +
+                   " iterations, no more than the distance (" +
+                   Twine(Distance) + ")");
     return std::nullopt;
   }
 
@@ -901,14 +982,22 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
     // The branch must run exactly once per iteration, to pop the condition
     // its iteration pushed. Blocks run at most once per iteration, and one
     // that dominates the latch runs at least once.
-    if (!Br || !Br->isConditional() || !DT->dominates(BB, P.Latch) ||
+    if (!Br || !Br->isConditional() ||
         Br->getSuccessor(0) == Br->getSuccessor(1))
       continue;
+    if (!DT->dominates(BB, P.Latch)) {
+      missedBranch(Br, "NotEveryIteration",
+                   "the branch does not run in every iteration (it is inside "
+                   "an if); only branches that do are pipelined");
+      continue;
+    }
 
     PipelinedBranch PB;
     PB.Br = Br;
     if (!buildSlice(P, PB)) {
       LLVM_DEBUG(dbgs() << "  cannot compute ahead: " << *Br << "\n");
+      missedBranch(Br, "ConditionNotComputable",
+                   "its condition cannot be computed ahead: " + Why);
       continue;
     }
     // Each condition the prologue queues costs a copy of the slice and a
@@ -921,6 +1010,9 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
     if (!PB.Distance) {
       LLVM_DEBUG(dbgs() << "  a store could clobber what the condition of "
                         << *Br << " reads\n");
+      missedBranch(Br, "StoreMayClobber",
+                   "a store in the loop may change what its condition reads "
+                   "in a later iteration (no distance is safe)");
       continue;
     }
     PrologueSize += PB.Distance * PushSize;
@@ -929,8 +1021,12 @@ std::optional<LoopPlan> RISCVBranchConditionPipelining::analyzeLoop(Loop *L) {
     P.Branches.push_back(std::move(PB));
   }
 
-  if (P.Branches.empty())
+  if (P.Branches.empty()) {
+    missedLoop(L, "NoBranchPipelinable",
+               "no branch condition in the loop can be pipelined (see the "
+               "remarks on its branches)");
     return std::nullopt;
+  }
 
   // A toggle repeats every two iterations whether or not they run, so a
   // counted loop whose conditions read nothing else needs no kernel that

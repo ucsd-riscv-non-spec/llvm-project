@@ -21,6 +21,7 @@
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/CodeGen/MachineOptimizationRemarkEmitter.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/Support/CommandLine.h"
@@ -136,6 +137,9 @@ public:
   MachineDominatorTree *MDT;
   MachineLoopInfo *MLI;
   MachineBlockFrequencyInfo *MBFI;
+  MachineOptimizationRemarkEmitter *ORE = nullptr;
+  // Why findHoistPoints stopped where it did, for the missed remark
+  std::string StopWhy;
 
   RISCVBranchSetupHoisting() : MachineFunctionPass(ID) {}
 
@@ -173,6 +177,8 @@ public:
   /// B-registers live at once still fit in those that may be assigned.
   unsigned countFittingPoints(MachineInstr &S, ArrayRef<HoistPoint> Points,
                               BRegLiveness &Liveness) const;
+  // The hazard isSafeToHoistTo found, for the missed remark
+  mutable const MachineInstr *PathHazard = nullptr;
   bool isSafeToHoistTo(const MachineInstr &SetupMI, MachineBasicBlock &DestBB,
                        MachineBasicBlock::const_iterator InsertPt,
                        const MachineInstr *OwnBranch) const;
@@ -424,6 +430,8 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   MLI = &getAnalysis<MachineLoopInfoWrapperPass>().getLI();
   MBFI = &getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
+  MachineOptimizationRemarkEmitter LocalORE(MF, MBFI);
+  ORE = &LocalORE;
 
   BRegLiveness Liveness(MF, *TRI);
   bool Changed = false;
@@ -863,6 +871,27 @@ bool RISCVBranchSetupHoisting::scheduleBranchSetup(
                           << " steps, to keep enough B-registers free\n");
       }
     }
+    // A source or target setup left in a loop runs on every iteration: say why
+    // (condition pushes run every iteration by design; pipelining moves them)
+    MachineBasicBlock *FinalBB =
+        NumPoints ? Points[NumPoints - 1].first : SetupMI->getParent();
+    if (SetupMI != C)
+      if (MachineLoop *InLoop = MLI->getLoopFor(FinalBB)) {
+        std::string Why = NumPoints < Points.size()
+                              ? "it is hoisted less far, to keep enough "
+                                "B-registers free"
+                              : StopWhy;
+        ORE->emit([&]() {
+          MachineOptimizationRemarkMissed R(DEBUG_TYPE, "SetupInLoop",
+                                            MI->getDebugLoc(), MI->getParent());
+          R << "the " << (SetupMI == S ? "source" : "target")
+            << " setup of this branch runs on every iteration of the loop";
+          if (const DebugLoc &LL = InLoop->getStartLoc())
+            R << " at line " << std::to_string(LL.getLine());
+          R << ": " << Why;
+          return R;
+        });
+      }
     if (!NumPoints)
       continue;
 
@@ -943,6 +972,81 @@ static bool hasRegisterDependency(const MachineInstr &MI,
   return false;
 }
 
+/// "a call to f at line 12", "LW at line 12": what an instruction is, for
+/// remarks.
+static std::string describe(const MachineInstr &MI) {
+  std::string S;
+  raw_string_ostream OS(S);
+  const MachineOperand *Callee = nullptr;
+  if (MI.isCall()) {
+    for (const MachineOperand &MO : MI.operands())
+      if (MO.isGlobal() || MO.isSymbol()) {
+        Callee = &MO;
+        break;
+      }
+    // A pb call names no callee: its B-register's target setup does, or the
+    // AUIPC that computes the register the setup reads (BMOVT_I %b, $x1, 0)
+    const MachineRegisterInfo &MRI = MI.getMF()->getRegInfo();
+    auto calleeOf = [&](const MachineInstr &Def) -> const MachineOperand * {
+      for (const MachineOperand &DO : Def.operands())
+        if (DO.isGlobal() || DO.isSymbol())
+          return &DO;
+      for (const MachineOperand &DO : Def.uses()) {
+        if (!DO.isReg() || !DO.getReg().isPhysical())
+          continue;
+        const MachineBasicBlock &DefBB = *Def.getParent();
+        for (MachineBasicBlock::const_reverse_iterator
+                 I = std::next(MachineBasicBlock::const_reverse_iterator(Def)),
+                 E = DefBB.rend();
+             I != E; ++I)
+          if (I->modifiesRegister(DO.getReg(), nullptr)) {
+            for (const MachineOperand &PO : I->operands())
+              if (PO.isGlobal() || PO.isSymbol())
+                return &PO;
+            break;
+          }
+      }
+      return nullptr;
+    };
+    for (const MachineOperand &MO : MI.uses())
+      if (!Callee && MO.isReg() && MO.getReg().isVirtual())
+        for (const MachineInstr &Def : MRI.def_instructions(MO.getReg()))
+          if (!Callee)
+            Callee = calleeOf(Def);
+  }
+  if (Callee && Callee->isGlobal())
+    OS << "a call to " << Callee->getGlobal()->getName();
+  else if (Callee)
+    OS << "a call to " << Callee->getSymbolName();
+  else if (MI.isCall())
+    OS << "an indirect call";
+  else if (MI.isInlineAsm())
+    OS << "inline assembly";
+  else
+    OS << MI.getMF()->getSubtarget().getInstrInfo()->getName(MI.getOpcode());
+  if (const DebugLoc &DL = MI.getDebugLoc())
+    OS << " at line " << DL.getLine();
+  return S;
+}
+
+/// Why \p MI keeps \p SetupMI from moving above it, for remarks.
+static std::string hazardReason(const MachineInstr &MI,
+                                const MachineInstr &SetupMI) {
+  if (MI.isBMOV() && MI.getNumOperands() && SetupMI.getNumOperands() &&
+      MI.getOperand(0).isReg() &&
+      MI.getOperand(0).getReg() == SetupMI.getOperand(0).getReg())
+    return "the branch's earlier setup (" + describe(MI) +
+           "), which it has to follow";
+  if (MI.getOpcode() == RISCV::BPUSH && MI.getFlag(MachineInstr::FrameSetup))
+    return "the prologue's save of callee-saved B-registers";
+  if (MI.isCall())
+    return describe(MI) + " (a setup is not kept live across a call)";
+  if (MI.isIndirectBranch() || MI.isInlineAsm() || MI.hasUnmodeledSideEffects())
+    return describe(MI) + " (an instruction-motion barrier)";
+  return describe(MI) +
+         ", which writes a register the setup reads, or uses its B-register";
+}
+
 static bool isHoistHazard(const MachineInstr &MI, const MachineInstr &SetupMI,
                           const TargetRegisterInfo &TRI,
                           const MachineInstr *OwnBranch) {
@@ -958,7 +1062,8 @@ static MachineBasicBlock::iterator
 scanBlockBackward(MachineBasicBlock *BB,
                   MachineBasicBlock::reverse_iterator From,
                   const MachineInstr &SetupMI, const TargetRegisterInfo &TRI,
-                  const MachineInstr *OwnBranch, bool &HazardFound) {
+                  const MachineInstr *OwnBranch, bool &HazardFound,
+                  const MachineInstr **HazardMI = nullptr) {
   HazardFound = false;
 
   // Try to hoist to the top of the func.
@@ -981,6 +1086,8 @@ scanBlockBackward(MachineBasicBlock *BB,
                  << "    - reason: Has Side Effects");
       LLVM_DEBUG(dbgs() << " ; Cannot cross: " << CurrMI);
       HazardFound = true;
+      if (HazardMI)
+        *HazardMI = &CurrMI;
       return std::next(CurrMI.getIterator());
     }
 
@@ -1011,13 +1118,15 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
     return false;
   bool SrcInCycle = false;
 
+  PathHazard = nullptr;
   auto rangeHasHazard = [&](MachineBasicBlock::const_iterator Begin,
                             MachineBasicBlock::const_iterator End) {
-    return llvm::any_of(
-        llvm::make_range(Begin, End), [&](const MachineInstr &MI) {
-          return &MI != &SetupMI &&
-                 isHoistHazard(MI, SetupMI, *TRI, OwnBranch);
-        });
+    for (const MachineInstr &MI : llvm::make_range(Begin, End))
+      if (&MI != &SetupMI && isHoistHazard(MI, SetupMI, *TRI, OwnBranch)) {
+        PathHazard = &MI;
+        return true;
+      }
+    return false;
   };
 
   // Walk the inverse CFG from the source to DestBB. Stopping at DestBB avoids
@@ -1066,7 +1175,10 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
   if (ReachedDest && SrcInCycle &&
       llvm::any_of(llvm::make_range(AfterSetup, SrcBB->end()),
                    [&](const MachineInstr &MI) {
-                     return isCycleHazard(MI, SetupMI, *TRI, OwnBranch);
+                     if (!isCycleHazard(MI, SetupMI, *TRI, OwnBranch))
+                       return false;
+                     PathHazard = &MI;
+                     return true;
                    })) {
     LLVM_DEBUG(dbgs() << "  [Stop] Hazard after the setup in BB#"
                       << SrcBB->getNumber() << ", in a cycle not through BB#"
@@ -1079,12 +1191,15 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
 
 static bool loopHasHazard(const MachineLoop &L, const MachineInstr &SetupMI,
                           const TargetRegisterInfo &TRI,
-                          const MachineInstr *OwnBranch) {
+                          const MachineInstr *OwnBranch,
+                          const MachineInstr **HazardMI = nullptr) {
   for (MachineBasicBlock *MBB : L.getBlocks()) {
     for (const MachineInstr &MI : *MBB) {
       bool IsHazard = isCycleHazard(MI, SetupMI, TRI, OwnBranch);
       LLVM_DEBUG(dbgs() << "  Checking loop MI (isHazard=" << IsHazard << "): " << MI);
       if (IsHazard) {
+        if (HazardMI)
+          *HazardMI = &MI;
         return true;
       }
     }
@@ -1106,19 +1221,26 @@ RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
   BlockFrequency Ref = MBFI->getBlockFreq(CurBB);
 
   bool HazardFound = false;
+  const MachineInstr *Hazard = nullptr;
+  StopWhy = "it reached the function entry";
+  // Set while the walk passes blocks it may not leave the setup in (another
+  // loop's, or too hot), cleared when it accepts one: if it then stops, that is
+  // why the setup stayed where it is
+  std::string Passed;
 
   auto IntraStart = std::next(SetupMI.getReverseIterator());
   if (IntraStart != CurBB->rend())
-    SafePoint =
-        scanBlockBackward(CurBB, IntraStart, SetupMI, *TRI, OwnBranch,
-                          HazardFound);
+    SafePoint = scanBlockBackward(CurBB, IntraStart, SetupMI, *TRI, OwnBranch,
+                                  HazardFound, &Hazard);
   else
     SafePoint = CurBB->getFirstNonPHI();
 
   if (SafePoint != SetupMI.getIterator())
     Points.push_back({CurBB, SafePoint});
-  if (HazardFound)
+  if (HazardFound) {
+    StopWhy = "it cannot move above " + hazardReason(*Hazard, SetupMI);
     return Points;
+  }
 
   MachineLoop *SetupLoop = MLI->getLoopFor(CurBB);
   MachineBasicBlock *BB = CurBB;
@@ -1133,8 +1255,11 @@ RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
       break;
 
     MachineBasicBlock *IDom = IDomNode->getBlock();
-    if (!IDom || DisableCrossBBHoisting)
+    if (!IDom || DisableCrossBBHoisting) {
+      if (DisableCrossBBHoisting)
+        StopWhy = "-riscv-ns-disable-cross-bb-hoisting is given";
       break;
+    }
 
     // Don't hoist across loop boundaries.
 #if 0
@@ -1177,9 +1302,8 @@ RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
       IDomSafePoint = IDom->getFirstTerminator();
       HazardFound = false;
     } else {
-      IDomSafePoint =
-          scanBlockBackward(IDom, IDomScanStart, SetupMI, *TRI, OwnBranch,
-                            HazardFound);
+      IDomSafePoint = scanBlockBackward(IDom, IDomScanStart, SetupMI, *TRI,
+                                        OwnBranch, HazardFound, &Hazard);
     }
 
     // The dominator tree chooses candidates; the inverse-CFG walk proves that
@@ -1188,17 +1312,29 @@ RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
       LLVM_DEBUG(dbgs() << "  [Stop] Hazard on a CFG path from BB#"
                         << CurBB->getNumber() << " to BB#" << IDom->getNumber()
                         << "\n");
+      StopWhy = PathHazard ? "it cannot move above " +
+                                 hazardReason(*PathHazard, SetupMI) +
+                                 ", on a path into its block"
+                           : std::string("it cannot reach a block before it");
       break;
     }
 
     for (MachineLoop *L = MLI->getLoopFor(BB); L && !L->contains(IDom);
          L = L->getParentLoop()) {
       LLVM_DEBUG(dbgs() << "  Checking loop hazard...\n");
-      if (loopHasHazard(*L, SetupMI, *TRI, OwnBranch))
+      const MachineInstr *LoopHazard = nullptr;
+      if (loopHasHazard(*L, SetupMI, *TRI, OwnBranch, &LoopHazard)) {
+        StopWhy = "the loop it would leave contains " +
+                  hazardReason(*LoopHazard, SetupMI);
         return Points;
+      }
     }
 
     if (InOtherLoop || TooHot) {
+      Passed = InOtherLoop
+                   ? "the blocks it could move to are inside another loop"
+                   : "the blocks it could move to run much more often than "
+                     "its own (-riscv-ns-hoist-max-freq-ratio)";
       LLVM_DEBUG(dbgs() << "  [Cross-BB] Passing BB#" << IDom->getNumber()
                         << (InOtherLoop ? ", in a loop the setup is not in"
                                         : ", which runs too often")
@@ -1221,15 +1357,21 @@ RISCVBranchSetupHoisting::findHoistPoints(MachineInstr &SetupMI,
       }
 #endif
       Points.push_back({IDom, IDomSafePoint});
+      Passed.clear();
       if (MBFI->getBlockFreq(IDom) < Ref)
         Ref = MBFI->getBlockFreq(IDom);
     }
     BB = IDom;
 
-    if (HazardFound)
+    if (HazardFound) {
+      StopWhy = "it cannot move above " + hazardReason(*Hazard, SetupMI) +
+                ", in a block before it";
       break;
+    }
   }
 
+  if (!Passed.empty() && StringRef(StopWhy).starts_with("it reached"))
+    StopWhy = Passed;
   return Points;
 }
 

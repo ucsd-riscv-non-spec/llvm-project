@@ -9,22 +9,23 @@
 #include "RISCV.h"
 #include "RISCVSubtarget.h"
 #include "RISCVTargetMachine.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemoryLocation.h"
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
-#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/IR/Dominators.h"
-#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsRISCV.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
 
@@ -71,6 +72,13 @@ private:
   bool findCandidate(Loop &L, LoopCandidate &C);
   bool fission(LoopCandidate &C, unsigned Queue);
 
+  // Why findCandidate rejected the loop, for the missed remark
+  std::string Why;
+  bool reject(const Twine &W) {
+    Why = W.str();
+    return false;
+  }
+
   DominatorTree *DT = nullptr;
   LoopInfo *LI = nullptr;
   ScalarEvolution *SE = nullptr;
@@ -79,6 +87,24 @@ private:
 };
 
 char RISCVIRLoopFission::ID = 0;
+
+/// "a call to f at line 12", "'load' at line 12": what an instruction is, for
+/// remarks.
+static std::string describe(const Instruction &I) {
+  std::string S;
+  raw_string_ostream OS(S);
+  if (auto *CB = dyn_cast<CallBase>(&I)) {
+    if (const Function *F = CB->getCalledFunction())
+      OS << "a call to " << F->getName();
+    else
+      OS << "an indirect call";
+  } else {
+    OS << "'" << I.getOpcodeName() << "'";
+  }
+  if (const DebugLoc &DL = I.getDebugLoc())
+    OS << " at line " << DL.getLine();
+  return S;
+}
 
 static void markFissionedLoop(BranchInst &LatchBranch) {
   LLVMContext &Context = LatchBranch.getContext();
@@ -103,19 +129,27 @@ bool RISCVIRLoopFission::findCandidate(Loop &L, LoopCandidate &C) {
   C.Latch = L.getLoopLatch();
   C.TripCount = SE->getSmallConstantTripCount(&L);
 
-  if (!L.isInnermost() || !C.Preheader || !C.Latch || C.TripCount == 0 ||
-      C.TripCount > QueueDepth || L.getExitingBlock() != C.Latch ||
-      !L.getExitBlock())
-    return false;
+  if (!L.isInnermost())
+    return reject("the loop contains another loop");
+  if (!C.Preheader || !C.Latch)
+    return reject("the loop has no preheader or no single latch");
+  if (C.TripCount == 0)
+    return reject("the trip count is not a compile-time constant");
+  if (C.TripCount > QueueDepth)
+    return reject("the trip count (" + Twine(C.TripCount) +
+                  ") is more than the condition queue holds (" +
+                  Twine(QueueDepth) + ")");
+  if (L.getExitingBlock() != C.Latch || !L.getExitBlock())
+    return reject("the loop can exit other than at its latch");
 
   auto *PreheaderBranch = dyn_cast<BranchInst>(C.Preheader->getTerminator());
   if (!PreheaderBranch || !PreheaderBranch->isUnconditional() ||
       PreheaderBranch->getSuccessor(0) != C.Header)
-    return false;
+    return reject("the preheader does not end in a jump to the loop");
 
   auto *LatchBranch = dyn_cast<BranchInst>(C.Latch->getTerminator());
   if (!LatchBranch || !LatchBranch->isConditional())
-    return false;
+    return reject("the latch does not end in a conditional branch");
 
   unsigned DataBranches = 0;
   for (BasicBlock *BB : L.blocks()) {
@@ -127,14 +161,17 @@ bool RISCVIRLoopFission::findCandidate(Loop &L, LoopCandidate &C) {
     ++DataBranches;
     C.DataBranch = Branch;
   }
-  if (DataBranches != 1 || C.DataBranch->getParent() != C.Header)
-    return false;
+  if (DataBranches != 1)
+    return reject("the loop has " + Twine(DataBranches) +
+                  " conditional branches besides the latch (one is handled)");
+  if (C.DataBranch->getParent() != C.Header)
+    return reject("the conditional branch is not in the loop header");
 
   auto *Condition = dyn_cast<ICmpInst>(C.DataBranch->getCondition());
   if (!Condition || !Condition->getOperand(0)->getType()->isIntegerTy() ||
       Condition->getOperand(0)->getType() != Condition->getOperand(1)->getType() ||
       Condition->getOperand(0)->getType()->getIntegerBitWidth() > XLen)
-    return false;
+    return reject("the branch condition is not an integer compare");
 
   C.Body = C.DataBranch->getSuccessor(0);
   C.Merge = C.DataBranch->getSuccessor(1);
@@ -142,12 +179,13 @@ bool RISCVIRLoopFission::findCandidate(Loop &L, LoopCandidate &C) {
       C.Body == C.Latch || C.Body == C.Header ||
       pred_size(C.Body) != 1 || *pred_begin(C.Body) != C.Header ||
       !C.Body->phis().empty())
-    return false;
+    return reject("the branch does not guard a single block that "
+                  "rejoins the loop (an if without else)");
 
   auto *BodyBranch = dyn_cast<BranchInst>(C.Body->getTerminator());
   if (!BodyBranch || !BodyBranch->isUnconditional() ||
       BodyBranch->getSuccessor(0) != C.Merge)
-    return false;
+    return reject("the guarded block does not jump straight to the merge");
   for (PHINode &Phi : C.Merge->phis()) {
     int BodyIndex = Phi.getBasicBlockIndex(C.Body);
     if (BodyIndex < 0)
@@ -155,14 +193,15 @@ bool RISCVIRLoopFission::findCandidate(Loop &L, LoopCandidate &C) {
     for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I)
       if (I != static_cast<unsigned>(BodyIndex) &&
           Phi.getIncomingValue(I) != Phi.getIncomingValue(BodyIndex))
-        return false;
+        return reject("the guarded block changes a value used after it");
   }
   for (Instruction &I : *C.Body)
     if (!I.isTerminator())
       for (User *U : I.users())
         if (auto *Use = dyn_cast<Instruction>(U))
           if (Use->getParent() != C.Body)
-            return false;
+            return reject("a value computed in the guarded block is used "
+                          "outside it");
 
   SmallVector<Instruction *, 16> Worklist;
   SmallPtrSet<Instruction *, 32> Visited;
@@ -175,15 +214,16 @@ bool RISCVIRLoopFission::findCandidate(Loop &L, LoopCandidate &C) {
   while (!Worklist.empty()) {
     Instruction *I = Worklist.pop_back_val();
     if (!DT->dominates(I, C.DataBranch))
-      return false;
+      return reject("the condition depends on " + describe(*I) +
+                    ", which does not run before the branch");
     if (auto *Load = dyn_cast<LoadInst>(I)) {
       if (!Load->isSimple())
-        return false;
+        return reject("the condition depends on a volatile or atomic load");
     } else if (isa<PHINode>(I)) {
       continue;
     } else if (I->mayReadOrWriteMemory() || I->mayHaveSideEffects() ||
                isa<CallBase>(I)) {
-      return false;
+      return reject("the condition depends on " + describe(*I));
     }
     for (Value *Operand : I->operands())
       AddConditionValue(Operand);
@@ -196,34 +236,39 @@ bool RISCVIRLoopFission::findCandidate(Loop &L, LoopCandidate &C) {
       if (isa<DbgInfoIntrinsic>(I) || I.isTerminator() || isa<PHINode>(I))
         continue;
       if (auto *Store = dyn_cast<StoreInst>(&I)) {
-        if (!Store->isSimple() || BB != C.Body)
-          return false;
+        if (!Store->isSimple())
+          return reject("the loop has a volatile or atomic store");
+        if (BB != C.Body)
+          return reject("the loop stores outside the guarded block (" +
+                        describe(I) + ")");
         Stores.push_back(Store);
         continue;
       }
       if (auto *Load = dyn_cast<LoadInst>(&I)) {
         if (!Load->isSimple())
-          return false;
+          return reject("the loop has a volatile or atomic load");
         Loads.push_back(Load);
         continue;
       }
       if (I.mayReadOrWriteMemory() || I.mayHaveSideEffects() ||
           isa<CallBase>(I))
-        return false;
+        return reject("the loop contains " + describe(I));
     }
   }
 
   if (Stores.empty())
-    return false;
+    return reject("the guarded block stores nothing");
   for (LoadInst *Load : Loads)
     for (StoreInst *Store : Stores)
       if (AA->alias(MemoryLocation::get(Load), MemoryLocation::get(Store)) !=
           AliasResult::NoAlias)
-        return false;
+        return reject("a load in the loop (" + describe(*Load) +
+                      ") may read what the guarded store (" + describe(*Store) +
+                      ") writes");
 
   for (PHINode &Phi : C.Header->phis())
     if (Phi.getBasicBlockIndex(C.Preheader) < 0)
-      return false;
+      return reject("a header phi has no value from the preheader");
 
   return true;
 }
@@ -347,15 +392,30 @@ bool RISCVIRLoopFission::runOnFunction(Function &F) {
           Queue = std::max(Queue, static_cast<unsigned>(ID->getZExtValue() + 1));
       }
 
+  OptimizationRemarkEmitter ORE(&F);
   for (BasicBlock *Header : Headers) {
     Loop *L = LI->getLoopFor(Header);
     if (!L || L->getHeader() != Header)
       continue;
     LoopCandidate Candidate;
-    if (!findCandidate(*L, Candidate))
+    if (!findCandidate(*L, Candidate)) {
+      ORE.emit([&]() {
+        return OptimizationRemarkMissed(DEBUG_TYPE, "NotFissioned",
+                                        L->getStartLoc(), L->getHeader())
+               << "not splitting the loop (IR loop fission): " << Why;
+      });
       continue;
-    if (fission(Candidate, Queue))
+    }
+    // The transformation changes the loop: take what the remark needs first
+    DebugLoc Loc = L->getStartLoc();
+    if (fission(Candidate, Queue)) {
+      ORE.emit([&]() {
+        return OptimizationRemark(DEBUG_TYPE, "Fissioned", Loc, Header)
+               << "split the loop: its conditions are computed first and "
+                  "queued";
+      });
       return true;
+    }
   }
   return false;
 }
