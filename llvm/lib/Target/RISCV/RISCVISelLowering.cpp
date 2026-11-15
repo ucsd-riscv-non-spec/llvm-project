@@ -96,7 +96,7 @@ static cl::opt<bool> NSBranchlessSelect(
     "riscv-ns-branchless-select", cl::Hidden,
     cl::desc("Non-Spec: lower scalar integer selects without a branch, as "
              "f ^ ((t ^ f) & -c)"),
-    cl::init(false));
+    cl::init(true));
 
 RISCVTargetLowering::RISCVTargetLowering(const TargetMachine &TM,
                                          const RISCVSubtarget &STI)
@@ -9240,12 +9240,25 @@ SDValue RISCVTargetLowering::lowerSELECT(SDValue Op, SelectionDAG &DAG) const {
   if (SDValue V = combineSelectToBinOp(Op.getNode(), DAG, Subtarget))
     return V;
 
-  // (select c, t, f) -> (xor f, (and (xor t, f), (neg c))), for c = 0 or 1
+  // (select c, t, f) -> f ^ ((t ^ f) & -c), with frozen t/f and c = 0 or 1.
   if (NSBranchlessSelect && VT.isScalarInteger()) {
+    // SELECT conditions obey ZeroOrOneBooleanContent, including conditions
+    // promoted from i1. Changing their width therefore preserves their value.
+    // Normalize when known-bits analysis cannot establish that representation.
     unsigned Bits = VT.getSizeInBits();
     SDValue C = DAG.getZExtOrTrunc(CondV, DL, VT);
     if (!DAG.MaskedValueIsZero(C, APInt::getHighBitsSet(Bits, Bits - 1)))
       C = DAG.getSetCC(DL, VT, C, DAG.getConstant(0, DL, VT), ISD::SETNE);
+
+    // Unlike SELECT, XOR/AND propagate poison from either arm. Freeze both
+    // arms so an unselected poison cannot affect the result, and reuse the
+    // same frozen FalseV in both XORs so undef cannot take different values.
+    // Freezing a selected poison/undef is a valid refinement of SELECT.
+    TrueV = DAG.getFreeze(TrueV);
+    FalseV = DAG.getFreeze(FalseV);
+
+    // Negation is modular, without no-wrap flags: -0 = 0 and -1 = all ones.
+    // Thus c=0 gives f ^ 0 = f, and c=1 gives f ^ (t ^ f) = t.
     SDValue Mask = DAG.getNegative(C, DL, VT);
     SDValue Diff = DAG.getNode(ISD::XOR, DL, VT, TrueV, FalseV);
     return DAG.getNode(ISD::XOR, DL, VT, FalseV,
