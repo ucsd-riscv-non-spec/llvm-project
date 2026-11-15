@@ -1,8 +1,8 @@
 # Non-Spec optimization guide
 
-What each Non-Spec compiler flag does, when to change it, and what to watch for. It covers every `riscv-ns-*` option in `llvm/lib/Target/RISCV`, plus the two loop fission options that do not have that prefix. Written against `302081b0c246` (branch `call-target-hoisting`), 2026-11-12.
+What the Non-Spec compiler flags do, when to change them, and what to watch for. It covers `riscv-ns-*` options in `llvm/lib/Target/RISCV`, plus the two loop fission options that do not have that prefix. Originally written against `302081b0c246` (branch `call-target-hoisting`), 2026-11-12. Version promotion and branchless select coverage was added against `48bfcf153beb`, 2026-11-14.
 
-The other files in `ns-docs/` hold the design and measurements behind the newer options. This guide links to them and does not repeat them. Every example output below came from the `llc-dev` build at that commit (section 1.4).
+The other files in `ns-docs/` hold the design and measurements behind the newer options. This guide links to them and does not repeat them. The original example outputs in sections 2–5 came from the `llc-dev` build at `302081b0c246` and have not been regenerated for the newer defaults.
 
 ---
 
@@ -12,6 +12,11 @@ The other files in `ns-docs/` hold the design and measurements behind the newer 
 
 | Flag | Default | Section |
 |---|---|---|
+| `-riscv-ns-disable-version-promote` | version promotion on | [7](#7-version-promotion) |
+| `-riscv-ns-version-promote-max-loop-size=N` | 256 | [7](#7-version-promotion) |
+| `-riscv-ns-version-promote-max-range=N` | 16777216 bytes (16 MiB) | [7](#7-version-promotion) |
+| `-riscv-ns-version-promote-max-checks=N` | 8 | [7](#7-version-promotion) |
+| `-riscv-ns-branchless-select` | true | [8](#8-branchless-integer-selects) |
 | `-riscv-ns-disable-software-pipelining` | pipelining on | 2.1 |
 | `-riscv-ns-swp-distance=N` | 16 (max 62) | 2.2 |
 | `-riscv-ns-swp-speculative` | off | 2.3 |
@@ -42,28 +47,39 @@ Everything is on by default except the three `-riscv-ns-swp-*` extensions (`spec
 - All of them are hidden `cl::opt`s, so `llc --help-hidden` lists them.
 - With `llc`, pass them directly. With `clang`, pass each one through `-mllvm`:
   `clang -O2 -mllvm -riscv-ns-swp-speculative -mllvm -riscv-ns-swp-speculative-distance=3 ...`
+- **Version promotion runs during IR optimization.** Set its controls in Clang
+  or `opt`; ordinary `llc` does not run that pipeline, and cannot undo promotion
+  already present in its input. `riscv-ns-version-promote` is an `opt` pass name,
+  while `-riscv-ns-disable-version-promote` is its disable option.
 - A flag supplies defaults for the whole compile. Clang also accepts
   [`#pragma clang loop riscv_ns_*` hints](loop-annotations.md), lowered to
   per-loop IR metadata, for independent pass controls,
   distances, feature gates, size limits, fission depth and force. Explicit
-  pass-disable flags remain compile-wide kill switches.
-- **At `-O0`,** IR loop fission and branch condition pipelining are not added to the pipeline. Hardware loops, machine fission, exit-jump splitting and hoisting still run.
-- **With GlobalISel** (`-global-isel`), IR loop fission and branch condition pipelining do nothing. Only SelectionDAG selects the queue intrinsics.
+  pass-disable flags remain compile-wide kill switches. Version promotion and
+  branchless select have no pass-specific loop annotations.
+- **At `-O0`,** version promotion, IR loop fission, decide/act splitting and branch condition pipelining are not added to the pipeline. Hardware loops, machine fission, exit-jump splitting and hoisting still run. Branchless select has no optimization-level gate of its own.
+- **With GlobalISel** (`-global-isel`), IR loop fission and branch condition pipelining do nothing. Only SelectionDAG selects the queue intrinsics. The branchless select fallback is also specific to SelectionDAG.
 
 ### 1.3 The passes, in pipeline order
 
-| | Pass (`-debug-only` name) | File | Its flags |
+| | Pass or lowering (`-debug-only` name for passes) | File | Its flags |
 |---|---|---|---|
+| Optimizer IR | Version promotion (`riscv-ns-version-promote`), at the vectorizer-start extension point | `RISCVNSVersionPromote.cpp` | [7](#7-version-promotion) |
 | IR | Non-Spec metadata validation (`riscv-ns-loop-metadata`) | `RISCVNSLoopOptions.cpp` | [Per-loop metadata](loop-annotations.md) |
 | IR | IR loop fission (`riscv-ir-loop-fission`) | `RISCVIRLoopFission.cpp` | 3.1 |
+| IR | Decide/act splitting (`riscv-decide-act`) | `RISCVLoopDecideAct.cpp` | [Decide/act](decide-act.md) |
 | IR | Branch condition pipelining (`riscv-branch-condition-pipelining`) | `RISCVBranchConditionPipelining.cpp` | 2.x |
 | IR | Generic `HardwareLoops`, which asks `RISCVTTIImpl::isHardwareLoopProfitable` | `RISCVTargetTransformInfo.cpp` | 4 |
+| SelectionDAG | Branchless integer select fallback in `lowerSELECT` (not a separate pass) | `RISCVISelLowering.cpp` | [8](#8-branchless-integer-selects) |
 | Before RA | Machine loop fission (`riscv-loop-fission-decomposed-branch`) | `RISCVLoopFission.cpp` | 3.2, 3.3 |
 | After RA | Pseudo expansion (`riscv-expand-pseudo`) | `RISCVExpandPseudoInsts.cpp` | 5.1 |
 | After RA | Branch setup hoisting and B-register hints (`riscv-branch-setup-hoisting`), then the B-register allocator | `RISCVBranchSetupHoisting.cpp` | 5.2 to 5.8 |
 
-The order matters in two places:
+The order matters:
 
+- **Version promotion can expose later opportunities.** Hoisting a loop-bound
+  load can make the fast loop counted, and cleanup after promotion can turn
+  conditional register updates into selects for branchless lowering.
 - **An earlier pass takes loops away from a later one.** Pipelining skips a loop that IR fission split, because the split loop contains queue intrinsics. Machine fission skips loops that IR fission marked (`riscv.loop-fissioned`) and rejects a pipelined kernel. It can still split the drain loop that pipelining leaves behind (3.2).
 - **Machine fission only works on hardware loops,** so it does nothing with `-riscv-ns-disable-hardware-loops`.
 
@@ -71,6 +87,7 @@ The order matters in two places:
 
 | Tool | What it shows |
 |---|---|
+| `-pass-remarks=riscv-ns-version-promote` / `-pass-remarks-missed=riscv-ns-version-promote` | Promoted location and overlap-test counts, or memory-range/check failures. Use with `opt`, or Clang's `-Rpass` / `-Rpass-missed`. Early eligibility skips are not all diagnosed. |
 | `-pass-remarks=riscv-branch-condition-pipelining` | Each pipelined loop and its distance. Without `-g`, the location prints as `<unknown>:0:0`. |
 | `-pass-remarks-missed=riscv-branch-condition-pipelining` | Branch-budget rejections and reasons annotated requests were blocked. |
 | `-pass-remarks-analysis=riscv-branch-condition-pipelining` | Annotated settings, their origin, force and distance reductions. |
@@ -80,12 +97,17 @@ The order matters in two places:
 
 | Pass | What `-stats` prints |
 |---|---|
+| version promotion | `Number of loops versioned on a memory overlap check`, `Number of loops promoted without a runtime check`, `Number of memory locations kept in registers`, `Number of loop-invariant loads hoisted`, `Number of versioned loops whose check could not be built (the original loop always runs)` |
 | pipelining | `Number of loops whose conditions were pipelined`, `Number of branches given a condition queue`, `Number of loops without a trip count whose conditions were pipelined`, `Number of loops with a trip count whose toggle conditions were pipelined in place` |
 | machine fission | `Number of loops split into compute/consume pairs` |
 | pseudo expansion | `Number of jumps after a conditional PB moved to their own block` |
 | hoisting | `Number of BMOV instructions able to be hoisted`, `Number of BMOVS hoisted less far to keep enough B-registers free`, `Number of branches given a preferred B-register`, `Number of hoist points rejected for running too often compared with a point the setup was already hoisted to` |
 
 IR fission has no counter. With `-debug-only`, it prints `fission: transformed <function> trip count <n>`.
+
+Branchless select has no dedicated remarks or counters. Compare assembly with
+`-riscv-ns-branchless-select=false`; the flag controls the integer fallback,
+so existing combines and native conditional instructions can still avoid branches.
 
 **Static instruction counts are misleading here.** Most of these flags move instructions rather than add or remove them. For example, with `-riscv-ns-disable-branch-setup-hoisting`, `clamp_below` (below) still has 28 instructions, but two setups go back into the loop body. Compare committed instructions and cycles in gem5. Before you credit a flag with a change in cycles, rule out two things (`call-target-hoisting.md` 7.6 to 7.8, `setup-placement.md` 6):
 
@@ -516,12 +538,17 @@ Run with `-pass-remarks=riscv-branch-condition-pipelining -debug-only=riscv-bran
 | `cannot compute ahead`, with a constant shift of the tested value | `-riscv-ns-swp-shift-recurrences`. For a `while` loop, add `-riscv-ns-swp-speculative`. |
 | `cannot compute ahead`, with a value flipped every iteration | `-riscv-ns-swp-toggles` |
 | `cannot compute ahead`, otherwise | The condition uses something that cannot be cloned, or it is longer than `-riscv-ns-swp-max-slice-size`. |
-| `a store could clobber what the condition of ... reads` | Prove the pointers don't alias (`restrict`), or accept that the loop writes what it reads. |
+| `a store could clobber what the condition of ... reads` | If the loaded address is loop-invariant, inspect [version promotion](version-promote.md) in the earlier IR optimization pipeline. Otherwise, prove the pointers don't alias (`restrict`) where valid, or accept that the loop writes what it reads. |
 | `loop is too large to duplicate` | `-riscv-ns-swp-max-loop-size` |
 | `never runs more than N iterations` | A smaller `-riscv-ns-swp-distance`. A constant trip count of 64 or fewer may already be handled by IR fission. |
 | `loop body cannot be pipelined` | A call, `alloca`, EH pad, or similar, and no flag helps. Or IR fission already split the loop: check `-debug-only=riscv-ir-loop-fission`. |
 | `not an innermost loop exiting at its latch` | No flag helps. |
 | missed remark about branch registers | `-riscv-ns-swp-max-function-branches` (see the warning in 2.7) |
+
+If the stalled `pb` only selects a value, compare the optimized IR and assembly
+with [branchless select](branchless-select.md) enabled and explicitly disabled.
+The default mask fallback removes selection branches only when an integer
+select reaches SelectionDAG lowering.
 
 ### 6.2 Trying the opt-in extensions
 
@@ -541,10 +568,52 @@ So far, the first two have been measured together on bitcount (1.77× vanilla, f
 
 Turn the passes off one at a time, roughly from the most to the least intrusive:
 
-1. `-riscv-ns-disable-software-pipelining`
-2. `-riscv-ns-disable-ir-loop-fission`
-3. `-disable-loop-fission-decomposed-branch`
-4. `-riscv-ns-disable-branch-setup-hoisting`
-5. `-riscv-ns-disable-hardware-loops`
+1. `-riscv-ns-disable-version-promote` (re-optimize the IR with Clang or `opt`)
+2. `-riscv-ns-disable-software-pipelining`
+3. `-riscv-ns-disable-ir-loop-fission`
+4. `-disable-loop-fission-decomposed-branch`
+5. `-riscv-ns-branchless-select=false`
+6. `-riscv-ns-disable-branch-setup-hoisting`
+7. `-riscv-ns-disable-hardware-loops`
 
 Add `-verify-machineinstrs`, except with `-riscv-ns-disable-split-exit-jumps` (5.1). The verifier can also fail for reasons unrelated to these passes (`swp-speculative.md` 6).
+
+---
+
+## 7. Version promotion
+
+- **Default:** enabled in optimized RISC-V IR pipelines; disable with
+  `-riscv-ns-disable-version-promote`.
+- **What it does:** keeps invariant integer memory locations in registers when
+  a branch/select condition or min/max reads them. A runtime range-overlap check
+  separates potentially aliasing accesses; failure takes the original loop.
+  If alias analysis already proves separation, conditional updates can be
+  promoted in place. Written locations are stored back only if their final
+  value differs from the initial value.
+- **Limits:** `-riscv-ns-version-promote-max-loop-size=256` IR instructions,
+  `-riscv-ns-version-promote-max-range=16777216` for data-indexed offset spans,
+  and `-riscv-ns-version-promote-max-checks=8` grouped overlap tests.
+- **Cost:** entry checks, loop duplication when needed and conditional
+  writeback. Short loops and overlapping ranges may not recover this cost.
+- **Use the disable flag** during IR optimization for an A/B comparison or
+  when investigating an incorrectly hoisted load or delayed store.
+
+See [version-promote.md](version-promote.md) for eligibility, exact limit
+semantics, pipeline placement, remarks, tests and the recorded tiffmedian result.
+
+## 8. Branchless integer selects
+
+- **Default:** `-riscv-ns-branchless-select=true`; explicitly use `=false` for
+  the disabled baseline. Older measurements used an opt-in default.
+- **What it does:** SelectionDAG's scalar integer fallback blends frozen arms
+  as `F ^ ((T ^ F) & -C)`, with a normalized 0/1 condition, avoiding the
+  selection `pb` and its setup. Min/max and saturation are covered when their
+  expansions reach this fallback.
+- **Scope:** RV32/RV64 scalar integer results. Earlier combines and native
+  conditional lowering retain priority; floating-point/vector results and
+  GlobalISel have other paths. This is not a standalone IR pass.
+- **Cost:** integer arithmetic and data dependencies in place of the selection
+  branch. Compare generated assembly and target cycles with the explicit opt-out.
+
+See [branchless-select.md](branchless-select.md) for examples, poison/undef
+handling, tests and the recorded GSM result.
