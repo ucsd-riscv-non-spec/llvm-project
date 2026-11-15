@@ -120,6 +120,36 @@ public:
   /// Number of those the function reads or writes, virtual or physical.
   unsigned getNumUsed() const { return NumUsed; }
 
+  unsigned getNumAssignableCalleeSaved() const {
+    unsigned Num = 0;
+    for (const MCPhysReg *R = MRI.getCalleeSavedRegs(); *R; ++R)
+      if (RISCV::PBRRegClass.contains(*R) && getId(*R) >= 0)
+        ++Num;
+    return Num;
+  }
+
+  unsigned getMaxLiveAcrossCalls() const {
+    unsigned MaxLive = 0;
+    SmallVector<unsigned, 4> Uses, Defs;
+    for (const MachineBasicBlock &MBB : MF) {
+      BitVector Live = getLiveOut(MBB);
+      for (const MachineInstr &MI : llvm::reverse(MBB)) {
+        if (MI.isDebugInstr())
+          continue;
+        if (MI.isCall())
+          MaxLive = std::max(MaxLive, Live.count());
+        Uses.clear();
+        Defs.clear();
+        getOperands(MI, Uses, Defs);
+        for (unsigned Id : Defs)
+          Live.reset(Id);
+        for (unsigned Id : Uses)
+          Live.set(Id);
+      }
+    }
+    return MaxLive;
+  }
+
   /// Returns the most B-registers live at once in the blocks where \p Reg is
   /// live.
   unsigned getMaxPressureAround(Register Reg) const;
@@ -169,6 +199,7 @@ public:
   MachineLoopInfo *MLI;
   MachineBlockFrequencyInfo *MBFI;
   MachineOptimizationRemarkEmitter *ORE = nullptr;
+  bool DisableCrossBBForPressure = false;
   // Why findHoistPoints stopped where it did, for the missed remark
   std::string StopWhy;
 
@@ -181,7 +212,9 @@ public:
     AU.addRequired<MachineDominatorTreeWrapperPass>();
     AU.addRequired<MachineLoopInfoWrapperPass>();
     AU.addRequired<MachineBlockFrequencyInfoWrapperPass>();
-    AU.setPreservesAll();
+    // Hoisting changes instruction positions, so invalidate instruction-level
+    // analyses such as LiveIntervals while preserving CFG analyses.
+    AU.setPreservesCFG();
     MachineFunctionPass::getAnalysisUsage(AU);
   }
 
@@ -358,9 +391,10 @@ void BRegLiveness::getOperands(const MachineInstr &MI,
     int Id = getId(MO.getReg());
     if (Id < 0)
       continue;
-    SmallVectorImpl<unsigned> &Ids = MO.isDef() ? Defs : Uses;
-    if ((MO.isDef() || MO.readsReg()) && !llvm::is_contained(Ids, Id))
-      Ids.push_back(Id);
+    if (MO.isDef() && !llvm::is_contained(Defs, Id))
+      Defs.push_back(Id);
+    if (MO.readsReg() && !llvm::is_contained(Uses, Id))
+      Uses.push_back(Id);
   }
 }
 
@@ -391,7 +425,7 @@ void BRegLiveness::compute(Register Reg, bool Clear) {
           continue;
         if (MO.isDef())
           Writes = true;
-        else if (MO.readsReg())
+        if (MO.readsReg())
           Reads = true;
       }
       ReadOnEntry |= Reads && !Overwritten;
@@ -478,6 +512,14 @@ bool RISCVBranchSetupHoisting::runOnMachineFunction(MachineFunction &MF) {
   ORE = &LocalORE;
 
   BRegLiveness Liveness(MF, *TRI);
+  constexpr unsigned LateAllocatorHeadroom = 2;
+  DisableCrossBBForPressure =
+      Liveness.getNumAssignable() <=
+      Liveness.getNumUsed() + LateAllocatorHeadroom;
+  LLVM_DEBUG(if (DisableCrossBBForPressure)
+                 dbgs() << "  [Limit] Cross-BB hoisting disabled in "
+                        << MF.getName()
+                        << " to leave headroom for late B-register allocation\n");
   bool Changed = false;
   if (!DisableBranchSetupHoisting)
     Changed |= hoistBranchSetups(MF, Liveness);
@@ -555,7 +597,7 @@ bool RISCVBranchSetupHoisting::hoistBranchSetups(MachineFunction &MF,
   // spill. If the function uses more B-registers than may be assigned, each
   // BMOVS is hoisted only as far as keeps the number live at once within
   // that.
-  bool LimitPressure = Liveness.getNumUsed() > Liveness.getNumAssignable();
+  bool LimitPressure = true;
 
   SmallVector<BranchWork *, 16> Order;
   for (BranchWork &W : llvm::reverse(WorkList))
@@ -825,7 +867,75 @@ bool RISCVBranchSetupHoisting::hintBranchRegs(
 
 } // end of anonymous namespace
 
-static bool isHoistBarrier(const MachineInstr &MI) {
+static bool isPreservedByCall(const MachineInstr &Call, MCPhysReg Reg) {
+  bool HasRegMask = false;
+  for (const MachineOperand &MO : Call.operands()) {
+    if (!MO.isRegMask())
+      continue;
+    HasRegMask = true;
+    if (MO.clobbersPhysReg(Reg))
+      return false;
+  }
+  return HasRegMask;
+}
+
+static bool canHoistSetupOverPBCall(const MachineInstr &Call,
+                                    const SetupGroup &G,
+                                    const TargetRegisterInfo &TRI,
+                                    const MachineLoopInfo &MLI) {
+  bool IsSourceOrTargetSetup = false;
+  switch (G.Setup->getOpcode()) {
+  case RISCV::BMOVS_I:
+  case RISCV::BMOVS_J:
+  case RISCV::BMOVT_I:
+  case RISCV::BMOVT_J:
+    IsSourceOrTargetSetup = true;
+    break;
+  default:
+    break;
+  }
+  if (Call.getOpcode() != RISCV::PseudoPBCALL || !IsSourceOrTargetSetup)
+    return false;
+
+  const MachineLoop *SetupLoop = MLI.getLoopFor(G.Setup->getParent());
+  if (!SetupLoop || !SetupLoop->contains(Call.getParent()))
+    return false;
+
+  const MachineFunction &MF = *Call.getMF();
+  const MachineRegisterInfo &MRI = MF.getRegInfo();
+  const BitVector Reserved = TRI.getReservedRegs(MF);
+  Register Reg = G.Setup->getOperand(0).getReg();
+  if (Reg.isPhysical()) {
+    if (Reserved.test(Reg))
+      return false;
+    bool IsCalleeSaved = false;
+    for (const MCPhysReg *R = MRI.getCalleeSavedRegs(); *R; ++R)
+      IsCalleeSaved |= *R == Reg;
+    if (!IsCalleeSaved)
+      return false;
+    return isPreservedByCall(Call, Reg.asMCReg());
+  }
+
+  // The allocator must have one color that survives every PseudoPBCALL in the
+  // function; the call's regmask makes it prefer only such colors.
+  for (const MCPhysReg *R = MRI.getCalleeSavedRegs(); *R; ++R) {
+    if (!RISCV::PBRRegClass.contains(*R) || Reserved.test(*R))
+      continue;
+    bool Preserved = true;
+    for (const MachineBasicBlock &MBB : MF)
+      for (const MachineInstr &MI : MBB)
+        if (MI.getOpcode() == RISCV::PseudoPBCALL &&
+            !isPreservedByCall(MI, *R))
+          Preserved = false;
+    if (Preserved)
+      return true;
+  }
+  return false;
+}
+
+static bool isHoistBarrier(const MachineInstr &MI, const SetupGroup &G,
+                           const TargetRegisterInfo &TRI,
+                           const MachineLoopInfo &MLI) {
   if (MI.isBMOV())
     return false;
   // A callee-saved B-register holds the caller's value until the prologue
@@ -833,6 +943,11 @@ static bool isHoistBarrier(const MachineInstr &MI) {
   // and a B-register live across a call has to get one.
   if (MI.getOpcode() == RISCV::BPUSH && MI.getFlag(MachineInstr::FrameSetup))
     return true;
+  // BPUSH/BPOP preserve the full B-register state, including its metadata and
+  // condition FIFO. A PseudoPBCALL is safe to cross only when its regmask and
+  // the caller's saved-register set leave an assignable callee-saved B-reg.
+  if (canHoistSetupOverPBCall(MI, G, TRI, MLI))
+    return false;
   // isBarrier() means that control cannot fall through; it is not a generic
   // instruction-motion barrier. Calls, inline asm, and unmodelled effects are
   // the boundaries relevant to these branch-setup register writes.
@@ -981,8 +1096,12 @@ RISCVBranchSetupHoisting::countFittingPoints(MachineInstr &S,
     auto [DestBB, InsertPt] = Points[NumPoints - 1];
     DestBB->splice(InsertPt, S.getParent(), &S);
     Liveness.update(Reg);
-    bool Result =
-        Liveness.getMaxPressureAround(Reg) <= Liveness.getNumAssignable();
+    unsigned NumCalleeSaved = Liveness.getNumAssignableCalleeSaved();
+    unsigned LiveAcrossCalls = Liveness.getMaxLiveAcrossCalls();
+    bool Result = Liveness.getMaxPressureAround(Reg) <=
+                      Liveness.getNumAssignable() &&
+                  LiveAcrossCalls <= NumCalleeSaved &&
+                  (!NumCalleeSaved || LiveAcrossCalls + 1 < NumCalleeSaved);
     HomeBB->splice(HomeNext, S.getParent(), &S);
     Liveness.update(Reg);
     return Result;
@@ -1131,12 +1250,14 @@ static bool isLeadHazard(const MachineInstr &MI, const SetupGroup &G,
 
 static bool isHoistHazard(const MachineInstr &MI, const SetupGroup &G,
                           const TargetRegisterInfo &TRI,
+                          const MachineLoopInfo &MLI,
                           const MachineInstr *OwnBranch) {
   if (&MI == OwnBranch)
     return false;
   if (G.Lead && isLeadHazard(MI, G, TRI))
     return true;
-  return isHoistBarrier(MI) || hasRegisterDependency(MI, G, TRI);
+  return isHoistBarrier(MI, G, TRI, MLI) ||
+         hasRegisterDependency(MI, G, TRI);
 }
 
 /// Scan `BB` backwards from `From`, returning the earliest safe
@@ -1146,6 +1267,7 @@ static MachineBasicBlock::iterator
 scanBlockBackward(MachineBasicBlock *BB,
                   MachineBasicBlock::reverse_iterator From,
                   const SetupGroup &G, const TargetRegisterInfo &TRI,
+                  const MachineLoopInfo &MLI,
                   const MachineInstr *OwnBranch, bool &HazardFound,
                   const MachineInstr **HazardMI = nullptr) {
   HazardFound = false;
@@ -1159,7 +1281,7 @@ scanBlockBackward(MachineBasicBlock *BB,
     if (CurrMI.isPHI())
       break;
 
-    if (isHoistHazard(CurrMI, G, TRI, OwnBranch)) {
+    if (isHoistHazard(CurrMI, G, TRI, MLI, OwnBranch)) {
       LLVM_DEBUG(dbgs() << "  [Hazard] Cannot cross: " << CurrMI);
       LLVM_DEBUG(if (CurrMI.isCall()) dbgs() << "    - reason: Call");
       LLVM_DEBUG(if (CurrMI.isIndirectBranch()) dbgs()
@@ -1186,13 +1308,14 @@ scanBlockBackward(MachineBasicBlock *BB,
 /// hoisted with it, or checked on their own.
 static bool isCycleHazard(const MachineInstr &MI, const SetupGroup &G,
                           const TargetRegisterInfo &TRI,
+                          const MachineLoopInfo &MLI,
                           const MachineInstr *OwnBranch) {
   if (G.contains(MI))
     return false;
   if (MI.isBMOV() &&
       MI.getOperand(0).getReg() == G.Setup->getOperand(0).getReg())
     return false;
-  return isHoistHazard(MI, G, TRI, OwnBranch);
+  return isHoistHazard(MI, G, TRI, MLI, OwnBranch);
 }
 
 bool RISCVBranchSetupHoisting::isSafeToHoistTo(
@@ -1209,7 +1332,8 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
   auto rangeHasHazard = [&](MachineBasicBlock::const_iterator Begin,
                             MachineBasicBlock::const_iterator End) {
     for (const MachineInstr &MI : llvm::make_range(Begin, End))
-      if (!G.contains(MI) && isHoistHazard(MI, G, *TRI, OwnBranch)) {
+      if (!G.contains(MI) &&
+          isHoistHazard(MI, G, *TRI, *MLI, OwnBranch)) {
         PathHazard = &MI;
         return true;
       }
@@ -1262,7 +1386,7 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
   if (ReachedDest && SrcInCycle &&
       llvm::any_of(llvm::make_range(AfterSetup, SrcBB->end()),
                    [&](const MachineInstr &MI) {
-                     if (!isCycleHazard(MI, G, *TRI, OwnBranch))
+                     if (!isCycleHazard(MI, G, *TRI, *MLI, OwnBranch))
                        return false;
                      PathHazard = &MI;
                      return true;
@@ -1278,11 +1402,12 @@ bool RISCVBranchSetupHoisting::isSafeToHoistTo(
 
 static bool loopHasHazard(const MachineLoop &L, const SetupGroup &G,
                           const TargetRegisterInfo &TRI,
+                          const MachineLoopInfo &MLI,
                           const MachineInstr *OwnBranch,
                           const MachineInstr **HazardMI = nullptr) {
   for (MachineBasicBlock *MBB : L.getBlocks()) {
     for (const MachineInstr &MI : *MBB) {
-      bool IsHazard = isCycleHazard(MI, G, TRI, OwnBranch);
+      bool IsHazard = isCycleHazard(MI, G, TRI, MLI, OwnBranch);
       LLVM_DEBUG(dbgs() << "  Checking loop MI (isHazard=" << IsHazard << "): " << MI);
       if (IsHazard) {
         if (HazardMI)
@@ -1324,7 +1449,7 @@ RISCVBranchSetupHoisting::findHoistPoints(const SetupGroup &G,
 
   auto IntraStart = std::next(G.front().getReverseIterator());
   if (IntraStart != CurBB->rend())
-    SafePoint = scanBlockBackward(CurBB, IntraStart, G, *TRI, OwnBranch,
+    SafePoint = scanBlockBackward(CurBB, IntraStart, G, *TRI, *MLI, OwnBranch,
                                   HazardFound, &Hazard);
   else
     SafePoint = CurBB->getFirstNonPHI();
@@ -1336,7 +1461,6 @@ RISCVBranchSetupHoisting::findHoistPoints(const SetupGroup &G,
     return Points;
   }
 
-  MachineLoop *SetupLoop = MLI->getLoopFor(CurBB);
   MachineBasicBlock *BB = CurBB;
 
   while (true) {
@@ -1349,9 +1473,12 @@ RISCVBranchSetupHoisting::findHoistPoints(const SetupGroup &G,
       break;
 
     MachineBasicBlock *IDom = IDomNode->getBlock();
-    if (!IDom || DisableCrossBBHoisting) {
+    if (!IDom || DisableCrossBBHoisting || DisableCrossBBForPressure) {
       if (DisableCrossBBHoisting)
         StopWhy = "-riscv-ns-disable-cross-bb-hoisting is given";
+      else if (DisableCrossBBForPressure)
+        StopWhy = "it leaves fewer than two B-registers free for late "
+                  "allocation";
       break;
     }
 
@@ -1396,7 +1523,7 @@ RISCVBranchSetupHoisting::findHoistPoints(const SetupGroup &G,
       IDomSafePoint = IDom->getFirstTerminator();
       HazardFound = false;
     } else {
-      IDomSafePoint = scanBlockBackward(IDom, IDomScanStart, G, *TRI,
+      IDomSafePoint = scanBlockBackward(IDom, IDomScanStart, G, *TRI, *MLI,
                                         OwnBranch, HazardFound, &Hazard);
     }
 
@@ -1417,7 +1544,7 @@ RISCVBranchSetupHoisting::findHoistPoints(const SetupGroup &G,
          L = L->getParentLoop()) {
       LLVM_DEBUG(dbgs() << "  Checking loop hazard...\n");
       const MachineInstr *LoopHazard = nullptr;
-      if (loopHasHazard(*L, G, *TRI, OwnBranch, &LoopHazard)) {
+      if (loopHasHazard(*L, G, *TRI, *MLI, OwnBranch, &LoopHazard)) {
         StopWhy = "the loop it would leave contains " +
                   hazardReason(*LoopHazard, SetupMI);
         return Points;

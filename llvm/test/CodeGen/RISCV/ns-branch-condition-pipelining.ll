@@ -33,13 +33,13 @@ define void @inc_pos(ptr %a, i64 %n) {
 ; CHECK:       loop.swp:
 ; CHECK-NEXT:    %swp.kernel.iv = phi i64 [ 0, %swp.ph ], [ %swp.kernel.iv.next, %latch.swp ]
 ; CHECK-NEXT:    %i.swp = phi i64 [ 0, %swp.ph ], [ %i.next.swp, %latch.swp ]
-; CHECK-NEXT:    %p.swp = getelementptr inbounds i32, ptr %a, i64 %i.swp
-; CHECK-NEXT:    %v.swp = load i32, ptr %p.swp
 ; CHECK-NEXT:    %i.ahead = add i64 %i.swp, 4
 ; CHECK-NEXT:    %p.ahead = getelementptr inbounds i32, ptr %a, i64 %i.ahead
 ; CHECK-NEXT:    %v.ahead = load i32, ptr %p.ahead
 ; CHECK-NEXT:    [[XA:%.*]] = sext i32 %v.ahead to i64
 ; CHECK-NEXT:    call void @llvm.riscv.ns.cond.push.i64(i32 0, i32 38, i64 [[XA]], i64 0)
+; CHECK-NEXT:    %p.swp = getelementptr inbounds i32, ptr %a, i64 %i.swp
+; CHECK-NEXT:    %v.swp = load i32, ptr %p.swp
 ; CHECK-NEXT:    [[POP:%.*]] = call i1 @llvm.riscv.ns.cond.pop(i32 0)
 ; CHECK-NEXT:    br i1 [[POP]], label %then.swp, label %latch.swp
 ; The kernel stops four iterations early.
@@ -80,6 +80,95 @@ then:
 latch:
   %i.next = add nuw i64 %i, 1
   %done = icmp eq i64 %i.next, %n
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret void
+}
+
+; The future condition is queued before independent work after its load.
+define void @schedule_ahead(ptr noalias %a, ptr noalias %out, i64 %n) {
+; CHECK-LABEL: define {{.*}} @schedule_ahead(
+; CHECK:       loop.swp:
+; CHECK:         %v.ahead = load i32, ptr %p.ahead
+; CHECK:         call void @llvm.riscv.ns.cond.push.i64
+; CHECK:         %v.swp = load i32, ptr %p.swp
+; CHECK:         %out.index.swp = add i64 %i.swp, 123
+entry:
+  %guard = icmp sgt i64 %n, 0
+  br i1 %guard, label %ph, label %exit
+
+ph:
+  br label %loop
+
+loop:
+  %i = phi i64 [ 0, %ph ], [ %i.next, %latch ]
+  %p = getelementptr inbounds i32, ptr %a, i64 %i
+  %v = load i32, ptr %p
+  %c = icmp sgt i32 %v, 0
+  %out.index = add i64 %i, 123
+  %out.p = getelementptr inbounds i32, ptr %out, i64 %out.index
+  br i1 %c, label %then, label %else
+
+then:
+  %v1 = add i32 %v, 1
+  store i32 %v1, ptr %out.p
+  br label %latch
+
+else:
+  store i32 0, ptr %out.p
+  br label %latch
+
+latch:
+  %i.next = add nuw i64 %i, 1
+  %done = icmp eq i64 %i.next, %n
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret void
+}
+
+; A dynamic affine step is multiplied by the pipeline distance once, not once
+; per iteration.
+define void @dynamic_step(ptr noalias %a, ptr noalias %out, i64 %n,
+                          i64 %step) {
+; CHECK-LABEL: define {{.*}} @dynamic_step(
+; CHECK:       ph:
+; CHECK:         [[OFFSET:%.*]] = mul i64 %step, 4
+; CHECK:       swp.ph:
+; CHECK:       loop.swp:
+; CHECK:         %i.ahead = add i64 %i.swp, [[OFFSET]]
+; CHECK-NOT:     mul i64 %step, 4
+entry:
+  %guard = icmp sgt i64 %n, 0
+  br i1 %guard, label %ph, label %exit
+
+ph:
+  br label %loop
+
+loop:
+  %i = phi i64 [ 0, %ph ], [ %i.next, %latch ]
+  %k = phi i64 [ 0, %ph ], [ %k.next, %latch ]
+  %p = getelementptr inbounds i32, ptr %a, i64 %i
+  %v = load i32, ptr %p
+  %c = icmp sgt i32 %v, 0
+  %out.index = add i64 %k, 123
+  %out.p = getelementptr inbounds i32, ptr %out, i64 %out.index
+  br i1 %c, label %then, label %else
+
+then:
+  %v1 = add i32 %v, 1
+  store i32 %v1, ptr %out.p
+  br label %latch
+
+else:
+  store i32 0, ptr %out.p
+  br label %latch
+
+latch:
+  %i.next = add i64 %i, %step
+  %k.next = add nuw i64 %k, 1
+  %done = icmp eq i64 %k.next, %n
   br i1 %done, label %exit, label %loop
 
 exit:

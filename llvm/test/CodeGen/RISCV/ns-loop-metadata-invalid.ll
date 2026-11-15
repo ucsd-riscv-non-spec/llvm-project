@@ -22,7 +22,7 @@
 ; RANGE: error: {{.*}}'llvm.loop.riscv.ns.swp.distance'{{.*}}expected {{.*}}i32 <integer in [1, 62]>
 ; DUP: error: {{.*}}'llvm.loop.riscv.ns.swp.toggles'{{.*}}duplicate key; expected {{.*}}i1 <boolean>
 ; FORCE: error: {{.*}}'llvm.loop.riscv.ns.force'{{.*}}expected {{.*}}i1 <boolean>
-; DEPTH: error: {{.*}}'llvm.loop.riscv.ns.fission.queue_depth'{{.*}}expected {{.*}}i32 <integer in [1, 64]>
+; DEPTH: error: {{.*}}'llvm.loop.riscv.ns.fission.queue_depth'{{.*}}expected {{.*}}i32 <integer in [1, 63]>
 ; SIZE: error: {{.*}}'llvm.loop.riscv.ns.swp.max_loop_size'{{.*}}expected {{.*}}i32 <integer in [1, 2147483647]>
 
 ;--- valid.ll
@@ -141,7 +141,7 @@ exit:
   ret void
 }
 !0 = distinct !{!0, !1}
-!1 = !{!"llvm.loop.riscv.ns.fission.queue_depth", i32 65}
+!1 = !{!"llvm.loop.riscv.ns.fission.queue_depth", i32 64}
 
 ;--- size.ll
 define void @size(ptr %p) {

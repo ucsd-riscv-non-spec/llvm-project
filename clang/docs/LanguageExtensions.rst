@@ -5490,7 +5490,7 @@ All names in this table have the prefix ``riscv_ns_``:
    * - ``swp_max_slice_size``, ``swp_max_loop_size``, ``swp_max_prologue_size``
      - Integer constant expression in [1, 2147483647]
    * - ``fission_queue_depth``
-     - Integer constant expression in [1, 64]
+     - Integer constant expression in [1, 63]
 
 Invalid arguments and duplicate hints are errors, including identical repeats.
 Numeric expressions are checked again after template substitution. Only
@@ -5503,9 +5503,10 @@ Numeric hints and ``riscv_ns_force(enable)`` do not enable disabled passes or
 opt-in features. In particular, ``riscv_ns_swp_speculative_distance(3)`` does
 not imply ``riscv_ns_swp_speculative(enable)``. Metadata overrides matching
 command-line tuning values. Explicit global pass disables still take precedence.
-Fission queue depth is the maximum whole-loop trip count for IR fission and
-the maximum tile size for machine fission. The generic ``pipeline`` hints
-control machine scheduling rather than Non-Spec condition lookahead.
+Fission queue depth is in the range 1–63 and is the maximum whole-loop trip
+count for IR fission and the maximum tile size for machine fission. The generic
+``pipeline`` hints control machine scheduling rather than Non-Spec condition
+lookahead.
 
 ``riscv_ns_force(enable)`` bypasses profitability and size limits, memory
 dependence proofs, speculative safety checks, and semantic instruction

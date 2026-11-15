@@ -4,7 +4,7 @@
 
 #define DISTANCE (2 * 4)
 #define ENABLE enable
-enum { QueueDepth = 64 };
+enum { QueueDepth = 63 };
 
 void valid(int *a, int n) {
 #pragma clang loop riscv_ns_swp(enable)
@@ -143,8 +143,8 @@ void invalid(int *a, int n) { // cxx-note {{declared here}}
   // expected-error@+1 {{invalid value '0'; must be positive}}
 #pragma clang loop riscv_ns_fission_queue_depth(0)
   while (n > 0) a[--n]++;
-  // expected-error@+1 {{invalid value 65 for 'riscv_ns_fission_queue_depth'; must be in the range [1, 64]}}
-#pragma clang loop riscv_ns_fission_queue_depth(65)
+  // expected-error@+1 {{invalid value 64 for 'riscv_ns_fission_queue_depth'; must be in the range [1, 63]}}
+#pragma clang loop riscv_ns_fission_queue_depth(64)
   while (n > 0) a[--n]++;
   // expected-error@+1 {{invalid value '-1'; must be positive}}
 #pragma clang loop riscv_ns_swp_distance(-1)

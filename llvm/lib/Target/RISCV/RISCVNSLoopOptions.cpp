@@ -54,7 +54,7 @@ constexpr Option Options[] = {
     {"llvm.loop.riscv.ns.swp.max_prologue_size", nullptr,
      &LoopOptions::MaxPrologueSize, INT32_MAX},
     {"llvm.loop.riscv.ns.fission.queue_depth", nullptr,
-     &LoopOptions::QueueDepth, 64}};
+     &LoopOptions::QueueDepth, 63}};
 
 StringRef propertyName(const Metadata *MD) {
   if (auto *Name = dyn_cast_or_null<MDString>(MD))
@@ -115,14 +115,14 @@ SWPSettings LoopOptions::resolveSWP(SWPSettings D, bool Disabled) const {
 
 FissionSettings LoopOptions::resolveIRFission(bool Disabled) const {
   return {!Disabled && IRFissionEnable.value_or(true), Force.value_or(false),
-          QueueDepth.value_or(64)};
+          QueueDepth.value_or(63)};
 }
 
 FissionSettings LoopOptions::resolveMachineFission(unsigned DefaultDepth,
                                                    bool Disabled) const {
   unsigned Depth = QueueDepth.value_or(DefaultDepth);
   return {!Disabled && MachineFissionEnable.value_or(true) && Depth != 0,
-          Force.value_or(false), std::min(Depth, 64u)};
+          Force.value_or(false), std::min(Depth, 63u)};
 }
 
 std::optional<LoopOptions>

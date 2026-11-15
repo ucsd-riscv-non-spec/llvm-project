@@ -61,13 +61,13 @@ static cl::opt<bool> DisableLoopFissionDecomposedBranch(
     "disable-loop-fission-decomposed-branch", cl::Hidden,
     cl::desc("Disable " PASS_NAME), cl::init(false));
 
-// Optional queue-depth override; the paper assumes a 64-entry branch
-// outcome queue, so tiling must not exceed this bound.
+// One slot is reserved to distinguish an empty condition queue from a full
+// one, so fission must leave at least one of its 64 entries unused.
 static cl::opt<unsigned>
     LoopFissionQueueDepth("loop-fission-queue-depth", cl::Hidden,
                           cl::desc("Branch outcome queue depth used to "
                                    "bound fission tile size"),
-                          cl::init(64));
+                          cl::init(63));
 
 STATISTIC(NumLoopsFissioned,
           "Number of loops split into compute/consume pairs");
@@ -418,7 +418,7 @@ bool RISCVLoopFissionDecomposedBranch::fissionLoop(
   if (Trip < 1)
     return Reject("the trip count is not a compile-time constant");
 
-  // The hardware queue holds 64 outcomes. A tile must not exceed it.
+  // The hardware queue holds at most 63 outcomes.
   int64_t Depth = Settings.QueueDepth;
   if (Depth < 1)
     return Reject("queue depth is below 1");

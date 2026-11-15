@@ -44,14 +44,14 @@ template <int Base> void lambda_template(int *a, int n) {
 
 void instantiate(int *a, int n) {
   loop_template<1, 1, 1, 1>(a, n);
-  loop_template<62, 62, 2147483647, 64>(a, n);
+  loop_template<62, 62, 2147483647, 63>(a, n);
   lambda_template<2>(a, n);
 }
 
 // A value of one remains a numeric Non-Spec request after instantiation.
 // CHECK-LABEL: define linkonce_odr {{.*}} @_Z13loop_templateILi1ELi1ELi1ELi1EEvPii(
 // CHECK: br label {{.*}}, !llvm.loop ![[MIN:[0-9]+]]
-// CHECK-LABEL: define linkonce_odr {{.*}} @_Z13loop_templateILi62ELi62ELi2147483647ELi64EEvPii(
+// CHECK-LABEL: define linkonce_odr {{.*}} @_Z13loop_templateILi62ELi62ELi2147483647ELi63EEvPii(
 // CHECK: br label {{.*}}, !llvm.loop ![[MAX:[0-9]+]]
 // CHECK-LABEL: define linkonce_odr {{.*}} @_ZZ15lambda_template
 // CHECK: br label {{.*}}, !llvm.loop ![[LAMBDA:[0-9]+]]
@@ -85,7 +85,7 @@ void instantiate(int *a, int n) {
 // CHECK-DAG: ![[MAX2]] = !{!"llvm.loop.riscv.ns.swp.max_slice_size", i32 2147483647}
 // CHECK-DAG: ![[MAX3]] = !{!"llvm.loop.riscv.ns.swp.max_loop_size", i32 2147483647}
 // CHECK-DAG: ![[MAX4]] = !{!"llvm.loop.riscv.ns.swp.max_prologue_size", i32 2147483647}
-// CHECK-DAG: ![[MAX5]] = !{!"llvm.loop.riscv.ns.fission.queue_depth", i32 64}
+// CHECK-DAG: ![[MAX5]] = !{!"llvm.loop.riscv.ns.fission.queue_depth", i32 63}
 
 // CHECK-DAG: ![[LAMBDA]] = distinct !{![[LAMBDA]], {{.*}}![[LAMBDADIST:[0-9]+]]}
 // CHECK-DAG: ![[LAMBDADIST]] = !{!"llvm.loop.riscv.ns.swp.distance", i32 3}

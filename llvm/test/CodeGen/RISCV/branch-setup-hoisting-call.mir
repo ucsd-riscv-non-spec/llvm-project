@@ -1,0 +1,163 @@
+# RUN: llc -mtriple=riscv64 \
+# RUN:   -run-pass=riscv-branch-setup-hoisting,greedy,virtregrewriter \
+# RUN:   -o - %s | FileCheck %s
+
+--- |
+  define void @hoist_over_pbcall() { ret void }
+  define void @no_saved_breg() { ret void }
+  define void @same_breg_pbcall_use() { ret void }
+  define void @queue_state_not_crossed() { ret void }
+...
+---
+name: hoist_over_pbcall
+tracksRegLiveness: true
+frameInfo:
+  adjustsStack: true
+  hasCalls: true
+  isCalleeSavedInfoValid: true
+fixedStack:
+  - { id: 0, type: spill-slot, offset: -8, size: 8, alignment: 8, callee-saved-register: '$b25' }
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $b25, $x1
+    frame-setup BPUSH killed $b25, $x2, 0
+    %0:pbr = BMOVS_J <mcsymbol .Lentry>
+    %0:pbr = BMOVT_J %0, %bb.1
+    PseudoPBU %0, %bb.1
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $x1
+    %1:pbr = BMOVS_J <mcsymbol .Lcall>
+    %1:pbr = BMOVT_I %1, $x0, 0
+    PseudoPBCALL %1, csr_ilp32_lp64, implicit-def $x1
+    %3:gpr = ADDI $x0, 1
+    %4:gpr = ADDI $x0, 2
+    %2:pbr = BMOVS_J <mcsymbol .Lloop>
+    %2:pbr = BMOVT_J %2, %bb.1
+    %2:pbr = BMOVC_BNE %2, %3, %4
+    PseudoPBC %2, %bb.1
+
+  bb.2:
+    $b25 = frame-destroy BPOP $x2, 0
+    PseudoRET
+...
+# CHECK-LABEL: name: hoist_over_pbcall
+# CHECK:       bb.0:
+# CHECK:         frame-setup BPUSH {{(killed )?}}$b25
+# CHECK:         renamable $b25 = BMOVS_J <mcsymbol .Lloop>
+# CHECK:         renamable $b25 = BMOVT_J
+# CHECK:       bb.1:
+# CHECK:         PseudoPBCALL
+# CHECK:         renamable $b25 = BMOVC_BNE
+# CHECK:         $b25 = frame-destroy BPOP
+
+---
+name: no_saved_breg
+tracksRegLiveness: true
+frameInfo:
+  hasCalls: true
+  isCalleeSavedInfoValid: true
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x1
+    %0:pbr = BMOVS_J <mcsymbol .Lentry>
+    %0:pbr = BMOVT_J %0, %bb.1
+    PseudoPBU %0, %bb.1
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $x1
+    %1:pbr = BMOVS_J <mcsymbol .Lcall>
+    %1:pbr = BMOVT_I %1, $x0, 0
+    PseudoPBCALL %1, csr_ilp32_lp64, implicit-def $x1
+    %3:gpr = ADDI $x0, 1
+    %4:gpr = ADDI $x0, 2
+    %2:pbr = BMOVS_J <mcsymbol .Lloop>
+    %2:pbr = BMOVT_J %2, %bb.1
+    %2:pbr = BMOVC_BNE %2, %3, %4
+    PseudoPBC %2, %bb.1
+
+  bb.2:
+    PseudoRET
+...
+# CHECK-LABEL: name: no_saved_breg
+# CHECK:       PseudoPBCALL
+# CHECK:       renamable $b{{[0-9]+}} = BMOVS_J <mcsymbol .Lloop>
+
+---
+name: queue_state_not_crossed
+tracksRegLiveness: true
+frameInfo:
+  adjustsStack: true
+  hasCalls: true
+  isCalleeSavedInfoValid: true
+fixedStack:
+  - { id: 0, type: spill-slot, offset: -8, size: 8, alignment: 8, callee-saved-register: '$b25' }
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $b25, $x1
+    frame-setup BPUSH killed $b25, $x2, 0
+    %0:pbr = BMOVS_J <mcsymbol .Lentry>
+    %0:pbr = BMOVT_J %0, %bb.1
+    PseudoPBU %0, %bb.1
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $x1
+    %1:pbr = BMOVS_J <mcsymbol .Lcall>
+    %1:pbr = BMOVT_I %1, $x0, 0
+    PseudoPBCALL %1, csr_ilp32_lp64, implicit-def $x1
+    %2:pbr = BMOVS_J <mcsymbol .Lqueue>
+    %2:pbr = BMOVT_J %2, %bb.1
+    %3:gpr = ADDI $x0, 1
+    %4:gpr = ADDI $x0, 2
+    %2:pbr = BMOVC_BNE %2, %3, %4
+    %2:pbr = BMOVC_BEQ %2, %3, %4
+    PseudoPBC %2, %bb.1
+
+  bb.2:
+    $b25 = frame-destroy BPOP $x2, 0
+    PseudoRET
+...
+---
+name: same_breg_pbcall_use
+tracksRegLiveness: true
+frameInfo:
+  hasCalls: true
+body: |
+  bb.0:
+    successors: %bb.1
+    liveins: $x1
+    %0:pbr = BMOVS_J <mcsymbol .Lentry>
+    %0:pbr = BMOVT_J %0, %bb.1
+    PseudoPBU %0, %bb.1
+
+  bb.1:
+    successors: %bb.1, %bb.2
+    liveins: $x1
+    %1:pbr = BMOVS_J <mcsymbol .Lcall>
+    %1:pbr = BMOVT_I %1, $x0, 0
+    PseudoPBCALL %1, csr_ilp32_lp64, implicit-def $x1
+    %3:gpr = ADDI $x0, 1
+    %4:gpr = ADDI $x0, 2
+    %1:pbr = BMOVS_J <mcsymbol .Lloop>
+    %1:pbr = BMOVT_J %1, %bb.1
+    %1:pbr = BMOVC_BNE %1, %3, %4
+    PseudoPBC %1, %bb.1
+
+  bb.2:
+    PseudoRET
+...
+# CHECK-LABEL: name: same_breg_pbcall_use
+# CHECK:       PseudoPBCALL
+# CHECK:       renamable $b{{[0-9]+}} = BMOVS_J <mcsymbol .Lloop>
+
+# CHECK-LABEL: name: queue_state_not_crossed
+# CHECK:       PseudoPBCALL
+# CHECK:       renamable $b{{[0-9]+}} = BMOVS_J <mcsymbol .Lqueue>
+# CHECK:       BMOVC_BNE
+# CHECK-NEXT:  BMOVC_BEQ

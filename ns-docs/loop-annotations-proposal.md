@@ -24,9 +24,9 @@ There are three consumers, in this order:
 
 | Pass | Current controls and constraints relevant to this proposal |
 |---|---|
-| [`RISCVIRLoopFission`](../llvm/lib/Target/RISCV/RISCVIRLoopFission.cpp) | Enabled by default; constant trip count of 1–64; transforms at most one loop per function per invocation. Its queue limit is fixed in the code. |
+| [`RISCVIRLoopFission`](../llvm/lib/Target/RISCV/RISCVIRLoopFission.cpp) | Enabled by default; constant trip count of 1–63; transforms at most one loop per function per invocation. Its queue limit is fixed in the code. |
 | [`RISCVBranchConditionPipelining`](../llvm/lib/Target/RISCV/RISCVBranchConditionPipelining.cpp) | Enabled by default; counted distance 16; in-place distance 4; speculative conditions, shift recurrences and toggles are opt-in. It has slice, loop, prologue and function branch-count limits. |
-| [`RISCVLoopFissionDecomposedBranch`](../llvm/lib/Target/RISCV/RISCVLoopFission.cpp) | Enabled by default; requires a hardware loop and a positive constant trip count recognized from machine instructions; tiles to `-loop-fission-queue-depth`, default 64. |
+| [`RISCVLoopFissionDecomposedBranch`](../llvm/lib/Target/RISCV/RISCVLoopFission.cpp) | Enabled by default; requires a hardware loop and a positive constant trip count recognized from machine instructions; tiles to `-loop-fission-queue-depth`, default 63. |
 
 IR fission runs before pipelining and hardware-loop formation. Machine fission
 runs before register allocation. An earlier transformation can therefore take
@@ -117,7 +117,7 @@ suffixes in the second column have the prefix `llvm.loop.riscv.ns.`.
 | `swp_max_slice_size` | `swp.max_slice_size` | 1–2³¹−1 | `-riscv-ns-swp-max-slice-size` (16) |
 | `swp_max_loop_size` | `swp.max_loop_size` | 1–2³¹−1 | `-riscv-ns-swp-max-loop-size` (256) |
 | `swp_max_prologue_size` | `swp.max_prologue_size` | 1–2³¹−1 | `-riscv-ns-swp-max-prologue-size` (512) |
-| `fission_queue_depth` | `fission.queue_depth` | 1–64 | IR: fixed 64; machine: `-loop-fission-queue-depth` (64) |
+| `fission_queue_depth` | `fission.queue_depth` | 1–63 | IR: fixed 63; machine: `-loop-fission-queue-depth` (63) |
 
 An omitted hint inherits the compile's setting. In particular, an omitted
 boolean differs from an explicit `disable`. A numeric hint alone does not enable
@@ -293,9 +293,9 @@ every use of the in-place transformation. Counted toggle-only loops can still
 be pipelined in place with `swp_toggles` enabled even when `swp_speculative` is
 disabled, preserving current behavior. Force does not change either feature gate.
 
-Keep the existing limits of 62 for SWP and 64 for fission. They are the bounds
+Keep the existing limits of 62 for SWP and 63 for fission. They are the bounds
 currently used by the respective implementations; this proposal does not
-reconcile their differing queue-capacity assumptions or change the architecture.
+change the architecture.
 
 ## 5. Pass ordering and metadata lifetime
 

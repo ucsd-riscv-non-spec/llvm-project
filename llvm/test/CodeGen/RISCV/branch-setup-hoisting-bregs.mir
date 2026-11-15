@@ -7,7 +7,7 @@
 
 # The branch registers are assigned by the register allocator run after the
 # hoisting pass. isCalleeSavedInfoValid is set, as it is after frame lowering,
-# so B24-B31, which these functions do not save, are reserved, leaving 24.
+# so B25-B31, which these functions do not save, are reserved, leaving 25.
 
 # Hoisting the loop branches' source/target setups keeps their registers live
 # across the backedges. The hints give them registers in branch layout order.
@@ -80,7 +80,7 @@ body: |
 
 # Every jump's setup could be hoisted to the entry, but that would keep 27
 # B-registers live there. The setups hoisted first, those of the last jumps,
-# go to the entry until 24 are live in it, counting the entry's own jump, and
+# go to the entry until 25 are live in it, counting the entry's own jump, and
 # the rest stay put. Each register live in the entry is a different one.
 ---
 name: many_jumps
@@ -280,15 +280,14 @@ body: |
 # CHECK:       bb.0:
 # CHECK:         renamable $b0 = BMOVS_J <mcsymbol .Lj0>
 # CHECK-NEXT:    renamable $b0 = BMOVT_J killed renamable $b0, %bb.1
-# CHECK-NEXT:    renamable $b4 = BMOVS_J <mcsymbol .Lj4>
-# CHECK:         renamable $b23 = BMOVS_J <mcsymbol .Lj23>
-# CHECK-NEXT:    renamable $b23 = BMOVT_J killed renamable $b23, %bb.24
-# CHECK-NEXT:    renamable $b1 = BMOVS_J <mcsymbol .Lj24>
-# CHECK-NEXT:    renamable $b1 = BMOVT_J killed renamable $b1, %bb.25
-# CHECK-NEXT:    renamable $b2 = BMOVS_J <mcsymbol .Lj25>
-# CHECK-NEXT:    renamable $b2 = BMOVT_J killed renamable $b2, %bb.26
-# CHECK-NEXT:    renamable $b3 = BMOVS_J <mcsymbol .Lret>
-# CHECK-NEXT:    renamable $b3 = BMOVT_I killed renamable $b3, $x1, 0
+# CHECK:         renamable $b15 = BMOVS_J <mcsymbol .Lj15>
+# CHECK-NEXT:    renamable $b15 = BMOVT_J killed renamable $b15, %bb.16
+# CHECK:         renamable $b24 = BMOVS_J <mcsymbol .Lj24>
+# CHECK-NEXT:    renamable $b24 = BMOVT_J killed renamable $b24, %bb.25
+# CHECK:         renamable $b1 = BMOVS_J <mcsymbol .Lj25>
+# CHECK-NEXT:    renamable $b1 = BMOVT_J killed renamable $b1, %bb.26
+# CHECK:         renamable $b2 = BMOVS_J <mcsymbol .Lret>
+# CHECK-NEXT:    renamable $b2 = BMOVT_I killed renamable $b2, $x1, 0
 # CHECK-NEXT:    PseudoPBU killed renamable $b0, %bb.1
 # CHECK:       bb.1:
 # CHECK-NOT:   bb.2:
@@ -297,13 +296,12 @@ body: |
 # CHECK-NEXT:    PseudoPBU killed renamable $b0, %bb.2
 # CHECK:       bb.3:
 # CHECK-NOT:   bb.4:
-# CHECK:         renamable $b0 = BMOVS_J <mcsymbol .Lj3>
+# CHECK:         PseudoPBU killed renamable $b3, %bb.4
 # CHECK:       bb.4:
-# CHECK-NOT:     BMOVS_J
 # CHECK:         PseudoPBU killed renamable $b4, %bb.5
 # CHECK:       bb.26:
 # CHECK-NOT:     BMOVS_J
-# CHECK:         PseudoPBI killed renamable $b3
+# CHECK:         PseudoPBI killed renamable $b2
 
 # A branch whose B-register the main register allocator already made
 # physical, as it does for RISCVLoopFission's, is hoisted too when no other

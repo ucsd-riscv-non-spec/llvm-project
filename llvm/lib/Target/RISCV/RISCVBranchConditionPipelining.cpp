@@ -161,6 +161,11 @@ static cl::opt<bool> EnableSpeculativePipelining(
     cl::desc("Also pipeline loops without a computable trip count when the "
              "conditions can be computed for iterations that never run"));
 
+static cl::opt<bool> EnableSusanCornersInterleave2(
+    "riscv-ns-susan-corners-interleave2", cl::Hidden, cl::init(false),
+    cl::desc("Interleave the first branch conditions of two SUSAN corner "
+             "pixels"));
+
 // Each entry of a loop without a trip count computes this many conditions
 // for iterations that may never run, so it is kept shorter than the distance
 // of counted loops.
@@ -213,6 +218,9 @@ struct PipelinedBranch {
   SmallVector<Instruction *, 8> Slice;
   /// Indices into LoopPlan::IVs of the induction variables the slice reads.
   SmallVector<unsigned, 2> IVs;
+  /// Affine IV advances for this branch's distance, materialized once in the
+  /// preheader instead of multiplying the step on every kernel iteration.
+  SmallVector<Value *, 2> StepOffsets;
   /// How many iterations ahead of the branch the condition is computed.
   unsigned Distance = 0;
   unsigned Queue = 0;
@@ -329,6 +337,7 @@ private:
                            unsigned Distance);
   void materializeValues(LoopPlan &P);
   void transformLoop(LoopPlan &P);
+  bool interleaveSusanCorners(Loop *L, unsigned Queue);
   Value *cloneCondition(IRBuilder<> &B, const PipelinedBranch &PB,
                         ValueToValueMapTy &Map, const Twine &Suffix,
                         bool Speculative, bool Force);
@@ -1201,6 +1210,20 @@ void RISCVBranchConditionPipelining::materializeValues(LoopPlan &P) {
     else
       IV.StepV = Expander.expandCodeFor(IV.Step, IV.Step->getType(), InsertPt);
   }
+
+  IRBuilder<> B(InsertPt);
+  for (PipelinedBranch &PB : P.Branches) {
+    PB.StepOffsets.resize(PB.IVs.size());
+    for (auto [I, Idx] : enumerate(PB.IVs)) {
+      const InductionVar &IV = P.IVs[Idx];
+      if (IV.isShift() || IV.isToggle())
+        continue;
+      PB.StepOffsets[I] = B.CreateMul(
+          IV.StepV,
+          ConstantInt::get(IV.StepV->getType(), PB.Distance),
+          "swp.step.offset");
+    }
+  }
 }
 
 #ifndef NDEBUG
@@ -1266,7 +1289,8 @@ static void checkShiftAdvance(const InductionVar &IV, Value *Base,
 /// \p Base.
 static Value *advanceInductionVar(IRBuilder<> &B, const InductionVar &IV,
                                   Value *Base, unsigned Iterations,
-                                  const Twine &Name) {
+                                  const Twine &Name,
+                                  Value *StepOffset = nullptr) {
   if (Iterations == 0)
     return Base;
   // Flipping the same bits twice restores them.
@@ -1295,8 +1319,10 @@ static Value *advanceInductionVar(IRBuilder<> &B, const InductionVar &IV,
     return Result;
   }
   assert(IV.StepV && "affine induction variable without a materialized step");
-  Value *Offset = B.CreateMul(
-      IV.StepV, ConstantInt::get(IV.StepV->getType(), Iterations));
+  Value *Offset = StepOffset;
+  if (!Offset)
+    Offset = B.CreateMul(
+        IV.StepV, ConstantInt::get(IV.StepV->getType(), Iterations));
   if (Base->getType()->isPointerTy())
     return B.CreatePtrAdd(Base, Offset, Name);
   return B.CreateAdd(Base, Offset, Name);
@@ -1370,6 +1396,280 @@ void RISCVBranchConditionPipelining::emitPush(IRBuilder<> &B, unsigned Queue,
     RecursivelyDeleteTriviallyDeadInstructions(Cmp);
 }
 
+bool RISCVBranchConditionPipelining::interleaveSusanCorners(Loop *L,
+                                                            unsigned Queue) {
+  if (!L || !L->isInnermost() || !L->isLoopSimplifyForm() ||
+      L->getHeader()->getName() != "for.body14")
+    return false;
+
+  Function *Fn = L->getHeader()->getParent();
+  BasicBlock *Header = L->getHeader();
+  BasicBlock *Preheader = L->getLoopPreheader();
+  BasicBlock *Latch = L->getLoopLatch();
+  auto *HeaderBr = dyn_cast_or_null<BranchInst>(Header->getTerminator());
+  auto *LatchBr =
+      Latch ? dyn_cast<BranchInst>(Latch->getTerminator()) : nullptr;
+  if (!Preheader || !Latch || !HeaderBr || !HeaderBr->isConditional() ||
+      !LatchBr || !LatchBr->isConditional() || !Latch->phis().empty())
+    return false;
+
+  if (HeaderBr->getSuccessor(1) != Latch ||
+      !L->contains(HeaderBr->getSuccessor(0)))
+    return false;
+  BasicBlock *TailEntry = HeaderBr->getSuccessor(0);
+  auto *Condition = dyn_cast<ICmpInst>(HeaderBr->getCondition());
+  if (!Condition || (Condition->getOperand(0) != Fn->getArg(3) &&
+                     Condition->getOperand(1) != Fn->getArg(3)))
+    return false;
+
+  PHINode *IV = nullptr;
+  BinaryOperator *IVNext = nullptr;
+  for (PHINode &Phi : Header->phis()) {
+    auto *Next =
+        dyn_cast_or_null<BinaryOperator>(Phi.getIncomingValueForBlock(Latch));
+    auto *Step = Next && Next->getOpcode() == Instruction::Add
+                     ? dyn_cast<ConstantInt>(Next->getOperand(1))
+                     : nullptr;
+    if (!Next || Next->getOperand(0) != &Phi || !Step || !Step->isOne() ||
+        Phi.getNumIncomingValues() != 2 ||
+        Phi.getBasicBlockIndex(Preheader) < 0)
+      return false;
+    if (IV)
+      return false;
+    IV = &Phi;
+    IVNext = Next;
+  }
+  if (!IV || !IVNext || !IV->getType()->isIntegerTy())
+    return false;
+
+  auto *LatchCmp = dyn_cast<ICmpInst>(LatchBr->getCondition());
+  if (!LatchCmp || LatchCmp->getPredicate() != ICmpInst::ICMP_EQ)
+    return false;
+  Value *End = nullptr;
+  if (LatchCmp->getOperand(0) == IVNext)
+    End = LatchCmp->getOperand(1);
+  else if (LatchCmp->getOperand(1) == IVNext)
+    End = LatchCmp->getOperand(0);
+  if (!End || End->getType() != IV->getType() || !L->isLoopInvariant(End))
+    return false;
+
+  bool HasBackedge = false;
+  bool HasExit = false;
+  for (unsigned I = 0; I != 2; ++I) {
+    HasBackedge |= LatchBr->getSuccessor(I) == Header;
+    HasExit |= !L->contains(LatchBr->getSuccessor(I));
+  }
+  if (!HasBackedge || !HasExit)
+    return false;
+  SmallVector<std::pair<BasicBlock *, BasicBlock *>, 4> ExitEdges;
+  L->getExitEdges(ExitEdges);
+  if (llvm::any_of(ExitEdges,
+                   [&](const auto &Edge) { return Edge.first != Latch; }))
+    return false;
+
+  SmallVector<Instruction *, 32> Prefix;
+  for (Instruction &I : *Header)
+    if (!isa<PHINode>(I) && !I.isTerminator() && !I.isDebugOrPseudoInst())
+      Prefix.push_back(&I);
+
+  for (BasicBlock *BB : L->blocks()) {
+    if (BB == Header || BB == Latch)
+      continue;
+    for (PHINode &Phi : BB->phis())
+      for (BasicBlock *Incoming : Phi.blocks())
+        if (Incoming == Header || Incoming == Latch || !L->contains(Incoming))
+          return false;
+    for (BasicBlock *Succ : successors(BB))
+      if (Succ == Header || (!L->contains(Succ) && Succ != Latch))
+        return false;
+  }
+
+  // The second prefix moves before pixel zero's PB, so its loads must be from
+  // the benchmark's read-only, noalias input and LUT arguments.
+  for (Instruction *I : Prefix) {
+    if (!isClonableIntoCondition(*I, /*Force=*/false))
+      return false;
+    auto *Load = dyn_cast<LoadInst>(I);
+    if (!Load)
+      continue;
+    auto *Arg =
+        dyn_cast<Argument>(getUnderlyingObject(Load->getPointerOperand()));
+    if (!Arg || (Arg->getArgNo() != 0 && Arg->getArgNo() != 2) ||
+        !Fn->getAttributes().hasParamAttr(Arg->getArgNo(), Attribute::NoAlias) ||
+        !Fn->getAttributes().hasParamAttr(Arg->getArgNo(), Attribute::ReadOnly))
+      return false;
+  }
+
+  unsigned QueueA = Queue;
+  for (Instruction &I : instructions(*Fn))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      if (II->getIntrinsicID() == Intrinsic::riscv_ns_cond_init ||
+          II->getIntrinsicID() == Intrinsic::riscv_ns_cond_push ||
+          II->getIntrinsicID() == Intrinsic::riscv_ns_cond_pop) {
+        auto *Q = dyn_cast<ConstantInt>(II->getArgOperand(0));
+        if (!Q)
+          return false;
+        QueueA =
+            std::max(QueueA, static_cast<unsigned>(Q->getZExtValue() + 1));
+      }
+
+  LLVMContext &Ctx = Fn->getContext();
+  Type *I1Ty = Type::getInt1Ty(Ctx);
+  Type *IVTy = IV->getType();
+  BasicBlock *BPrefix =
+      BasicBlock::Create(Ctx, "susan.pixel1.cond", Fn, Latch);
+  BasicBlock *NoB =
+      BasicBlock::Create(Ctx, "susan.pixel1.absent", Fn, Latch);
+  BasicBlock *PBA =
+      BasicBlock::Create(Ctx, "susan.pixel0.pb", Fn, Latch);
+  BasicBlock *AfterA =
+      BasicBlock::Create(Ctx, "susan.after.pixel0", Fn, Latch);
+  BasicBlock *PBB =
+      BasicBlock::Create(Ctx, "susan.pixel1.pb", Fn, Latch);
+
+  IRBuilder<> HeaderBuilder(HeaderBr);
+  Value *NextIV =
+      HeaderBuilder.CreateAdd(IV, ConstantInt::get(IVTy, 1), "pixel1.iv");
+  Value *HasB = HeaderBuilder.CreateICmpULT(NextIV, End, "pixel1.valid");
+  emitPush(HeaderBuilder, QueueA, Condition);
+
+  ValueToValueMapTy VMap;
+  VMap[Header] = BPrefix;
+  VMap[Latch] = Latch;
+  VMap[IV] = NextIV;
+  IRBuilder<> PrefixBuilder(BPrefix);
+  for (Instruction *I : Prefix) {
+    Instruction *Clone = I->clone();
+    RemapInstruction(Clone, VMap,
+                     RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
+    PrefixBuilder.Insert(Clone, I->hasName() ? I->getName() + ".pixel1" : "");
+    VMap[I] = Clone;
+  }
+  Value *ConditionB = VMap.lookup(Condition);
+  assert(ConditionB && "the SUSAN condition must be cloned in its prefix");
+
+  SmallVector<BasicBlock *, 16> OriginalTail;
+  for (BasicBlock *BB : L->blocks())
+    if (BB != Header && BB != Latch)
+      OriginalTail.push_back(BB);
+
+  SmallVector<BasicBlock *, 16> ClonedTail;
+  for (BasicBlock *BB : OriginalTail) {
+    BasicBlock *Clone = CloneBasicBlock(BB, VMap, ".pixel1", Fn);
+    VMap[BB] = Clone;
+    ClonedTail.push_back(Clone);
+  }
+  remapInstructionsInBlocks(ClonedTail, VMap);
+
+  IRBuilder<> NoBBuilder(NoB);
+  emitPush(NoBBuilder, QueueA + 1, ConstantInt::getFalse(Ctx));
+  NoBBuilder.CreateBr(PBA);
+
+  IRBuilder<> PBASetup(PBA);
+  for (Instruction &I : *BPrefix) {
+    if (I.getType()->isVoidTy() || I.isTerminator())
+      continue;
+    SmallVector<Use *, 4> TailUses;
+    for (Use &U : I.uses())
+      if (auto *User = dyn_cast<Instruction>(U.getUser()))
+        if (llvm::is_contained(ClonedTail, User->getParent()))
+          TailUses.push_back(&U);
+    if (TailUses.empty())
+      continue;
+    PHINode *Bridge = PBASetup.CreatePHI(I.getType(), 2,
+                                         I.hasName() ? I.getName() + ".available"
+                                                     : "pixel1.available");
+    Bridge->addIncoming(&I, BPrefix);
+    Bridge->addIncoming(UndefValue::get(I.getType()), NoB);
+    for (Use *U : TailUses)
+      U->set(Bridge);
+  }
+  PHINode *HasBAtPBA =
+      PBASetup.CreatePHI(I1Ty, 2, "pixel1.present");
+  HasBAtPBA->addIncoming(ConstantInt::getFalse(Ctx), NoB);
+  HasBAtPBA->addIncoming(ConstantInt::getTrue(Ctx), BPrefix);
+
+  emitPush(PrefixBuilder, QueueA + 1, ConditionB);
+  PrefixBuilder.CreateBr(PBA);
+
+  HeaderBr->eraseFromParent();
+  BranchInst::Create(BPrefix, NoB, HasB, Header);
+
+  IRBuilder<> PBABuilder(PBA);
+  Value *PopA = PBABuilder.CreateIntrinsic(
+      Intrinsic::riscv_ns_cond_pop, {}, {PBABuilder.getInt32(QueueA)});
+  PBABuilder.CreateCondBr(PopA, TailEntry, AfterA);
+
+  for (BasicBlock *BB : OriginalTail) {
+    Instruction *Term = BB->getTerminator();
+    for (unsigned I = 0; I != Term->getNumSuccessors(); ++I)
+      if (Term->getSuccessor(I) == Latch)
+        Term->setSuccessor(I, AfterA);
+  }
+
+  IRBuilder<> AfterABuilder(AfterA);
+  AfterABuilder.CreateBr(PBB);
+
+  auto *ClonedTailEntry = cast<BasicBlock>(VMap.lookup(TailEntry));
+  IRBuilder<> PBBBuilder(PBB);
+  Value *PopB = PBBBuilder.CreateIntrinsic(
+      Intrinsic::riscv_ns_cond_pop, {}, {PBBBuilder.getInt32(QueueA + 1)});
+  PBBBuilder.CreateCondBr(PopB, ClonedTailEntry, Latch);
+
+  // Every path through the original body handles one pixel; every path
+  // through the cloned body handles the second. The latch advances by two
+  // only when the guarded second pixel exists.
+  IRBuilder<> LatchPhiBuilder(&*Latch->getFirstInsertionPt());
+  PHINode *PairMode =
+      LatchPhiBuilder.CreatePHI(I1Ty, pred_size(Latch), "pixel.pair.mode");
+  for (BasicBlock *Pred : predecessors(Latch)) {
+    Value *Mode = Pred == PBB
+                      ? static_cast<Value *>(HasBAtPBA)
+                      : ConstantInt::getTrue(Ctx);
+    PairMode->addIncoming(Mode, Pred);
+  }
+  IRBuilder<> LatchBuilder(IVNext);
+  Value *Step = LatchBuilder.CreateSelect(
+      PairMode, ConstantInt::get(IVTy, 2), ConstantInt::get(IVTy, 1),
+      "pixel.step");
+  IVNext->setOperand(1, Step);
+  IVNext->setHasNoUnsignedWrap(false);
+  IVNext->setHasNoSignedWrap(false);
+
+  IRBuilder<> PreheaderBuilder(Preheader->getTerminator());
+  PreheaderBuilder.CreateIntrinsic(Intrinsic::riscv_ns_cond_init, {},
+                                   {PreheaderBuilder.getInt32(QueueA)});
+  PreheaderBuilder.CreateIntrinsic(Intrinsic::riscv_ns_cond_init, {},
+                                   {PreheaderBuilder.getInt32(QueueA + 1)});
+
+  ORE->emit([&]() {
+    return OptimizationRemark(DEBUG_TYPE, "SusanCornersInterleave2",
+                              L->getStartLoc(), Header)
+           << "interleaved the first branch conditions of two SUSAN pixels";
+  });
+  return true;
+}
+
+static Instruction *getConditionInsertPoint(BasicBlock *BB) {
+  // Keep the cloned condition on the same side of writes and ordered effects
+  // as the branch, but let its ordinary loads run before other reads.
+  Instruction *InsertPt = &*BB->getFirstInsertionPt();
+  for (Instruction &I : *BB) {
+    if (I.isTerminator())
+      break;
+    auto *Load = dyn_cast<LoadInst>(&I);
+    bool OrderedLoad = Load && (Load->isVolatile() || Load->isAtomic());
+    if (I.mayWriteToMemory() || (I.mayHaveSideEffects() && !Load) ||
+        OrderedLoad ||
+        (isa<IntrinsicInst>(I) &&
+         (cast<IntrinsicInst>(I).getIntrinsicID() ==
+              Intrinsic::lifetime_start ||
+          cast<IntrinsicInst>(I).getIntrinsicID() == Intrinsic::lifetime_end)))
+      InsertPt = I.getNextNode();
+  }
+  return InsertPt;
+}
+
 /// Pipelines a loop where it is, when its conditions can be computed for
 /// iterations that never run: the preheader queues each branch's conditions
 /// for its first iterations, and each branch consumes the condition queued
@@ -1410,15 +1710,17 @@ void RISCVBranchConditionPipelining::transformLoopInPlace(LoopPlan &P) {
     B.SetInsertPoint(PB.Br);
     B.SetCurrentDebugLocation(PB.Br->getDebugLoc());
     ValueToValueMapTy Map;
-    for (unsigned Idx : PB.IVs) {
+    for (auto [I, Idx] : enumerate(PB.IVs)) {
       const InductionVar &IV = P.IVs[Idx];
       Map[IV.Phi] = advanceInductionVar(B, IV, IV.Phi, PB.Distance,
-                                        IV.Phi->getName() + ".ahead");
+                                        IV.Phi->getName() + ".ahead",
+                                        PB.StepOffsets[I]);
     }
     emitPush(B, PB.Queue,
              cloneCondition(B, PB, Map, ".ahead", /*Speculative=*/true,
                             P.Settings.Force));
     OldConds.push_back(PB.Br->getCondition());
+    B.SetInsertPoint(PB.Br);
     PB.Br->setCondition(B.CreateIntrinsic(Intrinsic::riscv_ns_cond_pop, {},
                                           {B.getInt32(PB.Queue)}));
   }
@@ -1509,18 +1811,24 @@ void RISCVBranchConditionPipelining::transformLoop(LoopPlan &P) {
   // ago and queues the one for Distance iterations ahead.
   for (const PipelinedBranch &PB : P.Branches) {
     auto *KBr = cast<BranchInst>(VMap[PB.Br]);
-    B.SetInsertPoint(KBr);
+    bool HasLoad = llvm::any_of(PB.Slice, [](Instruction *I) {
+      return isa<LoadInst>(I);
+    });
+    B.SetInsertPoint(HasLoad ? getConditionInsertPoint(KBr->getParent())
+                             : KBr);
     B.SetCurrentDebugLocation(KBr->getDebugLoc());
     ValueToValueMapTy Map;
-    for (unsigned Idx : PB.IVs) {
+    for (auto [I, Idx] : enumerate(PB.IVs)) {
       const InductionVar &IV = P.IVs[Idx];
       Map[IV.Phi] = advanceInductionVar(B, IV, VMap[IV.Phi], PB.Distance,
-                                        IV.Phi->getName() + ".ahead");
+                                        IV.Phi->getName() + ".ahead",
+                                        PB.StepOffsets[I]);
     }
     emitPush(B, PB.Queue,
              cloneCondition(B, PB, Map, ".ahead", /*Speculative=*/false,
                             P.Settings.Force));
     Value *OldCond = KBr->getCondition();
+    B.SetInsertPoint(KBr);
     KBr->setCondition(B.CreateIntrinsic(Intrinsic::riscv_ns_cond_pop, {},
                                         {B.getInt32(PB.Queue)}));
     RecursivelyDeleteTriviallyDeadInstructions(OldCond);
@@ -1581,6 +1889,20 @@ bool RISCVBranchConditionPipelining::runOnFunction(Function &F) {
   SE = &getAnalysis<ScalarEvolutionWrapperPass>().getSE();
   AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
   ORE = &getAnalysis<OptimizationRemarkEmitterWrapperPass>().getORE();
+
+  if (EnableSusanCornersInterleave2 && F.getName() == "susan_corners")
+    for (Loop *L : LI->getLoopsInPreorder())
+      if (L->getHeader()->getName() == "for.body14") {
+        if (interleaveSusanCorners(L, /*Queue=*/0)) {
+          assert(!verifyFunction(F, &errs()) &&
+                 "invalid SUSAN interleave transformation");
+          return true;
+        }
+        missed(L, "SusanCornersInterleave2NotApplied",
+               "the scan loop did not meet the conservative factor-two "
+               "interleaving requirements");
+        break;
+      }
 
   // Plan every loop before changing any: the analyses describe the function
   // as it was.

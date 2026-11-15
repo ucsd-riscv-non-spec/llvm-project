@@ -36,7 +36,7 @@ struct SWPSettings {
 struct FissionSettings {
   bool Enable = true;
   bool Force = false;
-  unsigned QueueDepth = 64;
+  unsigned QueueDepth = 63;
 };
 
 /// Only explicitly supplied properties have values. In particular, false is

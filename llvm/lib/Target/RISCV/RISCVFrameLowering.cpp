@@ -1518,23 +1518,52 @@ static bool holdsBranchRegAroundLoop(const MachineInstr &MI) {
          MI.getOpcode() == RISCV::PseudoNSQBR;
 }
 
-/// Return the most B-registers that can be live across one call in \p MF,
-/// among those assigned after the frame is laid out.
-///
-/// Of those, only the B-registers of hardware loops and condition queues are
-/// live across a call, as each is live around its whole loop.
-/// RISCVExpandPseudo sets up every other branch directly before it, after any
-/// call, and RISCVBranchSetupHoisting does not move setups above calls. The
-/// B-registers of RISCVLoopFission's split branches are assigned by the main
-/// register allocator, so they are already physical here.
-static unsigned getMaxBranchRegsAcrossCall(const MachineFunction &MF) {
-  if (llvm::none_of(MF, [](const MachineBasicBlock &MBB) {
-        return llvm::any_of(MBB, holdsBranchRegAroundLoop);
-      }))
-    return 0;
+static bool becomesPBBranch(const MachineInstr &MI) {
+  switch (MI.getOpcode()) {
+  case RISCV::PseudoBR:
+  case RISCV::PseudoBREQ:
+  case RISCV::PseudoBRNE:
+  case RISCV::PseudoBRGE:
+  case RISCV::PseudoBRGEU:
+  case RISCV::PseudoBRLT:
+  case RISCV::PseudoBRLTU:
+  case RISCV::PseudoCALL:
+  case RISCV::PseudoCALLReg:
+  case RISCV::PseudoCALLIndirect:
+  case RISCV::PseudoCALLIndirectX7:
+  case RISCV::PseudoCALLIndirectNonX7:
+    return true;
+  default:
+    return false;
+  }
+}
 
-  // Neither analysis changes the function, but the dominator tree only
-  // takes a mutable one.
+static bool becomesPBCALL(const MachineInstr &MI) {
+  switch (MI.getOpcode()) {
+  case RISCV::PseudoCALL:
+  case RISCV::PseudoCALLReg:
+  case RISCV::PseudoCALLIndirect:
+  case RISCV::PseudoCALLIndirectX7:
+  case RISCV::PseudoCALLIndirectNonX7:
+    return true;
+  default:
+    return false;
+  }
+}
+
+struct BranchRegsAcrossCall {
+  unsigned LoopRegs = 0;
+  unsigned MaxRegsIncludingHoistedSetups = 0;
+};
+
+/// Return an upper bound on the B-registers that may need saving across one
+/// call. Loop and condition-queue branches are already live around their
+/// containing loops; a PseudoPBCALL may also have ordinary branch setups
+/// hoisted across it before the late B-register allocator runs.
+static BranchRegsAcrossCall
+getMaxBranchRegsAcrossCall(const MachineFunction &MF) {
+  BranchRegsAcrossCall Max;
+
   MachineDominatorTree MDT(const_cast<MachineFunction &>(MF));
   MachineLoopInfo MLI(MDT);
 
@@ -1545,19 +1574,43 @@ static unsigned getMaxBranchRegsAcrossCall(const MachineFunction &MF) {
         if (const MachineLoop *L = MLI.getLoopFor(&MBB))
           ++RegsPerLoop[L];
 
-  unsigned MaxRegs = 0;
   for (const MachineBasicBlock &MBB : MF) {
-    // A tail call leaves the function, so nothing has to survive it.
-    if (llvm::none_of(MBB, [](const MachineInstr &MI) {
-          return MI.isCall() && !MI.isReturn();
-        }))
-      continue;
-    unsigned Regs = 0;
-    for (const MachineLoop *L = MLI.getLoopFor(&MBB); L; L = L->getParentLoop())
-      Regs += RegsPerLoop.lookup(L);
-    MaxRegs = std::max(MaxRegs, Regs);
+    for (const MachineInstr &Call : MBB) {
+      // A tail call leaves the function, so nothing has to survive it.
+      if (!Call.isCall() || Call.isReturn())
+        continue;
+      unsigned LoopRegs = 0;
+      for (const MachineLoop *L = MLI.getLoopFor(&MBB); L;
+           L = L->getParentLoop())
+        LoopRegs += RegsPerLoop.lookup(L);
+
+      unsigned PotentialHoistedSetups = 0;
+      if (becomesPBCALL(Call)) {
+        SmallPtrSet<const MachineInstr *, 16> Branches;
+        for (const MachineLoop *L = MLI.getLoopFor(&MBB); L;
+             L = L->getParentLoop()) {
+          for (MachineBasicBlock *CandidateBB : L->blocks()) {
+            bool AfterCall = CandidateBB != &MBB;
+            for (const MachineInstr &Candidate : *CandidateBB) {
+              if (&Candidate == &Call) {
+                AfterCall = true;
+                continue;
+              }
+              if (AfterCall && becomesPBBranch(Candidate))
+                Branches.insert(&Candidate);
+            }
+          }
+        }
+        PotentialHoistedSetups = Branches.size();
+      }
+
+      Max.LoopRegs = std::max(Max.LoopRegs, LoopRegs);
+      Max.MaxRegsIncludingHoistedSetups =
+          std::max(Max.MaxRegsIncludingHoistedSetups,
+                   LoopRegs + PotentialHoistedSetups);
+    }
   }
-  return MaxRegs;
+  return Max;
 }
 
 void RISCVFrameLowering::determineCalleeSaves(MachineFunction &MF,
@@ -1570,18 +1623,32 @@ void RISCVFrameLowering::determineCalleeSaves(MachineFunction &MF,
   // the frame is laid out, so save as many as can be live across one call,
   // besides any the main register allocator already used;
   // RISCVRegisterInfo::getReservedRegs keeps the rest from being assigned.
-  if (unsigned NumBRegs = getMaxBranchRegsAcrossCall(MF)) {
+  BranchRegsAcrossCall AcrossCall = getMaxBranchRegsAcrossCall(MF);
+  if (AcrossCall.MaxRegsIncludingHoistedSetups) {
     SmallVector<MCPhysReg, 8> FreeBRegCSRs;
+    unsigned SavedBRegCSRs = 0;
     for (const MCPhysReg *R = MF.getRegInfo().getCalleeSavedRegs(); *R; ++R)
-      if (RISCV::PBRRegClass.contains(*R) && !SavedRegs.test(*R))
-        FreeBRegCSRs.push_back(*R);
-    if (NumBRegs > FreeBRegCSRs.size())
+      if (RISCV::PBRRegClass.contains(*R)) {
+        if (SavedRegs.test(*R))
+          ++SavedBRegCSRs;
+        else
+          FreeBRegCSRs.push_back(*R);
+      }
+    if (AcrossCall.LoopRegs > SavedBRegCSRs + FreeBRegCSRs.size())
       reportFatalUsageError(
-          "function '" + MF.getName() + "' keeps " + Twine(NumBRegs) +
+          "function '" + MF.getName() + "' keeps " +
+          Twine(AcrossCall.LoopRegs) +
           " branch register(s) live across calls, but only " +
-          Twine(FreeBRegCSRs.size()) +
+          Twine(SavedBRegCSRs + FreeBRegCSRs.size()) +
           " callee-saved branch register(s) are available");
-    for (MCPhysReg Reg : ArrayRef(FreeBRegCSRs).take_front(NumBRegs))
+    unsigned AdditionalBRegCSRs =
+        AcrossCall.MaxRegsIncludingHoistedSetups > SavedBRegCSRs
+            ? AcrossCall.MaxRegsIncludingHoistedSetups - SavedBRegCSRs
+            : 0;
+    AdditionalBRegCSRs =
+        std::min<unsigned>(AdditionalBRegCSRs, FreeBRegCSRs.size());
+    for (MCPhysReg Reg :
+         ArrayRef(FreeBRegCSRs).take_front(AdditionalBRegCSRs))
       SavedRegs.set(Reg);
   }
   // Unconditionally spill RA and FP only if the function uses a frame
@@ -2327,7 +2394,7 @@ bool RISCVFrameLowering::enableShrinkWrapping(const MachineFunction &MF) const {
   // The B-registers saved for loops around calls are only assigned after the
   // prologue and epilogue are placed, so shrink-wrapping cannot see where
   // they are used. Save them on entry and restore them at every return.
-  if (getMaxBranchRegsAcrossCall(MF))
+  if (getMaxBranchRegsAcrossCall(MF).MaxRegsIncludingHoistedSetups)
     return false;
 
   return true;

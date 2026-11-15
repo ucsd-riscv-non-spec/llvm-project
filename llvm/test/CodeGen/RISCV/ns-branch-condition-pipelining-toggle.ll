@@ -208,7 +208,7 @@ exit:
 ; CHECK-NEXT:    br i1 [[POP0]], label %even.swp, label %mid.swp
 ; CHECK:       mid.swp:
 ; CHECK:         call void @llvm.riscv.ns.cond.push.i64(i32 1, i32 40, i64 %v.ahead, i64 0)
-; CHECK-NEXT:    [[POP1:%.*]] = call i1 @llvm.riscv.ns.cond.pop(i32 1)
+; CHECK:         [[POP1:%.*]] = call i1 @llvm.riscv.ns.cond.pop(i32 1)
 ; The drain loop resumes the toggle and branches on it as before.
 ; CHECK:       swp.drain.ph:
 ; CHECK:         %t.swp.resume = phi i1 [ true, %entry ], [ %t.next.swp, %swp.kernel.exit ]

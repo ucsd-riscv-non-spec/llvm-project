@@ -3,7 +3,7 @@
 ; RUN:   | FileCheck %s --check-prefix=RVE
 
 ; A hardware loop's B-register is live across every call in the loop, so it
-; has to be callee-saved (B24-B31), and the function using it saves it.
+; has to be callee-saved (B25-B31), and the function using it saves it.
 
 declare void @use(i64, i64)
 
@@ -11,7 +11,7 @@ declare void @use(i64, i64)
 ; touch nor save a callee-saved one.
 define i64 @callee(i64 %x) noinline {
 ; CHECK-LABEL: callee:
-; CHECK-NOT:     {{bpush|bpop|b2[4-9]|b3[01]}}
+; CHECK-NOT:     {{bpush|bpop|b2[5-9]|b3[01]}}
 ; CHECK:       .Lfunc_end0:
 entry:
   %c = icmp sgt i64 %x, 10
@@ -30,16 +30,16 @@ done:
 ; RVE: function 'one_loop' keeps 1 branch register(s) live across calls, but only 0 callee-saved branch register(s) are available
 define i64 @one_loop(ptr %p, i64 %n) {
 ; CHECK-LABEL: one_loop:
-; CHECK:         bpush b24, [[SLOT:[0-9]+]](sp)
+; CHECK:         bpush b25, [[SLOT:[0-9]+]](sp)
 ; The setup cannot move above the save.
-; CHECK-NOT:     b24
-; CHECK:         bmovs b24, [[LOOP:.Lns_loop_[0-9]+]]
-; CHECK:         bmovc_loop b24,
+; CHECK-NOT:     b25
+; CHECK:         bmovs b25, [[LOOP:.Lns_loop_[0-9]+]]
+; CHECK:         bmovc_loop b25,
 ; CHECK:         pbal {{b[0-9]+}}, ra
 ; CHECK:       [[LOOP]]:
-; CHECK-NEXT:    pb b24
-; CHECK:         bpop b24, [[SLOT]](sp)
-; CHECK-NOT:     b24
+; CHECK-NEXT:    pb b25
+; CHECK:         bpop b25, [[SLOT]](sp)
+; CHECK-NOT:     b25
 ; CHECK:       .Lns_return_{{[0-9]+}}:
 ; CHECK-NEXT:    pb {{b([0-9]|1[0-9]|2[0-3])$}}
 entry:
@@ -63,15 +63,15 @@ exit:
 ; Both loops' B-registers are live across the call.
 define void @nested(i64 %n, i64 %m) {
 ; CHECK-LABEL: nested:
-; CHECK-DAG:     bpush b24,
 ; CHECK-DAG:     bpush b25,
-; CHECK:         bmovc_loop [[OUTER:b2[45]]],
-; CHECK:         bmovc_loop [[INNER:b2[45]]],
+; CHECK-DAG:     bpush b26,
+; CHECK:         bmovc_loop [[OUTER:b26]],
+; CHECK:         bmovc_loop [[INNER:b27]],
 ; CHECK:         pbal {{b[0-9]+}}, ra
 ; CHECK:         pb [[INNER]]
 ; CHECK:         pb [[OUTER]]
-; CHECK-DAG:     bpop b24,
 ; CHECK-DAG:     bpop b25,
+; CHECK-DAG:     bpop b26,
 ; CHECK:       .Lfunc_end2:
 entry:
   %gn = icmp sgt i64 %n, 0
@@ -98,9 +98,9 @@ exit:
 ; Without a call the loop's B-register need not be callee-saved.
 define void @no_call(ptr %p, i64 %n) {
 ; CHECK-LABEL: no_call:
-; CHECK-NOT:     {{bpush|bpop|b2[4-9]|b3[01]}}
+; CHECK-NOT:     {{bpush|bpop|b2[5-9]|b3[01]}}
 ; CHECK:         bmovc_loop
-; CHECK-NOT:     {{bpush|bpop|b2[4-9]|b3[01]}}
+; CHECK-NOT:     {{bpush|bpop|b2[5-9]|b3[01]}}
 ; CHECK:       .Lfunc_end3:
 entry:
   %guard = icmp sgt i64 %n, 0
@@ -128,14 +128,14 @@ declare signext i32 @f3(i8 signext)
 ; callee-saved one, so the second loop's own B-register needs the next.
 define signext i32 @split_loop() nounwind {
 ; CHECK-LABEL: split_loop:
-; CHECK-DAG:     bpush b24,
 ; CHECK-DAG:     bpush b25,
-; CHECK:         bmovc_beq b24,
-; CHECK:         bmovc_loop b25,
+; CHECK-DAG:     bpush b26,
+; CHECK:         bmovc_beq b25,
+; CHECK:         bmovc_loop b26,
 ; CHECK:         pbal {{b[0-9]+}}, ra
-; CHECK:         pb b25
-; CHECK-DAG:     bpop b24,
+; CHECK:         pb b26
 ; CHECK-DAG:     bpop b25,
+; CHECK-DAG:     bpop b26,
 ; CHECK:       .Lfunc_end4:
 entry:
   br label %loop

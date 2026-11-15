@@ -23,7 +23,7 @@ unsigned LoopHintAttr::getRISCVNSMaximum(OptionType Option) {
   case RISCVNSSWPSpeculativeDistance:
     return 62;
   case RISCVNSFissionQueueDepth:
-    return 64;
+    return 63;
   case RISCVNSSWPMaxSliceSize:
   case RISCVNSSWPMaxLoopSize:
   case RISCVNSSWPMaxPrologueSize:

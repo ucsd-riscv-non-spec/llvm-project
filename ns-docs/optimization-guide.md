@@ -24,7 +24,7 @@ The other files in `ns-docs/` hold the design and measurements behind the newer 
 | `-riscv-ns-swp-max-function-branches=N` | 32 | 2.7 |
 | `-riscv-ns-disable-ir-loop-fission` | IR fission on | 3.1 |
 | `-disable-loop-fission-decomposed-branch` | machine fission on | 3.2 |
-| `-loop-fission-queue-depth=N` | 64 (max 64) | 3.3 |
+| `-loop-fission-queue-depth=N` | 63 (max 63) | 3.3 |
 | `-riscv-ns-disable-hardware-loops` | hardware loops on | 4 |
 | `-riscv-ns-disable-split-exit-jumps` | splitting on | 5.1 |
 | `-riscv-ns-disable-branch-setup-hoisting` | hoisting on | 5.2 |
@@ -345,15 +345,15 @@ Note there is no `riscv-ns-` prefix.
 - **At the defaults, it mostly sees what pipelining leaves behind.** With 200 iterations of the 3.1 loop:
   - at the defaults, pipelining takes the loop. Machine fission skips the marked
     kernel, but can split the drain loop, whose trip count is the constant 16;
-  - with `-riscv-ns-disable-software-pipelining`, it splits the whole loop into a tile of 8 and three of 64.
+  - with `-riscv-ns-disable-software-pipelining`, it splits the whole loop into a tile of 11 and three of 63.
 - **It does nothing with `-riscv-ns-disable-hardware-loops`.**
 
 ### 3.3 `-loop-fission-queue-depth=N`
 
-- **Default:** 64. Values above 64 are cut to 64, and 0 disables machine fission
+- **Default:** 63. Values above 63 are cut to 63, and 0 disables machine fission
   on loops that inherit it. A positive local depth overrides that zero.
 - **This flag is the tile size of 3.2 only.** Without metadata, IR fission's
-  limit is 64. Per-loop `llvm.loop.riscv.ns.fission.queue_depth` overrides the
+  limit is 63. Per-loop `llvm.loop.riscv.ns.fission.queue_depth` overrides the
   whole-loop cutoff in IR fission and the maximum tile size in machine fission.
 - **Lower it** to model a smaller queue in hardware. Each extra tile reruns the tile's setup. For example, `=16` turns the 200-iteration loop into one tile of 8 and twelve of 16.
 
@@ -518,7 +518,7 @@ Run with `-pass-remarks=riscv-branch-condition-pipelining -debug-only=riscv-bran
 | `cannot compute ahead`, otherwise | The condition uses something that cannot be cloned, or it is longer than `-riscv-ns-swp-max-slice-size`. |
 | `a store could clobber what the condition of ... reads` | Prove the pointers don't alias (`restrict`), or accept that the loop writes what it reads. |
 | `loop is too large to duplicate` | `-riscv-ns-swp-max-loop-size` |
-| `never runs more than N iterations` | A smaller `-riscv-ns-swp-distance`. A constant trip count of 64 or fewer may already be handled by IR fission. |
+| `never runs more than N iterations` | A smaller `-riscv-ns-swp-distance`. A constant trip count of 63 or fewer may already be handled by IR fission. |
 | `loop body cannot be pipelined` | A call, `alloca`, EH pad, or similar, and no flag helps. Or IR fission already split the loop: check `-debug-only=riscv-ir-loop-fission`. |
 | `not an innermost loop exiting at its latch` | No flag helps. |
 | missed remark about branch registers | `-riscv-ns-swp-max-function-branches` (see the warning in 2.7) |

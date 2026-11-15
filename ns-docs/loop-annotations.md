@@ -63,7 +63,7 @@ supplied options; an absent boolean inherits its default and differs from false.
 | `swp_max_slice_size` | `swp.max_slice_size` | `i32`, 1–2147483647 | `-riscv-ns-swp-max-slice-size` (16) |
 | `swp_max_loop_size` | `swp.max_loop_size` | `i32`, 1–2147483647 | `-riscv-ns-swp-max-loop-size` (256) |
 | `swp_max_prologue_size` | `swp.max_prologue_size` | `i32`, 1–2147483647 | `-riscv-ns-swp-max-prologue-size` (512) |
-| `fission_queue_depth` | `fission.queue_depth` | `i32`, 1–64 | IR: 64; machine: `-loop-fission-queue-depth` (64) |
+| `fission_queue_depth` | `fission.queue_depth` | `i32`, 1–63 | IR: 63; machine: `-loop-fission-queue-depth` (63) |
 
 Metadata overrides matching command-line tuning values, including explicitly
 supplied values. The three explicit disable flags remain compile-wide kill

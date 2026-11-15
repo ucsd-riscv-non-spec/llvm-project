@@ -1,8 +1,8 @@
 ; RUN: llc -mtriple=riscv64 -O2 -save-temp-labels -stop-after=riscv-loop-fission-decomposed-branch < %s > %t-after.mir
-; RUN: llc -mtriple=riscv64 -run-pass=riscv-loop-fission-decomposed-branch %t-after.mir -o - | FileCheck %s --check-prefix=MACHINE
+; RUN: llc -mtriple=riscv64 -run-pass=riscv-loop-fission-decomposed-branch %t-after.mir -o - | FileCheck %s --check-prefixes=MACHINE,MACHINE-DEFAULT
 ; RUN: llc -mtriple=riscv64 -O2 -stop-after=riscv-ir-loop-fission < %s | FileCheck %s --check-prefix=IR
 ; RUN: llc -mtriple=riscv64 -O2 -riscv-ns-disable-ir-loop-fission -stop-after=riscv-ir-loop-fission < %s | FileCheck %s --check-prefix=IR-OFF
-; RUN: llc -mtriple=riscv64 -O2 -verify-machineinstrs -loop-fission-queue-depth=0 -stop-after=riscv-loop-fission-decomposed-branch < %s | FileCheck %s --check-prefix=MACHINE
+; RUN: llc -mtriple=riscv64 -O2 -verify-machineinstrs -loop-fission-queue-depth=0 -stop-after=riscv-loop-fission-decomposed-branch < %s | FileCheck %s --check-prefixes=MACHINE,MACHINE-DEPTH0
 ; RUN: llc -mtriple=riscv64 -O2 -disable-loop-fission-decomposed-branch -stop-after=riscv-loop-fission-decomposed-branch < %s | FileCheck %s --check-prefix=MACHINE-OFF
 ; RUN: llc -mtriple=riscv64 -O2 -stop-before=riscv-loop-fission-decomposed-branch < %s > %t.mir
 ; RUN: sed 's/bb\.\([0-9]*\)\.latch:/bb.\1:/' %t.mir > %t-lost-latch.mir
@@ -162,6 +162,69 @@ exit:
   ret void
 }
 
+; A 64-iteration loop exceeds the 63-outcome hardware queue. The default
+; machine tile is therefore 63, with a one-iteration first tile.
+; IR-LABEL: define {{.*}} @machine_default_depth(
+; IR-NOT: call {{.*}}@llvm.riscv.ns.cond
+; IR: ret void
+; MACHINE-DEFAULT-LABEL: name: machine_default_depth
+; MACHINE-DEFAULT: ADDI $x0, 1
+; MACHINE-DEFAULT: ADDI $x0, 63
+; MACHINE-DEFAULT: BMOVC_B
+; MACHINE-DEFAULT: PseudoPBC
+; MACHINE-DEPTH0-LABEL: name: machine_default_depth
+; MACHINE-DEPTH0-NOT: BMOVC_B
+; MACHINE-DEPTH0: ...
+; MACHINE-OFF-LABEL: name: machine_default_depth
+; MACHINE-OFF-NOT: BMOVC_B
+; MACHINE-OFF: ...
+define void @machine_default_depth(ptr noalias %a, ptr noalias %out) {
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %latch ]
+  %p = getelementptr i32, ptr %a, i64 %i
+  %v = load i32, ptr %p
+  %c = icmp sgt i32 %v, 0
+  br i1 %c, label %body, label %latch
+body:
+  %q = getelementptr i32, ptr %out, i64 %i
+  store i32 %v, ptr %q
+  br label %latch
+latch:
+  %next = add nuw i64 %i, 1
+  %again = icmp ult i64 %next, 64
+  br i1 %again, label %loop, label %exit, !llvm.loop !160
+exit:
+  ret void
+}
+
+; IR fission uses the same 63-outcome default and must reject a 64-iteration
+; loop rather than enqueueing more conditions than the hardware can hold.
+; IR-LABEL: define {{.*}} @ir_default_depth(
+; IR-NOT: call {{.*}}@llvm.riscv.ns.cond
+; IR: ret void
+define void @ir_default_depth(ptr noalias %a, ptr noalias %out) {
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %next, %latch ]
+  %p = getelementptr i32, ptr %a, i64 %i
+  %v = load i32, ptr %p
+  %c = icmp sgt i32 %v, 0
+  br i1 %c, label %body, label %latch
+body:
+  %q = getelementptr i32, ptr %out, i64 %i
+  store i32 %v, ptr %q
+  br label %latch
+latch:
+  %next = add nuw i64 %i, 1
+  %again = icmp ult i64 %next, 64
+  br i1 %again, label %loop, label %exit, !llvm.loop !180
+exit:
+  ret void
+}
+
 ; IR-LABEL: define {{.*}} @machine_disabled(
 ; IR-NOT: call {{.*}}@llvm.riscv.ns.cond
 ; IR: ret void
@@ -300,3 +363,13 @@ exit:
 !143 = !{!"llvm.loop.riscv.ns.fission.machine.enable", i1 true}
 !144 = !{!"llvm.loop.riscv.ns.fission.queue_depth", i32 16}
 !145 = !{!"llvm.loop.riscv.ns.force", i1 true}
+
+!160 = distinct !{!160, !161, !162, !163}
+!161 = !{!"llvm.loop.riscv.ns.swp.enable", i1 false}
+!162 = !{!"llvm.loop.riscv.ns.fission.ir.enable", i1 false}
+!163 = !{!"llvm.loop.riscv.ns.fission.machine.enable", i1 true}
+
+!180 = distinct !{!180, !181, !182, !183}
+!181 = !{!"llvm.loop.riscv.ns.swp.enable", i1 false}
+!182 = !{!"llvm.loop.riscv.ns.fission.ir.enable", i1 true}
+!183 = !{!"llvm.loop.riscv.ns.fission.machine.enable", i1 false}

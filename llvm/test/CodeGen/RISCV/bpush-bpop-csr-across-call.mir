@@ -20,7 +20,7 @@ body: |
     BPUSH %1, %0, 0
     PseudoRET
 ...
-# CHECK: frame-setup BPUSH killed $b24, $x2, 0
-# CHECK: renamable $b24 = BMOVS_I
+# CHECK: frame-setup BPUSH killed $b25, $x2, 0
+# CHECK: renamable $b25 = BMOVS_I
 # CHECK-NEXT: PseudoCALL
 # CHECK: frame-destroy BPOP $x2, 0
