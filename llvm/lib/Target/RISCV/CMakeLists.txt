@@ -32,6 +32,7 @@ add_public_tablegen_target(RISCVCommonTableGen)
 add_llvm_target(RISCVCodeGen
   RISCVAsmPrinter.cpp
   RISCVBranchConditionPipelining.cpp
+  RISCVChainLoadHoisting.cpp
   RISCVBranchSetupAnalysis.cpp
   RISCVCallingConv.cpp
   RISCVCodeGenPrepare.cpp
@@ -52,6 +53,7 @@ add_llvm_target(RISCVCodeGen
   RISCVIRLoopFission.cpp
   RISCVLoopDecideAct.cpp
   RISCVNSVersionPromote.cpp
+  RISCVSusanPBLatencySchedule.cpp
   RISCVISelDAGToDAG.cpp
   RISCVISelLowering.cpp
   RISCVLandingPadSetup.cpp

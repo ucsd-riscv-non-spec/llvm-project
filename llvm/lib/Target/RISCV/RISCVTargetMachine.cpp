@@ -154,7 +154,11 @@ extern "C" LLVM_ABI LLVM_EXTERNAL_VISIBILITY void LLVMInitializeRISCVTarget() {
   initializeRISCVExpandAtomicPseudoPass(*PR);
   initializeRISCVBranchSetupHoistingPass(*PR);
   initializeRISCVBranchConditionPipeliningPass(*PR);
+  initializeRISCVChainCheckThinningPass(*PR);
+  initializeRISCVChainLoadHoistingPass(*PR);
+  initializeRISCVChainLoadHoistingMachinePass(*PR);
   initializeRISCVIRLoopFissionPass(*PR);
+  initializeRISCVSusanPBLatencySchedulePass(*PR);
   initializeRISCVLoopDecideActPass(*PR);
   initializeRISCVNSLoopMetadataPass(*PR);
   initializeRISCVRedundantCopyEliminationPass(*PR);
@@ -502,6 +506,12 @@ void RISCVPassConfig::addIRPasses() {
   // Runs before HardwareLoops, which then converts the loops it creates.
   if (getOptLevel() != CodeGenOptLevel::None)
     addPass(createRISCVBranchConditionPipeliningPass());
+  if (getOptLevel() != CodeGenOptLevel::None)
+    addPass(createRISCVSusanResponseMapCompactionPass());
+  if (getOptLevel() != CodeGenOptLevel::None)
+    addPass(createRISCVChainCheckThinningPass());
+  if (getOptLevel() != CodeGenOptLevel::None)
+    addPass(createRISCVChainLoadHoistingPass());
   addPass(createHardwareLoopsLegacyPass());
 
   TargetPassConfig::addIRPasses();
@@ -627,6 +637,7 @@ void RISCVPassConfig::addPreEmitPass2() {
   addPass(createRISCVBranchSetupHoistingPass());
   addPass(createGreedyRegisterAllocator());
   addPass(createVirtRegRewriter());
+  addPass(createRISCVSusanPBLatencySchedulePass());
 }
 
 void RISCVPassConfig::addMachineSSAOptimization() {
@@ -641,6 +652,7 @@ void RISCVPassConfig::addMachineSSAOptimization() {
   if (TM->getTargetTriple().isRISCV64()) {
     addPass(createRISCVOptWInstrsPass());
   }
+  addPass(createRISCVChainLoadHoistingMachinePass());
 }
 
 void RISCVPassConfig::addPreRegAlloc() {

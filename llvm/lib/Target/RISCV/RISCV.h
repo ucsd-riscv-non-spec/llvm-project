@@ -127,8 +127,20 @@ void initializeRISCVBranchSetupHoistingPass(PassRegistry &);
 FunctionPass *createRISCVBranchConditionPipeliningPass();
 void initializeRISCVBranchConditionPipeliningPass(PassRegistry &);
 
+FunctionPass *createRISCVChainLoadHoistingPass();
+void initializeRISCVChainLoadHoistingPass(PassRegistry &);
+FunctionPass *createRISCVChainCheckThinningPass();
+void initializeRISCVChainCheckThinningPass(PassRegistry &);
+FunctionPass *createRISCVSusanResponseMapCompactionPass();
+void initializeRISCVSusanResponseMapCompactionPass(PassRegistry &);
+FunctionPass *createRISCVChainLoadHoistingMachinePass();
+void initializeRISCVChainLoadHoistingMachinePass(PassRegistry &);
+
 FunctionPass *createRISCVIRLoopFissionPass();
 void initializeRISCVIRLoopFissionPass(PassRegistry &);
+
+FunctionPass *createRISCVSusanPBLatencySchedulePass();
+void initializeRISCVSusanPBLatencySchedulePass(PassRegistry &);
 
 FunctionPass *createRISCVLoopDecideActPass();
 void initializeRISCVLoopDecideActPass(PassRegistry &);

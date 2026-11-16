@@ -1,12 +1,20 @@
 ; RUN: llc -mtriple=riscv64 -O2 -riscv-ns-susan-corners-interleave2 \
 ; RUN:   -stop-after=riscv-branch-condition-pipelining < %s | FileCheck %s
+; RUN: llc -mtriple=riscv64 -O2 \
+; RUN:   -riscv-ns-susan-corners-interleave-factor=4 \
+; RUN:   -stop-after=riscv-branch-condition-pipelining < %s \
+; RUN:   | FileCheck %s --check-prefix=FACTOR4
+; RUN: llc -mtriple=riscv64 -O2 \
+; RUN:   -riscv-ns-susan-corners-interleave-factor=6 \
+; RUN:   -stop-after=riscv-branch-condition-pipelining < %s \
+; RUN:   | FileCheck %s --check-prefix=FACTOR6
 ; RUN: llc -mtriple=riscv64 -O2 -riscv-ns-disable-software-pipelining \
 ; RUN:   -stop-after=riscv-branch-condition-pipelining < %s \
 ; RUN:   | FileCheck %s --check-prefix=DISABLED
 
-; The opt-in SUSAN transform computes pixel 1's first condition before
+; The factor-2 SUSAN transform computes pixel 1's first condition before
 ; consuming pixel 0's, then consumes pixel 1's condition after pixel 0's tail.
-; The absent-pixel path pushes a false condition so both queues are drained.
+; Its absent-pixel path pushes a false condition so both queues are drained.
 ; DISABLED-NOT: susan.pixel1.cond
 ; DISABLED-NOT: llvm.riscv.ns.cond.push
 
@@ -59,3 +67,29 @@ exit:
 ; CHECK: call i1 @llvm.riscv.ns.cond.pop(i32 1)
 ; CHECK: %pixel.pair.mode = phi i1
 ; CHECK: %pixel.step = select i1 %pixel.pair.mode, i64 2, i64 1
+
+; Larger factors use one queue per real pixel. Missing tail pixels skip both
+; their condition producer and PB instead of pushing placeholder conditions.
+; FACTOR4-LABEL: define void @susan_corners(
+; FACTOR4: call void @llvm.riscv.ns.cond.init(i32 0)
+; FACTOR4: call void @llvm.riscv.ns.cond.init(i32 1)
+; FACTOR4: call void @llvm.riscv.ns.cond.init(i32 2)
+; FACTOR4: call void @llvm.riscv.ns.cond.init(i32 3)
+; FACTOR4: call void @llvm.riscv.ns.cond.push.i64(i32 0,
+; FACTOR4: select i1 %pixel3.valid, i64 4,
+; FACTOR4: br i1 %pixel1.valid, label %susan.pixel1.cond, label %susan.pixel.prefix.done
+; FACTOR4: call void @llvm.riscv.ns.cond.push.i64(i32 1,
+; FACTOR4: call void @llvm.riscv.ns.cond.push.i64(i32 2,
+; FACTOR4: call void @llvm.riscv.ns.cond.push.i64(i32 3,
+; FACTOR4: call i1 @llvm.riscv.ns.cond.pop(i32 1)
+; FACTOR4: call i1 @llvm.riscv.ns.cond.pop(i32 2)
+; FACTOR4: call i1 @llvm.riscv.ns.cond.pop(i32 3)
+; FACTOR4: call i1 @llvm.riscv.ns.cond.pop(i32 0)
+
+; FACTOR6-LABEL: define void @susan_corners(
+; FACTOR6: call void @llvm.riscv.ns.cond.init(i32 0)
+; FACTOR6: call void @llvm.riscv.ns.cond.init(i32 5)
+; FACTOR6: select i1 %pixel5.valid, i64 6,
+; FACTOR6: call void @llvm.riscv.ns.cond.push.i64(i32 5,
+; FACTOR6: call i1 @llvm.riscv.ns.cond.pop(i32 5)
+; FACTOR6: call i1 @llvm.riscv.ns.cond.pop(i32 0)

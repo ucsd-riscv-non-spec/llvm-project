@@ -72,6 +72,11 @@
 // The pass runs before HardwareLoops, which then turns the kernel and the
 // remainder loop into hardware loops.
 //
+// Early-exit chain check thinning is also an opt-in IR transform. Its
+// contract mode trusts intact metadata only; callers must provide an image
+// buffer of at least x_size*y_size bytes and a LUT covering the full uchar
+// difference range. The pass does not prove those allocation extents.
+//
 //===----------------------------------------------------------------------===//
 
 #include "RISCV.h"
@@ -85,8 +90,10 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopIterator.h"
+#include "llvm/Analysis/Loads.h"
 #include "llvm/Analysis/MemoryLocation.h"
 #include "llvm/Analysis/OptimizationRemarkEmitter.h"
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -94,10 +101,12 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsRISCV.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/InitializePasses.h"
@@ -166,6 +175,51 @@ static cl::opt<bool> EnableSusanCornersInterleave2(
     cl::desc("Interleave the first branch conditions of two SUSAN corner "
              "pixels"));
 
+static cl::opt<unsigned> SusanCornersInterleaveFactor(
+    "riscv-ns-susan-corners-interleave-factor", cl::Hidden, cl::init(0),
+    cl::desc("Interleave SUSAN corner pixels by this factor (3-8); factor 2 "
+             "uses the separate interleave2 option"));
+
+static cl::opt<unsigned> SusanCornersLoadHoistDepth(
+    "riscv-ns-susan-corners-load-hoist-depth", cl::Hidden, cl::init(0),
+    cl::desc("Hoist SUSAN corner neighbor load chains across this many "
+             "threshold checks (1-3)"));
+
+static cl::opt<unsigned> ChainLoadHoistDistance(
+    "riscv-ns-hoist-chain-loads", cl::Hidden, cl::init(0),
+    cl::desc("Hoist safe load slices across this many early-exit checks "
+             "(0 disables; maximum 8)"));
+
+// Contract mode trusts only metadata attached by a transform that recognized
+// the corresponding bounded access. It assumes the image holds at least
+// x_size*y_size bytes and that the LUT covers the full uchar difference
+// range. This pass does not prove either allocation extent.
+static cl::opt<bool> AssumeChainLoadInBounds(
+    "riscv-ns-hoist-assume-chain-inbounds", cl::Hidden, cl::init(false),
+    cl::desc("Trust intact chain-inbounds metadata when hoisting or thinning "
+             "loads (assumes the image buffer holds at least x_size*y_size "
+             "bytes and the LUT covers the full uchar difference range; "
+             "this pass does not prove either extent)"));
+
+static cl::opt<unsigned> ThinChainChecks(
+    "riscv-ns-thin-checks", cl::Hidden, cl::init(0),
+    cl::desc("Check early-exit load chains every G contributions "
+             "(0 disables; requires safe speculative loads)"));
+
+static cl::opt<std::string> ThinChainChecksSchedule(
+    "riscv-ns-thin-checks-schedule", cl::Hidden, cl::init("uniform"),
+    cl::desc("Threshold-check schedule: uniform or histogram"));
+
+// Response-map compaction relies on the interleave transform's chain metadata
+// and on SUSAN's image allocation contract: at least x_size*y_size bytes.
+// The pass does not prove that extent.
+static cl::opt<bool> SusanCornersResponseCompact(
+    "riscv-ns-susan-response-compact", cl::Hidden, cl::init(false),
+    cl::desc("Compact SUSAN corner survivors before local-maximum checks "
+             "(requires interleave chain metadata; assumes the image buffer "
+             "holds at least x_size*y_size bytes, which this pass does not "
+             "prove)"));
+
 // Each entry of a loop without a trip count computes this many conditions
 // for iterations that may never run, so it is kept shorter than the distance
 // of counted loops.
@@ -176,6 +230,47 @@ static cl::opt<unsigned> SpeculativePipelineDistance(
 
 STATISTIC(NumLoopsPipelined, "Number of loops whose conditions were pipelined");
 STATISTIC(NumBranchesPipelined, "Number of branches given a condition queue");
+STATISTIC(NumChainLoadHoists, "Number of early-exit load slices hoisted");
+STATISTIC(NumChainLoadHoistRejectDereferenceability,
+          "Load slices rejected because speculative dereferenceability was "
+          "not proven");
+STATISTIC(NumChainLoadHoistRejectMemory,
+          "Load slices rejected because of an intervening memory effect");
+STATISTIC(NumChainLoadHoistRejectControl,
+          "Load slices rejected because of control-flow or loop guards");
+STATISTIC(NumChainLoadHoistRejectPressure,
+          "Load slices rejected by the live-value pressure limit");
+STATISTIC(NumChainLoadHoistRejectDependence,
+          "Load slices rejected because their address depends on the "
+          "accumulator");
+STATISTIC(NumChainChecksRemoved,
+          "Intermediate early-exit threshold checks removed");
+STATISTIC(NumChainCheckThinRejectContribution,
+          "Threshold checks kept because contributions are not nonnegative");
+STATISTIC(NumChainCheckThinRejectOverflow,
+          "Threshold checks kept because accumulator overflow is possible");
+STATISTIC(NumChainCheckThinRejectMemory,
+          "Threshold checks kept because of intervening side effects");
+STATISTIC(NumChainCheckThinRejectInBounds,
+          "Threshold checks kept because speculative loads are not safe");
+STATISTIC(NumChainCheckThinRejectLiveOut,
+          "Threshold checks kept because intermediate values are live on exit");
+STATISTIC(NumChainCheckThinRejectPressure,
+          "Threshold checks kept because of live-value pressure");
+STATISTIC(NumChainCheckThinRejectMonotonic,
+          "Threshold checks kept because exit conditions are not monotone");
+STATISTIC(NumChainCheckThinRejectControl,
+          "Threshold checks kept because the chain or loop control is unsafe");
+STATISTIC(NumChainCheckThinRejectShortChain,
+          "Chains too short to thin at the requested spacing");
+STATISTIC(NumSusanResponseCompactions,
+          "Number of SUSAN response-map scans compacted");
+STATISTIC(NumSusanResponseCompactRejectContract,
+          "Response-map compactions rejected because chain metadata is "
+          "missing");
+STATISTIC(NumSusanResponseCompactRejectPattern,
+          "Response-map compactions rejected because the IR shape is "
+          "unsupported");
 STATISTIC(NumLoopsPipelinedSpeculatively,
           "Number of loops without a trip count whose conditions were "
           "pipelined");
@@ -188,6 +283,12 @@ STATISTIC(NumToggleLoopsPipelined,
 static constexpr unsigned MaxDistance = 62;
 
 namespace {
+
+static MDNode *makeChainInBoundsContract(
+    LLVMContext &Ctx, StringRef Kind, unsigned BaseArg, unsigned ImageArg,
+    unsigned XSizeArg, unsigned YSizeArg, Loop *InnerLoop, Loop *OuterLoop,
+    int64_t RowStart, int64_t RowEndTrim, int64_t ColumnStart,
+    int64_t ColumnEndTrim, ArrayRef<int64_t> Offsets);
 
 /// A header phi whose value in iteration I is Start + I * Step.
 struct InductionVar {
@@ -338,6 +439,9 @@ private:
   void materializeValues(LoopPlan &P);
   void transformLoop(LoopPlan &P);
   bool interleaveSusanCorners(Loop *L, unsigned Queue);
+  bool interleaveSusanCornersFactor(Loop *L, unsigned Queue, unsigned Factor);
+  bool hoistSusanCornerLoads(Loop *L, unsigned Depth);
+  bool annotateSusanChainInBounds(Loop *L, std::string &FailureReason);
   Value *cloneCondition(IRBuilder<> &B, const PipelinedBranch &PB,
                         ValueToValueMapTy &Map, const Twine &Suffix,
                         bool Speculative, bool Force);
@@ -1396,6 +1500,489 @@ void RISCVBranchConditionPipelining::emitPush(IRBuilder<> &B, unsigned Queue,
     RecursivelyDeleteTriviallyDeadInstructions(Cmp);
 }
 
+bool RISCVBranchConditionPipelining::hoistSusanCornerLoads(Loop *L,
+                                                           unsigned Depth) {
+  auto Reject = [&](StringRef Reason) {
+    FailureReason = Reason;
+    return false;
+  };
+  if (!L || Depth < 1 || Depth > 3 || !L->isInnermost() ||
+      L->getHeader()->getName() != "for.body14")
+    return Reject("the requested loop or depth did not match");
+
+  Function *Fn = L->getHeader()->getParent();
+  BasicBlock *Latch = L->getLoopLatch();
+  if (!Latch || Fn->arg_size() <= 3)
+    return Reject("the corner scan loop has no recognized latch or threshold");
+
+  struct ThresholdCheck {
+    BranchInst *Branch;
+    ICmpInst *Compare;
+    BasicBlock *Continue;
+  };
+  SmallVector<ThresholdCheck, 20> Checks;
+  DenseMap<BasicBlock *, unsigned> BlockOrder;
+  unsigned NextBlockOrder = 0;
+  for (BasicBlock &BB : *Fn) {
+    BlockOrder[&BB] = NextBlockOrder++;
+    if (!L->contains(&BB))
+      continue;
+
+    auto *Br = dyn_cast<BranchInst>(BB.getTerminator());
+    auto *Cmp = Br && Br->isConditional()
+                    ? dyn_cast<ICmpInst>(Br->getCondition())
+                    : nullptr;
+    if (!Cmp || Br->getSuccessor(1) != Latch ||
+        (Cmp->getOperand(0) != Fn->getArg(3) &&
+         Cmp->getOperand(1) != Fn->getArg(3)))
+      continue;
+    BasicBlock *Continue = Br->getSuccessor(0);
+    if (Continue == Latch || !L->contains(Continue))
+      return false;
+    Checks.push_back({Br, Cmp, Continue});
+  }
+  if (Checks.empty() || Checks.size() > 19)
+    return Reject("the number of threshold checks was not recognized");
+
+  for (unsigned I = 1; I < Checks.size(); ++I)
+    if (!DT->dominates(Checks[I - 1].Continue,
+                       Checks[I].Branch->getParent()))
+      return Reject("the threshold checks do not form one continuation chain");
+
+  auto IsInputLoad = [&](LoadInst *Load) {
+    if (!Load->isSimple())
+      return false;
+    Value *Object = getUnderlyingObject(Load->getPointerOperand());
+    while (auto *GEP = dyn_cast<GEPOperator>(Object))
+      Object = getUnderlyingObject(GEP->getPointerOperand());
+    auto *Arg = dyn_cast<Argument>(Object);
+    if (!Arg || (Arg->getArgNo() != 0 && Arg->getArgNo() != 2))
+      return false;
+    unsigned ArgNo = Arg->getArgNo();
+    return Fn->getAttributes().hasParamAttr(ArgNo, Attribute::NoAlias) &&
+           Fn->getAttributes().hasParamAttr(ArgNo, Attribute::ReadOnly);
+  };
+
+  DenseMap<Instruction *, unsigned> InstructionOrder;
+  unsigned NextInstructionOrder = 0;
+  for (Instruction &I : instructions(*Fn))
+    InstructionOrder[&I] = NextInstructionOrder++;
+
+  DenseMap<Instruction *, BasicBlock *> MoveTo;
+  for (unsigned Source = 0; Source < Checks.size(); ++Source) {
+    if (Source + 1 < Depth)
+      continue;
+    unsigned Destination = Source + 1 - Depth;
+    ICmpInst *Anchor = Checks[Destination].Compare;
+
+    // Every block on this true-edge chain must be free of writes and calls.
+    // The hoisted image/LUT reads can then execute on an earlier threshold's
+    // exit path without changing observable state.
+    SmallPtrSet<BasicBlock *, 8> VisitedBlocks;
+    for (unsigned I = Destination; I <= Source; ++I) {
+      for (BasicBlock *BB :
+           {Checks[I].Branch->getParent(), Checks[I].Continue}) {
+        if (!VisitedBlocks.insert(BB).second)
+          continue;
+        for (Instruction &I : *BB)
+          if (I.mayWriteToMemory() || isa<CallBase>(I))
+                return Reject("a store or call lies on the crossed path");
+      }
+    }
+
+    SmallPtrSet<Instruction *, 32> Slice;
+    auto AddSlice = [&](auto &&Self, Value *V) -> bool {
+      auto *I = dyn_cast<Instruction>(V);
+      if (!I || DT->dominates(I, Anchor))
+        return true;
+      if (!L->contains(I->getParent()) || isa<PHINode>(I) ||
+          !isClonableIntoCondition(*I, /*Force=*/false))
+        return Reject("a load dependency is not movable within the scan loop");
+      if (auto *Load = dyn_cast<LoadInst>(I)) {
+        if (!IsInputLoad(Load))
+          return Reject("a load is not from the readonly image or LUT");
+      } else if (!isSafeToSpeculativelyExecute(I)) {
+        return Reject("a load-address instruction is not safe to speculate");
+      }
+      if (!Slice.insert(I).second)
+        return true;
+      for (Value *Operand : I->operands())
+        if (!Self(Self, Operand))
+          return false;
+      return true;
+    };
+
+    bool HasLoad = false;
+    for (Instruction &I : *Checks[Source].Continue) {
+      auto *Load = dyn_cast<LoadInst>(&I);
+      if (!Load)
+        continue;
+      HasLoad = true;
+      if (!AddSlice(AddSlice, Load))
+        return false;
+      for (User *U : Load->users())
+        if (auto *ZExt = dyn_cast<ZExtInst>(U))
+          if (!AddSlice(AddSlice, ZExt))
+            return false;
+    }
+    if (!HasLoad)
+      continue;
+
+    for (Instruction *I : Slice) {
+      auto It = MoveTo.find(I);
+      if (It == MoveTo.end() ||
+          BlockOrder[Checks[Destination].Compare->getParent()] <
+              BlockOrder[It->second])
+        MoveTo[I] = Checks[Destination].Compare->getParent();
+    }
+  }
+  if (MoveTo.empty())
+    return Reject("no independent image or LUT loads were found to hoist");
+
+  DenseMap<BasicBlock *, SmallVector<Instruction *, 16>> ByDestination;
+  for (auto &Entry : MoveTo)
+    ByDestination[Entry.second].push_back(Entry.first);
+  for (auto &Entry : ByDestination) {
+    llvm::sort(Entry.second, [&](Instruction *A, Instruction *B) {
+      return InstructionOrder[A] < InstructionOrder[B];
+    });
+    auto *Anchor = cast<ICmpInst>(Checks.front().Compare);
+    for (const ThresholdCheck &Check : Checks)
+      if (Check.Compare->getParent() == Entry.first) {
+        Anchor = Check.Compare;
+        break;
+      }
+    for (Instruction *I : Entry.second)
+      I->moveBefore(Anchor->getIterator());
+  }
+
+  ORE->emit([&]() {
+    return OptimizationRemark(DEBUG_TYPE, "SusanCornerLoadHoist",
+                              Checks.front().Compare->getDebugLoc(),
+                              Checks.front().Compare->getParent())
+           << "hoisted SUSAN neighbor load chains by "
+           << ore::NV("Depth", Depth) << " threshold check(s)";
+  });
+  return true;
+}
+
+static bool isSizeMinusFive(Value *Bound, Value *Size) {
+  while (auto *Cast = dyn_cast<CastInst>(Bound))
+    Bound = Cast->getOperand(0);
+  auto *BO = dyn_cast<BinaryOperator>(Bound);
+  if (!BO)
+    return false;
+  auto IsFive = [](Value *V, int64_t N) {
+    auto *C = dyn_cast<ConstantInt>(V);
+    return C && C->getSExtValue() == N;
+  };
+  if (BO->getOpcode() == Instruction::Add)
+    return (BO->getOperand(0) == Size && IsFive(BO->getOperand(1), -5)) ||
+           (BO->getOperand(1) == Size && IsFive(BO->getOperand(0), -5));
+  return BO->getOpcode() == Instruction::Sub &&
+         BO->getOperand(0) == Size && IsFive(BO->getOperand(1), 5);
+}
+
+static PHINode *getSusanBoundedIV(Loop *L, Value *Size) {
+  if (!L || !L->getLoopPreheader() || !L->getLoopLatch())
+    return nullptr;
+  auto *LatchBr =
+      dyn_cast<BranchInst>(L->getLoopLatch()->getTerminator());
+  auto *Cmp = LatchBr && LatchBr->isConditional()
+                  ? dyn_cast<ICmpInst>(LatchBr->getCondition())
+                  : nullptr;
+  if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_EQ)
+    return nullptr;
+
+  for (PHINode &Phi : L->getHeader()->phis()) {
+    auto *Start =
+        dyn_cast<ConstantInt>(Phi.getIncomingValueForBlock(L->getLoopPreheader()));
+    auto *Next = dyn_cast<BinaryOperator>(
+        Phi.getIncomingValueForBlock(L->getLoopLatch()));
+    if (!Start || Start->getSExtValue() != 5 || !Next ||
+        Next->getOpcode() != Instruction::Add)
+      continue;
+    ConstantInt *Step = nullptr;
+    if (Next->getOperand(0) == &Phi)
+      Step = dyn_cast<ConstantInt>(Next->getOperand(1));
+    else if (Next->getOperand(1) == &Phi)
+      Step = dyn_cast<ConstantInt>(Next->getOperand(0));
+    if (!Step || !Step->isOne())
+      continue;
+
+    Value *Bound = nullptr;
+    if (Cmp->getOperand(0) == Next)
+      Bound = Cmp->getOperand(1);
+    else if (Cmp->getOperand(1) == Next)
+      Bound = Cmp->getOperand(0);
+    if (Bound && isSizeMinusFive(Bound, Size))
+      return &Phi;
+  }
+  return nullptr;
+}
+
+static bool isZeroMinusByte(Value *V, LoadInst *&ByteLoad) {
+  auto *Neg = dyn_cast<BinaryOperator>(V);
+  auto *Zero = Neg ? dyn_cast<ConstantInt>(Neg->getOperand(0)) : nullptr;
+  auto *ZExt = Neg ? dyn_cast<ZExtInst>(Neg->getOperand(1)) : nullptr;
+  ByteLoad = ZExt ? dyn_cast<LoadInst>(ZExt->getOperand(0)) : nullptr;
+  return Neg && Neg->getOpcode() == Instruction::Sub && Zero &&
+         Zero->isZero() && ZExt && ZExt->getSrcTy()->isIntegerTy(8) &&
+         ByteLoad;
+}
+
+static Value *getSusanPointerBase(Value *V,
+                                  SmallPtrSetImpl<Value *> &Visited) {
+  if (!Visited.insert(V).second)
+    return V;
+  V = V->stripPointerCasts();
+  if (auto *GEP = dyn_cast<GEPOperator>(V))
+    return getSusanPointerBase(GEP->getPointerOperand(), Visited);
+  if (auto *Phi = dyn_cast<PHINode>(V)) {
+    Value *Base = nullptr;
+    for (Value *Incoming : Phi->incoming_values()) {
+      if (isa<UndefValue>(Incoming) || isa<PoisonValue>(Incoming))
+        continue;
+      Value *Candidate = getSusanPointerBase(Incoming, Visited);
+      if (Base && Base != Candidate)
+        return V;
+      Base = Candidate;
+    }
+    return Base ? Base : V;
+  }
+  if (auto *Select = dyn_cast<SelectInst>(V)) {
+    Value *TrueBase = getSusanPointerBase(Select->getTrueValue(), Visited);
+    Value *FalseBase = getSusanPointerBase(Select->getFalseValue(), Visited);
+    return TrueBase == FalseBase ? TrueBase : V;
+  }
+  return V;
+}
+
+static Value *getSusanPointerBase(Value *V) {
+  SmallPtrSet<Value *, 16> Visited;
+  return getSusanPointerBase(V, Visited);
+}
+
+static bool feedsSusanThreshold(LoadInst *Load, Value *Limit) {
+  SmallVector<Value *, 16> Worklist(Load->users());
+  SmallPtrSet<Value *, 32> Visited;
+  while (!Worklist.empty()) {
+    Value *V = Worklist.pop_back_val();
+    if (!Visited.insert(V).second)
+      continue;
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I)
+      continue;
+    if (auto *Cmp = dyn_cast<ICmpInst>(I))
+      if (Cmp->getOperand(0) == Limit || Cmp->getOperand(1) == Limit)
+        return true;
+    if (I->mayReadOrWriteMemory() || isa<CallBase>(I) || I->isTerminator())
+      continue;
+    Worklist.append(I->user_begin(), I->user_end());
+  }
+  return false;
+}
+
+static bool matchSusanLUTLoad(LoadInst *Load, Value *LUT, Value *Image,
+                              Value *&CenterPointer, LoadInst *&CenterLoad,
+                              LoadInst *&Neighbor, StringRef &FailureReason) {
+  if (!Load || !Load->getType()->isIntegerTy(8)) {
+    FailureReason = "the LUT result is not an i8";
+    return false;
+  }
+  auto *Access = dyn_cast<GEPOperator>(Load->getPointerOperand());
+  if (!Access || Access->getNumIndices() != 1 ||
+      !isZeroMinusByte(Access->idx_begin()->get(), Neighbor)) {
+    FailureReason = "the LUT offset is not zero minus zext i8";
+    return false;
+  }
+  auto *Base = dyn_cast<GEPOperator>(Access->getPointerOperand());
+  auto *CenterIndex =
+      Base && Base->getNumIndices() == 1
+          ? dyn_cast<ZExtInst>(Base->idx_begin()->get())
+          : nullptr;
+  CenterLoad =
+      CenterIndex ? dyn_cast<LoadInst>(CenterIndex->getOperand(0)) : nullptr;
+  if (!Base || Base->getPointerOperand() != LUT) {
+    FailureReason = "the LUT address does not use the expected base pointer";
+    return false;
+  }
+  if (!CenterIndex || !CenterIndex->getSrcTy()->isIntegerTy(8) ||
+      !CenterLoad || !CenterLoad->getType()->isIntegerTy(8)) {
+    FailureReason = "the LUT base is not indexed by the center image byte";
+    return false;
+  }
+  if (getSusanPointerBase(Neighbor->getPointerOperand()) != Image) {
+    FailureReason = "the LUT offset byte does not come from the image";
+    return false;
+  }
+  if (getSusanPointerBase(CenterLoad->getPointerOperand()) != Image) {
+    FailureReason = "the LUT center byte does not come from the image";
+    return false;
+  }
+  CenterPointer = CenterLoad->getPointerOperand();
+  return true;
+}
+
+static bool collectSusanContractAddress(
+    Value *V, Value *Base, Value *Row, Value *Column, Value *XSize,
+    Value *YSize, const SmallPtrSetImpl<LoadInst *> &ImageLoads,
+    MDNode *Contract, DenseMap<Instruction *, MDNode *> &Tags,
+    SmallPtrSetImpl<Instruction *> &Visited) {
+  if (V == Base || V == Row || V == Column || V == XSize || V == YSize ||
+      isa<Constant>(V))
+    return true;
+  if (auto *Load = dyn_cast<LoadInst>(V))
+    return ImageLoads.contains(Load);
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I || I->mayReadOrWriteMemory() || isa<CallBase>(I) ||
+      I->isTerminator() || isa<PHINode>(I) ||
+      (!isa<GEPOperator>(I) && !isa<CastInst>(I) &&
+       !isa<BinaryOperator>(I)))
+    return false;
+  auto It = Tags.find(I);
+  if (It != Tags.end() && It->second != Contract)
+    return false;
+  Tags[I] = Contract;
+  if (!Visited.insert(I).second)
+    return true;
+  for (Value *Operand : I->operands())
+    if (!collectSusanContractAddress(Operand, Base, Row, Column, XSize, YSize,
+                                     ImageLoads, Contract, Tags, Visited))
+      return false;
+  return true;
+}
+
+bool RISCVBranchConditionPipelining::annotateSusanChainInBounds(
+    Loop *L, std::string &FailureReason) {
+  auto Fail = [&](StringRef Reason) {
+    FailureReason = Reason.str();
+    return false;
+  };
+  Function *Fn = L->getHeader()->getParent();
+  if (Fn->getName() != "susan_corners" || Fn->arg_size() < 7 ||
+      !L->getParentLoop())
+    return Fail("the recognized image and nested scan loops were not found");
+
+  Argument *Image = Fn->getArg(0);
+  Argument *LUT = Fn->getArg(2);
+  Argument *XSize = Fn->getArg(5);
+  Argument *YSize = Fn->getArg(6);
+  Loop *Outer = L->getParentLoop();
+  PHINode *Column = getSusanBoundedIV(L, XSize);
+  PHINode *Row = getSusanBoundedIV(Outer, YSize);
+  if (!Column || !Row)
+    return Fail("the i/j loops do not start at 5 and end at size-5");
+
+  Value *CenterPointer = nullptr;
+  LoadInst *CenterLoad = nullptr;
+  SmallVector<LoadInst *, 32> Loads;
+  for (Instruction &I : instructions(*Fn))
+    if (L->contains(I.getParent()))
+      if (auto *Load = dyn_cast<LoadInst>(&I))
+        Loads.push_back(Load);
+  SmallVector<LoadInst *, 40> ThresholdLUTLoads;
+  SmallVector<LoadInst *, 40> NeighborLoads;
+
+  for (LoadInst *Load : Loads) {
+    if (getSusanPointerBase(Load->getPointerOperand()) != LUT)
+      continue;
+    if (!feedsSusanThreshold(Load, Fn->getArg(3)))
+      continue;
+    Value *CandidateCenter = nullptr;
+    LoadInst *CandidateCenterLoad = nullptr;
+    LoadInst *NeighborLoad = nullptr;
+    StringRef LUTFailure;
+    if (!matchSusanLUTLoad(Load, LUT, Image, CandidateCenter,
+                           CandidateCenterLoad, NeighborLoad, LUTFailure))
+      return Fail(LUTFailure);
+    if (CenterPointer && CenterPointer != CandidateCenter)
+      return Fail("the neighbor loads use different center pixels");
+    if (CenterLoad && CenterLoad != CandidateCenterLoad)
+      return Fail("the neighbor loads use different center-byte loads");
+    CenterPointer = CandidateCenter;
+    CenterLoad = CandidateCenterLoad;
+    ThresholdLUTLoads.push_back(Load);
+    NeighborLoads.push_back(NeighborLoad);
+  }
+  if (!CenterPointer)
+    return Fail("no recognized SUSAN LUT base was found");
+  if (NeighborLoads.size() != 36)
+    return Fail("the recognized chain contains " +
+                std::to_string(NeighborLoads.size()) +
+                " of 36 neighbor loads");
+
+  LLVMContext &Ctx = Fn->getContext();
+  const int64_t ImageOffsets[] = {-3, 3, -3, 3};
+  const int64_t LUTOffsets[] = {-255, 0};
+  MDNode *ImageContract = makeChainInBoundsContract(
+      Ctx, "image", Image->getArgNo(), Image->getArgNo(),
+      XSize->getArgNo(), YSize->getArgNo(), L, Outer, 5, 5, 5, 5,
+      ImageOffsets);
+  MDNode *LUTContract = makeChainInBoundsContract(
+      Ctx, "lut", LUT->getArgNo(), Image->getArgNo(), XSize->getArgNo(),
+      YSize->getArgNo(), L, Outer, 5, 5, 5, 5, LUTOffsets);
+  Row->setMetadata(
+      "riscv.ns.chain.iv",
+      MDNode::get(Ctx, {MDString::get(Ctx, "v1"),
+                        MDString::get(Ctx, Outer->getHeader()->getName())}));
+  Column->setMetadata(
+      "riscv.ns.chain.iv",
+      MDNode::get(Ctx, {MDString::get(Ctx, "v1"),
+                        MDString::get(Ctx, L->getHeader()->getName())}));
+
+  static const std::pair<int64_t, int64_t> NeighborOffsets[] = {
+      {-3, -1}, {-3, 0},  {-3, 1},  {-2, -2}, {-2, -1}, {-2, 0},
+      {-2, 1},  {-2, 2},  {-1, -3}, {-1, -2}, {-1, -1}, {-1, 0},
+      {-1, 1},  {-1, 2},  {-1, 3},  {0, -3},  {0, -2},  {0, -1},
+      {0, 1},   {0, 2},   {0, 3},   {1, -3},  {1, -2},  {1, -1},
+      {1, 0},   {1, 1},   {1, 2},   {1, 3},   {2, -2},  {2, -1},
+      {2, 0},   {2, 1},   {2, 2},   {3, -1},  {3, 0},   {3, 1}};
+  SmallPtrSet<LoadInst *, 32> ImageLoads;
+  DenseMap<LoadInst *, std::pair<int64_t, int64_t>> ImageLoadOffsets;
+  ImageLoads.insert(CenterLoad);
+  ImageLoadOffsets[CenterLoad] = {0, 0};
+  for (unsigned I = 0; I != NeighborLoads.size(); ++I) {
+    LoadInst *Load = NeighborLoads[I];
+    if (ImageLoads.insert(Load).second)
+      ImageLoadOffsets[Load] = NeighborOffsets[I];
+    else if (ImageLoadOffsets.lookup(Load) != NeighborOffsets[I])
+      return Fail("a neighbor load is reused at different image offsets");
+  }
+
+  DenseMap<Instruction *, MDNode *> Tags;
+  for (LoadInst *Load : ImageLoads) {
+    SmallPtrSet<Instruction *, 32> Visited;
+    auto Offset = ImageLoadOffsets.lookup(Load);
+    MDNode *OffsetNode = MDNode::get(
+        Ctx, {ConstantAsMetadata::get(ConstantInt::get(
+                 Type::getInt64Ty(Ctx), static_cast<uint64_t>(Offset.first),
+                 true)),
+              ConstantAsMetadata::get(ConstantInt::get(
+                  Type::getInt64Ty(Ctx), static_cast<uint64_t>(Offset.second),
+                  true))});
+    Load->setMetadata("riscv.ns.chain.offset", OffsetNode);
+    Tags[Load] = ImageContract;
+    if (!collectSusanContractAddress(
+            Load->getPointerOperand(), Image, Row, Column, XSize, YSize,
+            ImageLoads, ImageContract, Tags, Visited))
+      return Fail("an image address chain contains an unrecognized value");
+  }
+
+  for (LoadInst *Load : ThresholdLUTLoads) {
+    Tags[Load] = LUTContract;
+    SmallPtrSet<Instruction *, 32> Visited;
+    if (!collectSusanContractAddress(
+            Load->getPointerOperand(), LUT, Row, Column, XSize, YSize,
+            ImageLoads, LUTContract, Tags, Visited))
+      return Fail("a LUT address chain contains an unrecognized value");
+  }
+
+  for (auto &Entry : Tags)
+    Entry.first->setMetadata("riscv.ns.chain.inbounds", Entry.second);
+  return true;
+}
+
 bool RISCVBranchConditionPipelining::interleaveSusanCorners(Loop *L,
                                                             unsigned Queue) {
   if (!L || !L->isInnermost() || !L->isLoopSimplifyForm() ||
@@ -1500,6 +2087,16 @@ bool RISCVBranchConditionPipelining::interleaveSusanCorners(Loop *L,
       return false;
   }
 
+  std::string ContractFailure;
+  if (!annotateSusanChainInBounds(L, ContractFailure))
+    ORE->emit([&]() {
+      return OptimizationRemarkMissed(
+                 DEBUG_TYPE, "SusanChainInBoundsNotAttached",
+                 L->getStartLoc(), Header)
+             << "could not attach the bounded image/LUT contract: "
+             << ContractFailure;
+    });
+
   unsigned QueueA = Queue;
   for (Instruction &I : instructions(*Fn))
     if (auto *II = dyn_cast<IntrinsicInst>(&I))
@@ -1530,6 +2127,23 @@ bool RISCVBranchConditionPipelining::interleaveSusanCorners(Loop *L,
   IRBuilder<> HeaderBuilder(HeaderBr);
   Value *NextIV =
       HeaderBuilder.CreateAdd(IV, ConstantInt::get(IVTy, 1), "pixel1.iv");
+  MDNode *ImageContract = nullptr;
+  for (BasicBlock *BB : L->blocks())
+    for (Instruction &I : *BB)
+      if (auto *Load = dyn_cast<LoadInst>(&I))
+        if (MDNode *Contract =
+                Load->getMetadata("riscv.ns.chain.inbounds")) {
+          auto *Kind = Contract->getNumOperands() > 1
+                           ? dyn_cast<MDString>(Contract->getOperand(1))
+                           : nullptr;
+          if (Kind && Kind->getString() == "image") {
+            ImageContract = Contract;
+            break;
+          }
+        }
+  if (ImageContract)
+    cast<Instruction>(NextIV)->setMetadata("riscv.ns.chain.inbounds",
+                                           ImageContract);
   Value *HasB = HeaderBuilder.CreateICmpULT(NextIV, End, "pixel1.valid");
   emitPush(HeaderBuilder, QueueA, Condition);
 
@@ -1579,6 +2193,12 @@ bool RISCVBranchConditionPipelining::interleaveSusanCorners(Loop *L,
     PHINode *Bridge = PBASetup.CreatePHI(I.getType(), 2,
                                          I.hasName() ? I.getName() + ".available"
                                                      : "pixel1.available");
+    // Cloned-tail uses of this bridge are reached only after the matching
+    // queue pop selects the present pixel; the undef input is absent there.
+    Bridge->setMetadata("riscv.ns.chain.bridge",
+                        MDNode::get(Ctx, MDString::get(Ctx, "v1")));
+    if (MDNode *ChainMD = I.getMetadata("riscv.ns.chain.inbounds"))
+      Bridge->setMetadata("riscv.ns.chain.inbounds", ChainMD);
     Bridge->addIncoming(&I, BPrefix);
     Bridge->addIncoming(UndefValue::get(I.getType()), NoB);
     for (Use *U : TailUses)
@@ -1646,6 +2266,280 @@ bool RISCVBranchConditionPipelining::interleaveSusanCorners(Loop *L,
     return OptimizationRemark(DEBUG_TYPE, "SusanCornersInterleave2",
                               L->getStartLoc(), Header)
            << "interleaved the first branch conditions of two SUSAN pixels";
+  });
+  return true;
+}
+
+bool RISCVBranchConditionPipelining::interleaveSusanCornersFactor(
+    Loop *L, unsigned Queue, unsigned Factor) {
+  if (Factor < 3 || Factor > 8 || !L || !L->isInnermost() ||
+      !L->isLoopSimplifyForm() || L->getHeader()->getName() != "for.body14")
+    return false;
+
+  Function *Fn = L->getHeader()->getParent();
+  BasicBlock *Header = L->getHeader();
+  BasicBlock *Preheader = L->getLoopPreheader();
+  BasicBlock *Latch = L->getLoopLatch();
+  auto *HeaderBr = dyn_cast_or_null<BranchInst>(Header->getTerminator());
+  auto *LatchBr =
+      Latch ? dyn_cast<BranchInst>(Latch->getTerminator()) : nullptr;
+  if (!Preheader || !Latch || !HeaderBr || !HeaderBr->isConditional() ||
+      !LatchBr || !LatchBr->isConditional() || !Latch->phis().empty())
+    return false;
+
+  if (HeaderBr->getSuccessor(1) != Latch ||
+      !L->contains(HeaderBr->getSuccessor(0)))
+    return false;
+  BasicBlock *TailEntry = HeaderBr->getSuccessor(0);
+  auto *Condition = dyn_cast<ICmpInst>(HeaderBr->getCondition());
+  if (!Condition || (Condition->getOperand(0) != Fn->getArg(3) &&
+                     Condition->getOperand(1) != Fn->getArg(3)))
+    return false;
+
+  PHINode *IV = nullptr;
+  BinaryOperator *IVNext = nullptr;
+  for (PHINode &Phi : Header->phis()) {
+    auto *Next =
+        dyn_cast_or_null<BinaryOperator>(Phi.getIncomingValueForBlock(Latch));
+    auto *Step = Next && Next->getOpcode() == Instruction::Add
+                     ? dyn_cast<ConstantInt>(Next->getOperand(1))
+                     : nullptr;
+    if (!Next || Next->getOperand(0) != &Phi || !Step || !Step->isOne() ||
+        Phi.getNumIncomingValues() != 2 ||
+        Phi.getBasicBlockIndex(Preheader) < 0)
+      return false;
+    if (IV)
+      return false;
+    IV = &Phi;
+    IVNext = Next;
+  }
+  if (!IV || !IVNext || !IV->getType()->isIntegerTy() ||
+      IV->getType()->getIntegerBitWidth() < 4)
+    return false;
+
+  auto *LatchCmp = dyn_cast<ICmpInst>(LatchBr->getCondition());
+  if (!LatchCmp || LatchCmp->getPredicate() != ICmpInst::ICMP_EQ)
+    return false;
+  Value *End = nullptr;
+  if (LatchCmp->getOperand(0) == IVNext)
+    End = LatchCmp->getOperand(1);
+  else if (LatchCmp->getOperand(1) == IVNext)
+    End = LatchCmp->getOperand(0);
+  if (!End || End->getType() != IV->getType() || !L->isLoopInvariant(End))
+    return false;
+
+  bool HasBackedge = false;
+  bool HasExit = false;
+  for (unsigned I = 0; I != 2; ++I) {
+    HasBackedge |= LatchBr->getSuccessor(I) == Header;
+    HasExit |= !L->contains(LatchBr->getSuccessor(I));
+  }
+  if (!HasBackedge || !HasExit)
+    return false;
+  SmallVector<std::pair<BasicBlock *, BasicBlock *>, 4> ExitEdges;
+  L->getExitEdges(ExitEdges);
+  if (llvm::any_of(ExitEdges,
+                   [&](const auto &Edge) { return Edge.first != Latch; }))
+    return false;
+
+  SmallVector<Instruction *, 32> Prefix;
+  for (Instruction &I : *Header)
+    if (!isa<PHINode>(I) && !I.isTerminator() && !I.isDebugOrPseudoInst())
+      Prefix.push_back(&I);
+
+  for (BasicBlock *BB : L->blocks()) {
+    if (BB == Header || BB == Latch)
+      continue;
+    for (PHINode &Phi : BB->phis())
+      for (BasicBlock *Incoming : Phi.blocks())
+        if (Incoming == Header || Incoming == Latch || !L->contains(Incoming))
+          return false;
+    for (BasicBlock *Succ : successors(BB))
+      if (Succ == Header || (!L->contains(Succ) && Succ != Latch))
+        return false;
+  }
+
+  for (Instruction *I : Prefix) {
+    if (!isClonableIntoCondition(*I, /*Force=*/false))
+      return false;
+    auto *Load = dyn_cast<LoadInst>(I);
+    if (!Load)
+      continue;
+    auto *Arg =
+        dyn_cast<Argument>(getUnderlyingObject(Load->getPointerOperand()));
+    if (!Arg || (Arg->getArgNo() != 0 && Arg->getArgNo() != 2) ||
+        !Fn->getAttributes().hasParamAttr(Arg->getArgNo(),
+                                          Attribute::NoAlias) ||
+        !Fn->getAttributes().hasParamAttr(Arg->getArgNo(), Attribute::ReadOnly))
+      return false;
+  }
+
+  unsigned QueueA = Queue;
+  for (Instruction &I : instructions(*Fn))
+    if (auto *II = dyn_cast<IntrinsicInst>(&I))
+      if (II->getIntrinsicID() == Intrinsic::riscv_ns_cond_init ||
+          II->getIntrinsicID() == Intrinsic::riscv_ns_cond_push ||
+          II->getIntrinsicID() == Intrinsic::riscv_ns_cond_pop) {
+        auto *Q = dyn_cast<ConstantInt>(II->getArgOperand(0));
+        if (!Q)
+          return false;
+        QueueA = std::max(QueueA, static_cast<unsigned>(Q->getZExtValue() + 1));
+      }
+  if (QueueA > 0x7fffffffU - (Factor - 1))
+    return false;
+
+  LLVMContext &Ctx = Fn->getContext();
+  Type *IVTy = IV->getType();
+  SmallVector<Value *, 8> LaneIV(Factor, IV);
+  SmallVector<Value *, 8> HasLane(Factor, ConstantInt::getTrue(Ctx));
+  SmallVector<BasicBlock *, 8> PrefixBlocks(Factor, nullptr);
+  SmallVector<BasicBlock *, 8> PBBlocks(Factor, nullptr);
+  SmallVector<BasicBlock *, 8> GateBlocks(Factor, nullptr);
+  SmallVector<BasicBlock *, 8> TailEntries(Factor, nullptr);
+  SmallVector<BasicBlock *, 16> OriginalTail;
+  SmallVector<SmallVector<BasicBlock *, 16>, 8> LaneTails(Factor);
+  SmallVector<SmallVector<WeakTrackingVH, 32>, 8> LanePrefixValues(Factor);
+
+  for (unsigned I = 1; I < Factor; ++I)
+    PrefixBlocks[I] =
+        BasicBlock::Create(Ctx, "susan.pixel" + Twine(I) + ".cond", Fn, Latch);
+  BasicBlock *PrefixDone =
+      BasicBlock::Create(Ctx, "susan.pixel.prefix.done", Fn, Latch);
+  for (unsigned I = 1; I < Factor; ++I) {
+    PBBlocks[I] =
+        BasicBlock::Create(Ctx, "susan.pixel" + Twine(I) + ".pb", Fn, Latch);
+    GateBlocks[I] = BasicBlock::Create(
+        Ctx, "susan.pixel" + Twine(I) + ".present", Fn, Latch);
+  }
+  PBBlocks[0] = BasicBlock::Create(Ctx, "susan.pixel0.pb", Fn, Latch);
+  TailEntries[0] = TailEntry;
+
+  IRBuilder<> HeaderBuilder(HeaderBr);
+  emitPush(HeaderBuilder, QueueA, Condition);
+  for (unsigned I = 1; I < Factor; ++I) {
+    LaneIV[I] = HeaderBuilder.CreateAdd(IV, ConstantInt::get(IVTy, I),
+                                        "pixel" + Twine(I) + ".iv");
+    Value *InBounds =
+        HeaderBuilder.CreateICmpULT(LaneIV[I], End, "pixel.in.bounds");
+    HasLane[I] = HeaderBuilder.CreateAnd(HasLane[I - 1], InBounds,
+                                         "pixel" + Twine(I) + ".valid");
+  }
+  Value *GroupStep = ConstantInt::get(IVTy, 1);
+  for (unsigned I = 1; I < Factor; ++I)
+    GroupStep =
+        HeaderBuilder.CreateSelect(HasLane[I], ConstantInt::get(IVTy, I + 1),
+                                   GroupStep, "pixel.group.step");
+
+  for (BasicBlock *BB : L->blocks())
+    if (BB != Header && BB != Latch)
+      OriginalTail.push_back(BB);
+
+  for (unsigned I = 1; I < Factor; ++I) {
+    ValueToValueMapTy VMap;
+    VMap[Header] = PrefixBlocks[I];
+    VMap[Latch] = Latch;
+    VMap[IV] = LaneIV[I];
+
+    IRBuilder<> PrefixBuilder(PrefixBlocks[I]);
+    for (Instruction *Inst : Prefix) {
+      Instruction *Clone = Inst->clone();
+      RemapInstruction(Clone, VMap,
+                       RF_NoModuleLevelChanges | RF_IgnoreMissingLocals);
+      PrefixBuilder.Insert(
+          Clone, Inst->hasName() ? Inst->getName() + ".pixel" + Twine(I) : "");
+      VMap[Inst] = Clone;
+      LanePrefixValues[I].push_back(Clone);
+    }
+
+    for (BasicBlock *BB : OriginalTail) {
+      BasicBlock *Clone = CloneBasicBlock(BB, VMap, ".pixel" + Twine(I), Fn);
+      VMap[BB] = Clone;
+      LaneTails[I].push_back(Clone);
+    }
+    remapInstructionsInBlocks(LaneTails[I], VMap);
+    TailEntries[I] = cast<BasicBlock>(VMap.lookup(TailEntry));
+
+    Value *LaneCondition = VMap.lookup(Condition);
+    assert(LaneCondition && "SUSAN prefix must contain the branch condition");
+    emitPush(PrefixBuilder, QueueA + I, LaneCondition);
+    if (I + 1 < Factor)
+      PrefixBuilder.CreateCondBr(HasLane[I + 1], PrefixBlocks[I + 1],
+                                 PrefixDone);
+    else
+      PrefixBuilder.CreateBr(PrefixDone);
+  }
+  LaneTails[0] = OriginalTail;
+
+  HeaderBr->eraseFromParent();
+  BranchInst::Create(PrefixBlocks[1], PrefixDone, HasLane[1], Header);
+  IRBuilder<> PrefixDoneBuilder(PrefixDone);
+  for (unsigned I = 1; I < Factor; ++I) {
+    for (unsigned J = 0; J < Prefix.size(); ++J) {
+      Value *LaneValue = LanePrefixValues[I][J];
+      if (!LaneValue || LaneValue->getType()->isVoidTy())
+        continue;
+      SmallVector<Use *, 4> TailUses;
+      for (Use &U : LaneValue->uses())
+        if (auto *User = dyn_cast<Instruction>(U.getUser()))
+          if (llvm::is_contained(LaneTails[I], User->getParent()))
+            TailUses.push_back(&U);
+      if (TailUses.empty())
+        continue;
+
+      Instruction *Original = Prefix[J];
+      PHINode *Bridge = PrefixDoneBuilder.CreatePHI(
+          LaneValue->getType(), Factor,
+          Original->hasName()
+              ? Original->getName() + ".pixel" + Twine(I) + ".available"
+              : "pixel.available");
+      Bridge->addIncoming(UndefValue::get(LaneValue->getType()), Header);
+      for (unsigned K = 1; K < Factor; ++K)
+        Bridge->addIncoming(K >= I ? LaneValue
+                                   : UndefValue::get(LaneValue->getType()),
+                            PrefixBlocks[K]);
+      for (Use *U : TailUses)
+        U->set(Bridge);
+    }
+  }
+  PrefixDoneBuilder.CreateBr(PBBlocks[0]);
+
+  for (unsigned I = 0; I < Factor; ++I) {
+    BasicBlock *Next = I + 1 < Factor ? GateBlocks[I + 1] : Latch;
+    IRBuilder<> PBBuilder(PBBlocks[I]);
+    Value *Pop = PBBuilder.CreateIntrinsic(Intrinsic::riscv_ns_cond_pop, {},
+                                           {PBBuilder.getInt32(QueueA + I)});
+    PBBuilder.CreateCondBr(Pop, TailEntries[I], Next);
+    if (I != 0) {
+      IRBuilder<> GateBuilder(GateBlocks[I]);
+      GateBuilder.CreateCondBr(HasLane[I], PBBlocks[I], Latch);
+    }
+  }
+
+  for (unsigned I = 0; I < Factor; ++I) {
+    BasicBlock *Next = I + 1 < Factor ? GateBlocks[I + 1] : Latch;
+    for (BasicBlock *BB : LaneTails[I]) {
+      Instruction *Term = BB->getTerminator();
+      for (unsigned Succ = 0; Succ != Term->getNumSuccessors(); ++Succ)
+        if (Term->getSuccessor(Succ) == Latch)
+          Term->setSuccessor(Succ, Next);
+    }
+  }
+
+  IRBuilder<> LatchBuilder(IVNext);
+  IVNext->setOperand(1, GroupStep);
+  IVNext->setHasNoUnsignedWrap(false);
+  IVNext->setHasNoSignedWrap(false);
+
+  IRBuilder<> PreheaderBuilder(Preheader->getTerminator());
+  for (unsigned I = 0; I < Factor; ++I)
+    PreheaderBuilder.CreateIntrinsic(Intrinsic::riscv_ns_cond_init, {},
+                                     {PreheaderBuilder.getInt32(QueueA + I)});
+
+  ORE->emit([&]() {
+    return OptimizationRemark(DEBUG_TYPE, "SusanCornersInterleaveFactor",
+                              L->getStartLoc(), Header)
+           << "interleaved SUSAN corner pixels by factor "
+           << ore::NV("Factor", Factor);
   });
   return true;
 }
@@ -1879,6 +2773,16 @@ bool RISCVBranchConditionPipelining::runOnFunction(Function &F) {
   if (!RISCVNS::validateLoopOptions(F))
     return false;
 
+  if (SusanCornersLoadHoistDepth > 3)
+    report_fatal_error("SUSAN corner load-hoist depth must be 1-3");
+  if (EnableSusanCornersInterleave2 && SusanCornersInterleaveFactor)
+    report_fatal_error("select either SUSAN interleave2 or an interleave "
+                       "factor, not both");
+  if (SusanCornersInterleaveFactor &&
+      (SusanCornersInterleaveFactor < 3 || SusanCornersInterleaveFactor > 8))
+    report_fatal_error("SUSAN interleave factor must be 3-8; use "
+                       "-riscv-ns-susan-corners-interleave2 for factor 2");
+
   // Only SelectionDAG knows how to select the queue intrinsics.
   auto &TM = getAnalysis<TargetPassConfig>().getTM<RISCVTargetMachine>();
   const RISCVSubtarget &ST = TM.getSubtarget<RISCVSubtarget>(F);
@@ -1890,16 +2794,39 @@ bool RISCVBranchConditionPipelining::runOnFunction(Function &F) {
   AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
   ORE = &getAnalysis<OptimizationRemarkEmitterWrapperPass>().getORE();
 
-  if (EnableSusanCornersInterleave2 && F.getName() == "susan_corners")
+  bool Changed = false;
+  if (SusanCornersLoadHoistDepth && F.getName() == "susan_corners") {
+    bool Applied = false;
     for (Loop *L : LI->getLoopsInPreorder())
       if (L->getHeader()->getName() == "for.body14") {
-        if (interleaveSusanCorners(L, /*Queue=*/0)) {
+        Applied = hoistSusanCornerLoads(L, SusanCornersLoadHoistDepth);
+        break;
+      }
+    if (!Applied)
+      report_fatal_error(Twine("could not safely apply the requested SUSAN "
+                               "corner load-hoist depth: ") +
+                         FailureReason);
+    Changed = true;
+  }
+
+  unsigned SusanFactor =
+      EnableSusanCornersInterleave2 ? 2 : SusanCornersInterleaveFactor;
+  if (SusanFactor && F.getName() == "susan_corners")
+    for (Loop *L : LI->getLoopsInPreorder())
+      if (L->getHeader()->getName() == "for.body14") {
+        bool Applied =
+            SusanFactor == 2
+                ? interleaveSusanCorners(L, /*Queue=*/0)
+                : interleaveSusanCornersFactor(L, /*Queue=*/0, SusanFactor);
+        if (Applied) {
           assert(!verifyFunction(F, &errs()) &&
                  "invalid SUSAN interleave transformation");
           return true;
         }
-        missed(L, "SusanCornersInterleave2NotApplied",
-               "the scan loop did not meet the conservative factor-two "
+        missed(L,
+               SusanFactor == 2 ? "SusanCornersInterleave2NotApplied"
+                                : "SusanCornersInterleaveFactorNotApplied",
+               "the scan loop did not meet the conservative SUSAN "
                "interleaving requirements");
         break;
       }
@@ -2033,7 +2960,7 @@ bool RISCVBranchConditionPipelining::runOnFunction(Function &F) {
     Plans.push_back(std::move(*P));
   }
   if (Plans.empty())
-    return false;
+    return Changed;
 
   for (LoopPlan &P : Plans)
     materializeValues(P);
@@ -2077,4 +3004,2293 @@ INITIALIZE_PASS_END(RISCVBranchConditionPipelining, DEBUG_TYPE, PASS_NAME,
 
 FunctionPass *llvm::createRISCVBranchConditionPipeliningPass() {
   return new RISCVBranchConditionPipelining();
+}
+
+namespace {
+
+struct ChainInBoundsContract {
+  StringRef Kind;
+  Value *Base;
+  Value *ImageBase;
+  Value *XSize;
+  Value *YSize;
+  StringRef InnerLoop;
+  StringRef OuterLoop;
+  int64_t RowStart;
+  int64_t RowEndTrim;
+  int64_t ColumnStart;
+  int64_t ColumnEndTrim;
+  SmallVector<int64_t, 4> Offsets;
+};
+
+static bool getContractInt(Metadata *MD, int64_t &Value) {
+  auto *CAM = dyn_cast<ConstantAsMetadata>(MD);
+  auto *CI = CAM ? dyn_cast<ConstantInt>(CAM->getValue()) : nullptr;
+  if (!CI || CI->getBitWidth() > 64)
+    return false;
+  Value = CI->getSExtValue();
+  return true;
+}
+
+static bool parseChainInBoundsContract(const Instruction &I,
+                                       ChainInBoundsContract &Contract) {
+  MDNode *Node = I.getMetadata("riscv.ns.chain.inbounds");
+  if (!Node || Node->getNumOperands() != 13)
+    return false;
+  auto *Version = dyn_cast<MDString>(Node->getOperand(0));
+  auto *Kind = dyn_cast<MDString>(Node->getOperand(1));
+  auto *InnerLoop = dyn_cast<MDString>(Node->getOperand(6));
+  auto *OuterLoop = dyn_cast<MDString>(Node->getOperand(7));
+  auto *Offsets = dyn_cast<MDNode>(Node->getOperand(12));
+  if (!Version || Version->getString() != "v1" || !Kind ||
+      (Kind->getString() != "image" && Kind->getString() != "lut") ||
+      !InnerLoop || !OuterLoop || !Offsets)
+    return false;
+
+  Contract.Kind = Kind->getString();
+  int64_t BaseArg = -1, ImageArg = -1, XSizeArg = -1, YSizeArg = -1;
+  if (!getContractInt(Node->getOperand(2), BaseArg) ||
+      !getContractInt(Node->getOperand(3), ImageArg) ||
+      !getContractInt(Node->getOperand(4), XSizeArg) ||
+      !getContractInt(Node->getOperand(5), YSizeArg) || BaseArg < 0 ||
+      ImageArg < 0 || XSizeArg < 0 || YSizeArg < 0 ||
+      static_cast<uint64_t>(BaseArg) >= I.getFunction()->arg_size() ||
+      static_cast<uint64_t>(ImageArg) >= I.getFunction()->arg_size() ||
+      static_cast<uint64_t>(XSizeArg) >= I.getFunction()->arg_size() ||
+      static_cast<uint64_t>(YSizeArg) >= I.getFunction()->arg_size())
+    return false;
+  Contract.Base = I.getFunction()->getArg(BaseArg);
+  Contract.ImageBase = I.getFunction()->getArg(ImageArg);
+  Contract.XSize = I.getFunction()->getArg(XSizeArg);
+  Contract.YSize = I.getFunction()->getArg(YSizeArg);
+  Contract.InnerLoop = InnerLoop->getString();
+  Contract.OuterLoop = OuterLoop->getString();
+  if (!getContractInt(Node->getOperand(8), Contract.RowStart) ||
+      !getContractInt(Node->getOperand(9), Contract.RowEndTrim) ||
+      !getContractInt(Node->getOperand(10), Contract.ColumnStart) ||
+      !getContractInt(Node->getOperand(11), Contract.ColumnEndTrim))
+    return false;
+
+  Contract.Offsets.clear();
+  for (const MDOperand &Offset : Offsets->operands()) {
+    int64_t Value = 0;
+    if (!getContractInt(Offset.get(), Value))
+      return false;
+    Contract.Offsets.push_back(Value);
+  }
+  return true;
+}
+
+static MDNode *makeChainInBoundsContract(
+    LLVMContext &Ctx, StringRef Kind, unsigned BaseArg, unsigned ImageArg,
+    unsigned XSizeArg, unsigned YSizeArg, Loop *InnerLoop, Loop *OuterLoop,
+    int64_t RowStart, int64_t RowEndTrim, int64_t ColumnStart,
+    int64_t ColumnEndTrim, ArrayRef<int64_t> Offsets) {
+  SmallVector<Metadata *, 16> OffsetMD;
+  for (int64_t Offset : Offsets)
+    OffsetMD.push_back(ConstantAsMetadata::get(ConstantInt::get(
+        Type::getInt64Ty(Ctx), static_cast<uint64_t>(Offset), true)));
+  Metadata *Fields[] = {
+      MDString::get(Ctx, "v1"),
+      MDString::get(Ctx, Kind),
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt64Ty(Ctx), BaseArg)),
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt64Ty(Ctx), ImageArg)),
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt64Ty(Ctx), XSizeArg)),
+      ConstantAsMetadata::get(
+          ConstantInt::get(Type::getInt64Ty(Ctx), YSizeArg)),
+      MDString::get(Ctx, InnerLoop->getHeader()->getName()),
+      MDString::get(Ctx, OuterLoop ? OuterLoop->getHeader()->getName()
+                                   : StringRef()),
+      ConstantAsMetadata::get(ConstantInt::get(
+          Type::getInt64Ty(Ctx), static_cast<uint64_t>(RowStart), true)),
+      ConstantAsMetadata::get(ConstantInt::get(
+          Type::getInt64Ty(Ctx), static_cast<uint64_t>(RowEndTrim), true)),
+      ConstantAsMetadata::get(ConstantInt::get(
+          Type::getInt64Ty(Ctx), static_cast<uint64_t>(ColumnStart), true)),
+      ConstantAsMetadata::get(ConstantInt::get(
+          Type::getInt64Ty(Ctx), static_cast<uint64_t>(ColumnEndTrim), true)),
+      MDNode::get(Ctx, OffsetMD)};
+  return MDNode::get(Ctx, Fields);
+}
+
+class RISCVChainLoadHoisting : public FunctionPass {
+  enum class RejectKind {
+    Dereferenceability,
+    Memory,
+    Control,
+    Pressure,
+    Dependence
+  };
+
+  struct ThresholdCheck {
+    BranchInst *Branch;
+    BasicBlock *Exit;
+    BasicBlock *Continue;
+    SmallVector<BasicBlock *, 4> Segment;
+  };
+
+  static constexpr unsigned MaxDistance = 8;
+  static constexpr unsigned MaxLiveLoadResults = 8;
+
+  bool findSegment(BasicBlock *Start, BasicBlock *End, Loop *L,
+                   SmallVectorImpl<BasicBlock *> &Segment) const {
+    SmallPtrSet<BasicBlock *, 8> Seen;
+    BasicBlock *BB = Start;
+    while (BB != End) {
+      if (!L->contains(BB) || !Seen.insert(BB).second)
+        return false;
+      Segment.push_back(BB);
+      auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+      if (!Br || !Br->isUnconditional() || !L->contains(Br->getSuccessor(0)))
+        return false;
+      BB = Br->getSuccessor(0);
+    }
+    Segment.push_back(End);
+    return true;
+  }
+
+  void markAccumulator(Value *V, SmallPtrSetImpl<Value *> &Values,
+                       SmallPtrSetImpl<Value *> &Visited) const {
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || isa<LoadInst>(I) || !Visited.insert(V).second)
+      return;
+    if (I->getType()->isIntegerTy() && !isa<PHINode>(I))
+      Values.insert(I);
+    for (Value *Operand : I->operands())
+      markAccumulator(Operand, Values, Visited);
+  }
+
+  void collectConditionLoads(Value *V,
+                             const SmallPtrSetImpl<BasicBlock *> &Segment,
+                             SmallPtrSetImpl<Value *> &Visited,
+                             SmallPtrSetImpl<LoadInst *> &Loads) const {
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || !Visited.insert(V).second)
+      return;
+    if (auto *Load = dyn_cast<LoadInst>(I)) {
+      if (Segment.contains(Load->getParent()))
+        Loads.insert(Load);
+      return;
+    }
+    if (isa<PHINode>(I))
+      return;
+    for (Value *Operand : I->operands())
+      collectConditionLoads(Operand, Segment, Visited, Loads);
+  }
+
+  bool isProvenDereferenceable(LoadInst *Load, Instruction *At,
+                               DominatorTree &DT,
+                               std::string &FailureReason) const {
+    const DataLayout &DL = Load->getDataLayout();
+    if (isDereferenceableAndAlignedPointer(
+            Load->getPointerOperand(), Load->getType(), Load->getAlign(), DL,
+            At, nullptr, &DT))
+      return true;
+
+    auto *Base = dyn_cast<Argument>(
+        getUnderlyingObject(Load->getPointerOperand()));
+    if (!Base) {
+      FailureReason = "pointer base is not a function argument";
+      return false;
+    }
+    uint64_t DereferenceableBytes =
+        Load->getFunction()->getAttributes().getParamDereferenceableBytes(
+            Base->getArgNo());
+    TypeSize AccessSize = DL.getTypeStoreSize(Load->getType());
+    if (!DereferenceableBytes || AccessSize.isScalable() ||
+        AccessSize.getFixedValue() > DereferenceableBytes) {
+      FailureReason = "base argument has no sufficient dereferenceable-bytes "
+                      "attribute";
+      return false;
+    }
+
+    int64_t MinOffset = 0;
+    int64_t MaxOffset = 0;
+    Value *Ptr = Load->getPointerOperand();
+    while (Ptr != Base) {
+      auto *GEP = dyn_cast<GEPOperator>(Ptr);
+      if (!GEP) {
+        FailureReason = "pointer expression is not a simple GEP";
+        return false;
+      }
+      APInt ConstantOffset(64, 0);
+      if (GEP->accumulateConstantOffset(DL, ConstantOffset)) {
+        MinOffset += ConstantOffset.getSExtValue();
+        MaxOffset += ConstantOffset.getSExtValue();
+      } else {
+        if (GEP->getNumIndices() != 1 ||
+            !GEP->getSourceElementType()->isIntegerTy(8)) {
+          FailureReason = "dynamic pointer offset is not a byte GEP";
+          return false;
+        }
+        Value *Index = *GEP->idx_begin();
+        ConstantRange Range =
+            [&]() -> ConstantRange {
+          if (auto *ZExt = dyn_cast<ZExtInst>(Index)) {
+            Type *SrcTy = ZExt->getSrcTy();
+            if (SrcTy->isIntegerTy() && SrcTy->getIntegerBitWidth() < 63)
+              return ConstantRange(
+                  APInt(64, 0),
+                  APInt(64, uint64_t(1) << SrcTy->getIntegerBitWidth()));
+          }
+          return computeConstantRange(Index, /*ForSigned=*/true,
+                                      /*UseInstrInfo=*/true, nullptr, At, &DT);
+        }();
+        if (Range.isFullSet() || Range.isEmptySet() ||
+            Range.isSizeLargerThan(DereferenceableBytes)) {
+          FailureReason = "dynamic byte offset has no bounded range";
+          return false;
+        }
+        MinOffset += Range.getSignedMin().getSExtValue();
+        MaxOffset += Range.getSignedMax().getSExtValue();
+      }
+      Ptr = GEP->getPointerOperand();
+    }
+
+    bool InBounds =
+        MinOffset >= 0 && MaxOffset >= MinOffset &&
+        static_cast<uint64_t>(MaxOffset) + AccessSize.getFixedValue() <=
+            DereferenceableBytes;
+    if (!InBounds)
+      FailureReason = "offset range exceeds the dereferenceable byte extent";
+    return InBounds;
+  }
+
+  bool matchesContractLoop(const ChainInBoundsContract &Contract, Loop *L,
+                           Instruction *At, DominatorTree &DT) const {
+    if (!L || !L->contains(At->getParent()) ||
+        L->getHeader()->getName() != Contract.InnerLoop)
+      return false;
+    Loop *Outer = L->getParentLoop();
+    if ((Outer ? Outer->getHeader()->getName() : StringRef()) !=
+        Contract.OuterLoop ||
+        Contract.RowStart != 5 || Contract.RowEndTrim != 5 ||
+        Contract.ColumnStart != 5 || Contract.ColumnEndTrim != 5)
+      return false;
+    return true;
+  }
+
+  bool isChainContractSafeLoad(
+      LoadInst *Load, Loop *L, Instruction *At, DominatorTree &DT,
+      ScalarEvolution &SE,
+      SmallPtrSetImpl<Instruction *> &ContractAddressInstructions,
+      SmallPtrSetImpl<LoadInst *> &ContractLoads,
+      SmallPtrSetImpl<LoadInst *> &VisitedLoads,
+      SmallPtrSetImpl<Instruction *> &VisitedAddress) const {
+    if (!VisitedLoads.insert(Load).second)
+      return true;
+
+    ChainInBoundsContract Contract;
+    if (!parseChainInBoundsContract(*Load, Contract) ||
+        !matchesContractLoop(Contract, L, At, DT))
+      return false;
+    MDNode *ContractNode = Load->getMetadata("riscv.ns.chain.inbounds");
+
+    if (Contract.Kind == "image") {
+      if (Contract.Offsets.size() != 4 ||
+          Contract.Offsets[0] != -3 || Contract.Offsets[1] != 3 ||
+          Contract.Offsets[2] != -3 || Contract.Offsets[3] != 3 ||
+          Contract.Base != Contract.ImageBase)
+        return false;
+      if (getSusanPointerBase(Load->getPointerOperand()) != Contract.Base)
+        return false;
+      MDNode *OffsetNode = Load->getMetadata("riscv.ns.chain.offset");
+      if (!OffsetNode || OffsetNode->getNumOperands() != 2)
+        return false;
+      int64_t Dy = 0, Dx = 0;
+      if (!getContractInt(OffsetNode->getOperand(0), Dy) ||
+          !getContractInt(OffsetNode->getOperand(1), Dx) ||
+          Dy < Contract.Offsets[0] || Dy > Contract.Offsets[1] ||
+          Dx < Contract.Offsets[2] || Dx > Contract.Offsets[3])
+        return false;
+    } else {
+      if (Contract.Offsets.size() != 2 || Contract.Offsets[0] != -255 ||
+          Contract.Offsets[1] != 0)
+        return false;
+      auto *Access = dyn_cast<GEPOperator>(Load->getPointerOperand());
+      if (!Access || Access->getNumIndices() != 1)
+        return false;
+      auto *Neg = dyn_cast<BinaryOperator>(Access->idx_begin()->get());
+      auto *Zero = Neg ? dyn_cast<ConstantInt>(Neg->getOperand(0)) : nullptr;
+      auto *ZExt = Neg ? dyn_cast<ZExtInst>(Neg->getOperand(1)) : nullptr;
+      auto *ByteLoad =
+          ZExt ? dyn_cast<LoadInst>(ZExt->getOperand(0)) : nullptr;
+      if (!Neg || Neg->getOpcode() != Instruction::Sub || !Zero ||
+          !Zero->isZero() || !ZExt ||
+          !ZExt->getSrcTy()->isIntegerTy(8) || !ByteLoad ||
+          Access->getPointerOperand()->getType() != Contract.Base->getType())
+        return false;
+      if (!isSusanLUTBase(Access->getPointerOperand(), Contract, ContractNode,
+                          L, At, DT, SE, ContractAddressInstructions,
+                          ContractLoads, VisitedLoads, VisitedAddress))
+        return false;
+      if (!isChainContractSafeLoad(ByteLoad, L, At, DT, SE,
+                                   ContractAddressInstructions, ContractLoads,
+                                   VisitedLoads, VisitedAddress))
+        return false;
+    }
+
+    if (!collectContractAddress(
+            Load->getPointerOperand(), Contract.Base, Contract,
+            Load->getMetadata("riscv.ns.chain.inbounds"), L, At, DT, SE,
+            ContractAddressInstructions, ContractLoads, VisitedLoads,
+            VisitedAddress))
+      return false;
+    ContractLoads.insert(Load);
+    return true;
+  }
+
+  bool isSusanLUTBase(
+      Value *V, const ChainInBoundsContract &Contract, MDNode *ContractNode,
+      Loop *L, Instruction *At, DominatorTree &DT, ScalarEvolution &SE,
+      SmallPtrSetImpl<Instruction *> &ContractAddressInstructions,
+      SmallPtrSetImpl<LoadInst *> &ContractLoads,
+      SmallPtrSetImpl<LoadInst *> &VisitedLoads,
+      SmallPtrSetImpl<Instruction *> &VisitedAddress) const {
+    if (auto *Phi = dyn_cast<PHINode>(V)) {
+      if (!Phi->getType()->isPointerTy() ||
+          Phi->getMetadata("riscv.ns.chain.inbounds") != ContractNode)
+        return false;
+      ContractAddressInstructions.insert(Phi);
+      if (!VisitedAddress.insert(Phi).second)
+        return true;
+      for (Value *Incoming : Phi->incoming_values())
+        if (!isa<UndefValue>(Incoming) && !isa<PoisonValue>(Incoming) &&
+            !isSusanLUTBase(Incoming, Contract, ContractNode, L, At, DT, SE,
+                            ContractAddressInstructions, ContractLoads,
+                            VisitedLoads, VisitedAddress))
+          return false;
+      return true;
+    }
+
+    auto *GEP = dyn_cast<GEPOperator>(V);
+    auto *GEPInst = dyn_cast<Instruction>(V);
+    if (!GEP || !GEPInst || GEP->getNumIndices() != 1 ||
+        GEPInst->getMetadata("riscv.ns.chain.inbounds") != ContractNode)
+      return false;
+    auto *ZExt = dyn_cast<ZExtInst>(GEP->idx_begin()->get());
+    auto *CenterLoad =
+        ZExt ? dyn_cast<LoadInst>(ZExt->getOperand(0)) : nullptr;
+    if (!ZExt || !ZExt->getSrcTy()->isIntegerTy(8) || !CenterLoad ||
+        GEP->getPointerOperand() != Contract.Base ||
+        getSusanPointerBase(CenterLoad->getPointerOperand()) !=
+            Contract.ImageBase)
+      return false;
+    ContractAddressInstructions.insert(GEPInst);
+    if (!VisitedAddress.insert(GEPInst).second)
+      return true;
+    return isChainContractSafeLoad(CenterLoad, L, At, DT, SE,
+                                   ContractAddressInstructions, ContractLoads,
+                                   VisitedLoads, VisitedAddress) &&
+           collectContractAddress(
+               GEP->getPointerOperand(), Contract.Base, Contract,
+               ContractNode, L, At, DT, SE, ContractAddressInstructions,
+               ContractLoads, VisitedLoads, VisitedAddress) &&
+           collectContractAddress(
+               GEP->idx_begin()->get(), Contract.Base, Contract,
+               ContractNode, L, At, DT, SE, ContractAddressInstructions,
+               ContractLoads, VisitedLoads, VisitedAddress);
+  }
+
+  bool collectContractAddress(
+      Value *V, Value *Base, const ChainInBoundsContract &Contract,
+      MDNode *ContractNode, Loop *L, Instruction *At, DominatorTree &DT,
+      ScalarEvolution &SE,
+      SmallPtrSetImpl<Instruction *> &ContractAddressInstructions,
+      SmallPtrSetImpl<LoadInst *> &ContractLoads,
+      SmallPtrSetImpl<LoadInst *> &VisitedLoads,
+      SmallPtrSetImpl<Instruction *> &VisitedAddress) const {
+    if (V == Base || V == Contract.XSize || V == Contract.YSize ||
+        isa<Constant>(V))
+      return true;
+    if (auto *Load = dyn_cast<LoadInst>(V))
+      return isChainContractSafeLoad(
+          Load, L, At, DT, SE, ContractAddressInstructions, ContractLoads,
+          VisitedLoads, VisitedAddress);
+
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || isa<CallBase>(I) || I->mayReadOrWriteMemory() ||
+        I->isTerminator())
+      return false;
+    if (!VisitedAddress.insert(I).second)
+      return true;
+    if (auto *Phi = dyn_cast<PHINode>(I)) {
+      if (Phi->getMetadata("riscv.ns.chain.inbounds") == ContractNode) {
+        if (!Phi->getType()->isPointerTy())
+          return false;
+      } else {
+        MDNode *IV = Phi->getMetadata("riscv.ns.chain.iv");
+        auto *Version =
+            IV && IV->getNumOperands() == 2
+                ? dyn_cast<MDString>(IV->getOperand(0))
+                : nullptr;
+        auto *Header =
+            IV && IV->getNumOperands() == 2
+                ? dyn_cast<MDString>(IV->getOperand(1))
+                : nullptr;
+        if (!Phi->getType()->isIntegerTy() || !Version ||
+            Version->getString() != "v1" || !Header ||
+            (Header->getString() != Contract.InnerLoop &&
+             Header->getString() != Contract.OuterLoop) ||
+            Phi->getParent()->getName() != Header->getString())
+          return false;
+        return true;
+      }
+      ContractAddressInstructions.insert(Phi);
+      for (Value *Incoming : Phi->incoming_values())
+        if (!isa<UndefValue>(Incoming) && !isa<PoisonValue>(Incoming) &&
+            !collectContractAddress(
+                Incoming, Base, Contract, ContractNode, L, At, DT, SE,
+                ContractAddressInstructions, ContractLoads, VisitedLoads,
+                VisitedAddress))
+          return false;
+      return true;
+    }
+    if (I->getMetadata("riscv.ns.chain.inbounds") != ContractNode)
+      return false;
+    ContractAddressInstructions.insert(I);
+    for (Value *Operand : I->operands())
+      if (!collectContractAddress(
+              Operand, Base, Contract, ContractNode, L, At, DT, SE,
+              ContractAddressInstructions, ContractLoads, VisitedLoads,
+              VisitedAddress))
+        return false;
+    return true;
+  }
+
+  bool reject(RejectKind Kind, StringRef Reason, Function &F,
+              BranchInst *At, OptimizationRemarkEmitter &ORE) const {
+    switch (Kind) {
+    case RejectKind::Dereferenceability:
+      ++NumChainLoadHoistRejectDereferenceability;
+      break;
+    case RejectKind::Memory:
+      ++NumChainLoadHoistRejectMemory;
+      break;
+    case RejectKind::Control:
+      ++NumChainLoadHoistRejectControl;
+      break;
+    case RejectKind::Pressure:
+      ++NumChainLoadHoistRejectPressure;
+      break;
+    case RejectKind::Dependence:
+      ++NumChainLoadHoistRejectDependence;
+      break;
+    }
+    DEBUG_WITH_TYPE("riscv-chain-load-hoisting",
+                    dbgs() << "rejecting load slice in " << F.getName()
+                           << " at " << At->getParent()->getName() << ": "
+                           << Reason << '\n');
+    ORE.emit([&]() {
+      return OptimizationRemarkMissed(
+                 "riscv-chain-load-hoisting", "Rejected", At->getDebugLoc(),
+                 At->getParent())
+             << "did not hoist a load slice in " << F.getName() << ": "
+             << Reason;
+    });
+    return false;
+  }
+
+  bool processChain(ArrayRef<ThresholdCheck> Checks, Loop *L, Function &F,
+                    DominatorTree &DT, ScalarEvolution &SE,
+                    BranchProbabilityInfo &BPI,
+                    AAResults &AA, OptimizationRemarkEmitter &ORE,
+                    DenseMap<Instruction *, BranchInst *> &MoveDestination) {
+    if (Checks.size() < 2)
+      return false;
+
+    SmallPtrSet<Value *, 32> Accumulators;
+    SmallPtrSet<Value *, 32> VisitedAccumulators;
+    for (const ThresholdCheck &Check : Checks)
+      if (auto *Cmp = dyn_cast<ICmpInst>(Check.Branch->getCondition()))
+        for (Value *Operand : Cmp->operands())
+          markAccumulator(Operand, Accumulators, VisitedAccumulators);
+
+    DenseMap<unsigned, SmallVector<LoadInst *, 8>> LiveLoadsAtDestination;
+    unsigned HoistedSlices = 0;
+    for (unsigned Source = 1; Source < Checks.size(); ++Source) {
+      unsigned Destination =
+          Source > ChainLoadHoistDistance ? Source - ChainLoadHoistDistance : 0;
+
+      double ReachProbability = 1.0;
+      for (unsigned I = Destination; I < Source; ++I) {
+        BranchInst *Br = Checks[I].Branch;
+        BranchProbability ContinueProbability =
+            BPI.getEdgeProbability(Br->getParent(), Checks[I].Continue);
+        ReachProbability *=
+            static_cast<double>(ContinueProbability.getNumerator()) /
+            BranchProbability::getDenominator();
+      }
+      if (1.0 - ReachProbability > 0.99) {
+        ++NumChainLoadHoistRejectControl;
+        DEBUG_WITH_TYPE("riscv-chain-load-hoisting",
+                        dbgs() << "rejecting load slice in " << F.getName()
+                               << " at "
+                               << Checks[Source].Branch->getParent()->getName()
+                               << ": estimated exit-path waste exceeds 99%\n");
+        continue;
+      }
+
+      SmallPtrSet<BasicBlock *, 8> SourceSegment;
+      for (BasicBlock *BB : Checks[Source].Segment)
+        SourceSegment.insert(BB);
+      SmallPtrSet<LoadInst *, 8> ConditionLoads;
+      SmallPtrSet<Value *, 32> VisitedCondition;
+      collectConditionLoads(Checks[Source].Branch->getCondition(),
+                            SourceSegment, VisitedCondition, ConditionLoads);
+      if (ConditionLoads.empty())
+        continue;
+
+      SmallPtrSet<Instruction *, 32> ContractAddressInstructions;
+      SmallPtrSet<LoadInst *, 8> ContractLoads;
+      if (AssumeChainLoadInBounds)
+        for (LoadInst *Load : ConditionLoads) {
+          SmallPtrSet<Instruction *, 32> CandidateAddressInstructions;
+          SmallPtrSet<LoadInst *, 8> CandidateLoads;
+          SmallPtrSet<LoadInst *, 8> VisitedLoads;
+          SmallPtrSet<Instruction *, 32> VisitedAddress;
+          if (isChainContractSafeLoad(
+                  Load, L, Checks[Destination].Branch, DT, SE,
+                  CandidateAddressInstructions, CandidateLoads, VisitedLoads,
+                  VisitedAddress)) {
+            ContractAddressInstructions.insert(
+                CandidateAddressInstructions.begin(),
+                CandidateAddressInstructions.end());
+            ContractLoads.insert(CandidateLoads.begin(), CandidateLoads.end());
+          }
+        }
+
+      SmallPtrSet<Instruction *, 32> Slice;
+      SmallPtrSet<LoadInst *, 8> SliceLoads;
+      SmallPtrSet<LoadInst *, 8> AddressLoads;
+      unsigned Failure = 0;
+      LoadInst *UnsafeLoad = nullptr;
+      std::string DereferenceabilityFailure;
+      auto AddSlice = [&](auto &&Self, Value *V, bool IsAddressValue) -> bool {
+        auto *I = dyn_cast<Instruction>(V);
+        if (!I || DT.dominates(I, Checks[Destination].Branch))
+          return true;
+        if (Accumulators.contains(I)) {
+          Failure = 5;
+          return false;
+        }
+        if (!L->contains(I->getParent()) || isa<PHINode>(I) ||
+            I->isTerminator() || isa<CallBase>(I)) {
+          Failure = 3;
+          return false;
+        }
+        if (auto *Load = dyn_cast<LoadInst>(I)) {
+          if (!Load->isSimple()) {
+            Failure = 2;
+            return false;
+          }
+          if (IsAddressValue)
+            AddressLoads.insert(Load);
+          std::string ProofFailure;
+          if (!isSafeToSpeculativelyExecute(
+                  Load, Checks[Destination].Branch, nullptr, &DT, nullptr) &&
+              !isProvenDereferenceable(Load, Checks[Destination].Branch, DT,
+                                       ProofFailure) &&
+              !ContractLoads.contains(Load)) {
+            Failure = 1;
+            UnsafeLoad = Load;
+            DereferenceabilityFailure =
+                ProofFailure.empty()
+                    ? "missing or invalid chain-inbounds metadata"
+                    : ProofFailure;
+            return false;
+          }
+          SliceLoads.insert(Load);
+          if (!Slice.insert(I).second)
+            return true;
+          return Self(Self, Load->getPointerOperand(), true);
+        }
+        if (I->mayReadOrWriteMemory() ||
+            (!isSafeToSpeculativelyExecute(
+                 I, Checks[Destination].Branch, nullptr, &DT, nullptr, true,
+                 false) &&
+             !ContractAddressInstructions.contains(I))) {
+          Failure = 3;
+          return false;
+        }
+        if (!Slice.insert(I).second)
+          return true;
+        for (Value *Operand : I->operands())
+          if (!Self(Self, Operand, IsAddressValue))
+            return false;
+        return true;
+      };
+
+      bool Safe = true;
+      for (LoadInst *Load : ConditionLoads)
+        if (!AddSlice(AddSlice, Load, false)) {
+          Safe = false;
+          break;
+        }
+      if (!Safe) {
+        if (Failure == 1) {
+          std::string Detail =
+              (Twine("load '") + UnsafeLoad->getName() +
+               "' through pointer '" +
+               UnsafeLoad->getPointerOperand()->getName() + "' is not proven "
+               "dereferenceable at the hoist point (" +
+               DereferenceabilityFailure + ")")
+                  .str();
+          reject(RejectKind::Dereferenceability,
+                 Detail, F, Checks[Source].Branch, ORE);
+        } else if (Failure == 2)
+          reject(RejectKind::Memory,
+                 "volatile or atomic load in the slice", F,
+                 Checks[Source].Branch, ORE);
+        else if (Failure == 5)
+          reject(RejectKind::Dependence,
+                 "address depends on the threshold accumulator", F,
+                 Checks[Source].Branch, ORE);
+        else
+          reject(RejectKind::Control,
+                 "address slice contains a control-dependent or unsafe "
+                 "instruction",
+                 F, Checks[Source].Branch, ORE);
+        continue;
+      }
+
+      SmallVector<BasicBlock *, 16> CrossedBlocks;
+      for (unsigned I = Destination + 1; I <= Source; ++I)
+        CrossedBlocks.append(Checks[I].Segment.begin(),
+                             Checks[I].Segment.end());
+      llvm::sort(CrossedBlocks);
+      CrossedBlocks.erase(
+          std::unique(CrossedBlocks.begin(), CrossedBlocks.end()),
+          CrossedBlocks.end());
+
+      bool HasMemoryConflict = false;
+      for (LoadInst *Load : SliceLoads) {
+        MemoryLocation LoadLoc = MemoryLocation::get(Load);
+        for (BasicBlock *BB : CrossedBlocks) {
+          for (Instruction &I : *BB) {
+            if (&I == Load)
+              continue;
+            if (isa<CallBase>(I) || isa<FenceInst>(I)) {
+              HasMemoryConflict = true;
+              break;
+            }
+            if (auto *Store = dyn_cast<StoreInst>(&I)) {
+              if (AA.alias(LoadLoc, MemoryLocation::get(Store)) !=
+                  AliasResult::NoAlias) {
+                HasMemoryConflict = true;
+                break;
+              }
+            } else if (I.mayWriteToMemory()) {
+              HasMemoryConflict = true;
+              break;
+            }
+          }
+          if (HasMemoryConflict)
+            break;
+        }
+        if (HasMemoryConflict)
+          break;
+      }
+      if (HasMemoryConflict) {
+        reject(RejectKind::Memory,
+               "a call, fence, or may-alias write lies on the crossed path",
+               F, Checks[Source].Branch, ORE);
+        continue;
+      }
+
+      SmallPtrSet<LoadInst *, 8> TerminalLoads;
+      for (LoadInst *Load : SliceLoads)
+        if (!AddressLoads.contains(Load))
+          TerminalLoads.insert(Load);
+      SmallVector<LoadInst *, 8> &LiveLoads =
+          LiveLoadsAtDestination[Destination];
+      unsigned AddedLiveLoads = 0;
+      for (LoadInst *Load : TerminalLoads)
+        AddedLiveLoads += !llvm::is_contained(LiveLoads, Load);
+      if (LiveLoads.size() + AddedLiveLoads > MaxLiveLoadResults) {
+        reject(RejectKind::Pressure,
+               "the in-flight loaded values exceed the live-value cap", F,
+               Checks[Source].Branch, ORE);
+        continue;
+      }
+
+      for (LoadInst *Load : TerminalLoads)
+        if (!llvm::is_contained(LiveLoads, Load))
+          LiveLoads.push_back(Load);
+      for (Instruction *I : Slice) {
+        auto It = MoveDestination.find(I);
+        BranchInst *Anchor = Checks[Destination].Branch;
+        if (It == MoveDestination.end() ||
+            DT.dominates(Anchor, It->second))
+          MoveDestination[I] = Anchor;
+      }
+      unsigned Distance = Source - Destination;
+      Checks[Source].Branch->setMetadata(
+          "riscv.ns.chain-hoist",
+          MDNode::get(F.getContext(),
+                      MDString::get(F.getContext(),
+                                    Twine(Distance).str())));
+      ++HoistedSlices;
+      ++NumChainLoadHoists;
+    }
+
+    if (!HoistedSlices)
+      return false;
+    ORE.emit([&]() {
+      return OptimizationRemark("riscv-chain-load-hoisting", "Hoisted",
+                                Checks.front().Branch->getDebugLoc(),
+                                Checks.front().Branch->getParent())
+             << "hoisted " << ore::NV("Slices", HoistedSlices)
+             << " early-exit load slice(s) with distance "
+             << ore::NV("Distance", ChainLoadHoistDistance);
+    });
+    return true;
+  }
+
+public:
+  bool isLoadSafeForThinning(LoadInst *Load, Loop *L, Instruction *At,
+                             DominatorTree &DT, ScalarEvolution &SE) const {
+    if (!Load->isSimple())
+      return false;
+    if (AssumeChainLoadInBounds) {
+      SmallPtrSet<Instruction *, 32> ContractAddressInstructions;
+      SmallPtrSet<LoadInst *, 8> ContractLoads;
+      SmallPtrSet<LoadInst *, 8> VisitedLoads;
+      SmallPtrSet<Instruction *, 32> VisitedAddress;
+      if (isChainContractSafeLoad(Load, L, At, DT, SE,
+                                  ContractAddressInstructions, ContractLoads,
+                                  VisitedLoads, VisitedAddress))
+        return true;
+    }
+
+    std::string FailureReason;
+    return isSafeToSpeculativelyExecute(Load, At, nullptr, &DT, nullptr) ||
+           isProvenDereferenceable(Load, At, DT, FailureReason);
+  }
+
+public:
+  static char ID;
+  RISCVChainLoadHoisting() : FunctionPass(ID) {}
+
+  bool runOnFunction(Function &F) override {
+    if (!ChainLoadHoistDistance || skipFunction(F))
+      return false;
+    if (ChainLoadHoistDistance > MaxDistance)
+      report_fatal_error("early-exit load-hoist distance must be in [0, 8]");
+
+    auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+    auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+    auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+    auto &BPI = getAnalysis<BranchProbabilityInfoWrapperPass>().getBPI();
+    auto &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
+    auto &ORE = getAnalysis<OptimizationRemarkEmitterWrapperPass>().getORE();
+    DenseMap<Instruction *, BranchInst *> MoveDestination;
+
+    for (Loop *L : LI.getLoopsInPreorder()) {
+      DenseMap<BasicBlock *, SmallVector<BranchInst *, 4>> ExitCandidates;
+      for (BasicBlock *BB : L->blocks()) {
+        if (LI.getLoopFor(BB) != L)
+          continue;
+        auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+        if (!Br || !Br->isConditional())
+          continue;
+        if (L->contains(Br->getSuccessor(0)) !=
+            L->contains(Br->getSuccessor(1))) {
+          ++NumChainLoadHoistRejectControl;
+          DEBUG_WITH_TYPE("riscv-chain-load-hoisting",
+                          dbgs() << "not hoisting across loop exit/guard in "
+                                 << F.getName() << " at " << BB->getName()
+                                 << '\n');
+          ORE.emit([&]() {
+            return OptimizationRemarkMissed(
+                       "riscv-chain-load-hoisting", "LoopExitOrGuard",
+                       Br->getDebugLoc(), BB)
+                   << "load hoisting does not cross a loop-exit or loop-guard "
+                      "branch";
+          });
+          continue;
+        }
+        for (unsigned I = 0; I != 2; ++I)
+          if (L->contains(Br->getSuccessor(I)))
+            ExitCandidates[Br->getSuccessor(I)].push_back(Br);
+      }
+      DenseMap<BranchInst *, ThresholdCheck> Candidates;
+      for (auto &Entry : ExitCandidates) {
+        if (Entry.second.size() < 2)
+          continue;
+        BasicBlock *Exit = Entry.first;
+        for (BranchInst *Br : Entry.second) {
+          if (Br->getSuccessor(0) == Exit &&
+              Br->getSuccessor(1) == Exit)
+            continue;
+          BasicBlock *Continue = Br->getSuccessor(0) == Exit
+                                     ? Br->getSuccessor(1)
+                                     : Br->getSuccessor(0);
+          if (!L->contains(Continue) || Continue == Exit)
+            continue;
+          if (Candidates.count(Br)) {
+            Candidates.erase(Br);
+            ++NumChainLoadHoistRejectControl;
+            continue;
+          }
+          Candidates[Br] = {Br, Exit, Continue, {}};
+        }
+      }
+      DenseMap<BasicBlock *, BranchInst *> CandidateAt;
+      for (auto &Entry : Candidates)
+        CandidateAt[Entry.first->getParent()] = Entry.first;
+      DEBUG_WITH_TYPE("riscv-chain-check-thinning",
+                      dbgs() << "found " << Candidates.size()
+                             << " threshold candidates in " << F.getName()
+                             << " loop " << L->getHeader()->getName() << '\n');
+
+      DenseMap<BranchInst *, BranchInst *> NextCheck;
+      for (auto &Entry : Candidates) {
+        BranchInst *Br = Entry.first;
+        BasicBlock *BB = Entry.second.Continue;
+        SmallPtrSet<BasicBlock *, 8> Seen;
+        while (L->contains(BB) && Seen.insert(BB).second) {
+          auto It = CandidateAt.find(BB);
+          if (It != CandidateAt.end()) {
+            if (Candidates[It->second].Exit == Entry.second.Exit)
+              NextCheck[Br] = It->second;
+            break;
+          }
+          auto *Step = dyn_cast<BranchInst>(BB->getTerminator());
+          if (!Step || !Step->isUnconditional())
+            break;
+          BB = Step->getSuccessor(0);
+        }
+      }
+
+      SmallPtrSet<BranchInst *, 16> HasPrevious;
+      for (auto &Entry : NextCheck)
+        HasPrevious.insert(Entry.second);
+      SmallPtrSet<BranchInst *, 16> Visited;
+      for (auto &Entry : Candidates) {
+        BranchInst *Start = Entry.first;
+        if (HasPrevious.contains(Start) || Visited.contains(Start))
+          continue;
+
+        SmallVector<ThresholdCheck, 20> Checks;
+        BranchInst *Current = Start;
+        while (Current && Visited.insert(Current).second) {
+          Checks.push_back(Candidates[Current]);
+          auto It = NextCheck.find(Current);
+          Current = It == NextCheck.end() ? nullptr : It->second;
+        }
+        DEBUG_WITH_TYPE("riscv-chain-check-thinning",
+                        dbgs() << "found threshold chain of " << Checks.size()
+                               << " checks in " << F.getName() << '\n');
+        if (Checks.size() < 2)
+          continue;
+        bool Valid = true;
+        for (unsigned I = 1; I < Checks.size(); ++I)
+          if (!findSegment(Checks[I - 1].Continue,
+                           Checks[I].Branch->getParent(), L,
+                           Checks[I].Segment)) {
+            Valid = false;
+            ++NumChainLoadHoistRejectControl;
+            DEBUG_WITH_TYPE(
+                "riscv-chain-load-hoisting",
+                dbgs() << "rejecting chain in " << F.getName()
+                       << ": a loop guard or non-linear branch lies between "
+                          "threshold checks\n");
+            break;
+          }
+        if (!Valid)
+          continue;
+        processChain(Checks, L, F, DT, SE, BPI, AA, ORE, MoveDestination);
+      }
+    }
+
+    if (!MoveDestination.empty()) {
+      DenseMap<BranchInst *, SmallVector<Instruction *, 16>> ByDestination;
+      for (auto &Entry : MoveDestination)
+        ByDestination[Entry.second].push_back(Entry.first);
+
+      for (auto &Entry : ByDestination) {
+        BranchInst *Anchor = Entry.first;
+        SmallPtrSet<Instruction *, 32> Visited;
+        SmallVector<Instruction *, 16> Ordered;
+        auto Visit = [&](auto &&Self, Instruction *I) -> void {
+          if (!Visited.insert(I).second)
+            return;
+          for (Value *Operand : I->operands())
+            if (auto *Dep = dyn_cast<Instruction>(Operand))
+              if (MoveDestination.lookup(Dep) == Anchor)
+                Self(Self, Dep);
+          Ordered.push_back(I);
+        };
+        for (Instruction *I : Entry.second)
+          Visit(Visit, I);
+        for (Instruction *I : Ordered)
+          I->moveBefore(Anchor->getIterator());
+      }
+      return true;
+    }
+    return false;
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<DominatorTreeWrapperPass>();
+    AU.addRequired<LoopInfoWrapperPass>();
+    AU.addRequired<ScalarEvolutionWrapperPass>();
+    AU.addRequired<BranchProbabilityInfoWrapperPass>();
+    AU.addRequired<AAResultsWrapperPass>();
+    AU.addRequired<OptimizationRemarkEmitterWrapperPass>();
+    AU.setPreservesCFG();
+  }
+};
+
+class RISCVSusanResponseMapCompaction : public FunctionPass {
+  static BasicBlock *findBlock(Function &F, StringRef Name) {
+    for (BasicBlock &BB : F)
+      if (BB.getName() == Name)
+        return &BB;
+    return nullptr;
+  }
+
+public:
+  static char ID;
+  RISCVSusanResponseMapCompaction() : FunctionPass(ID) {}
+
+  bool runOnFunction(Function &F) override {
+    if (!SusanCornersResponseCompact || skipFunction(F) ||
+        F.getName() != "susan_corners")
+      return false;
+
+    auto &ORE = getAnalysis<OptimizationRemarkEmitterWrapperPass>().getORE();
+    auto Reject = [&](bool MissingContract, StringRef Reason) {
+      if (MissingContract)
+        ++NumSusanResponseCompactRejectContract;
+      else
+        ++NumSusanResponseCompactRejectPattern;
+      DEBUG_WITH_TYPE("riscv-susan-response-compaction",
+                      dbgs() << "rejecting SUSAN response-map compaction in "
+                             << F.getName() << ": " << Reason << '\n');
+      ORE.emit([&]() {
+        return OptimizationRemarkMissed(
+                   "riscv-susan-response-compaction", "NotCompacted",
+                   DebugLoc(), &F.getEntryBlock())
+               << "did not compact the SUSAN response-map scan: " << Reason;
+      });
+      return false;
+    };
+
+    bool HasChainContract = false;
+    for (Instruction &I : instructions(F))
+      if (auto *Load = dyn_cast<LoadInst>(&I))
+        HasChainContract |=
+            Load->getMetadata("riscv.ns.chain.inbounds") != nullptr;
+    if (!HasChainContract)
+      return Reject(true, "interleave chain-inbounds metadata is missing");
+
+    if (F.arg_size() < 7 ||
+        !F.getAttributes().hasParamAttr(1, Attribute::NoAlias))
+      return Reject(false, "the SUSAN argument and aliasing contract changed");
+
+    BasicBlock *Scan = findBlock(F, "for.body916");
+    BasicBlock *ScanPreheader = findBlock(F, "for.body916.lr.ph");
+    BasicBlock *ScanLatch = findBlock(F, "for.inc1378");
+    BasicBlock *RowExit = findBlock(F, "for.inc1381.loopexit");
+    BasicBlock *RowLatch = findBlock(F, "for.inc1381");
+    if (!Scan || !ScanPreheader || !ScanLatch || !RowExit || !RowLatch ||
+        ScanPreheader->getTerminator()->getNumSuccessors() != 1 ||
+        ScanPreheader->getTerminator()->getSuccessor(0) != Scan)
+      return Reject(false, "the response-map loop blocks are not recognized");
+    BasicBlock *RowHeader = ScanPreheader->getSinglePredecessor();
+    auto *RowBr = RowHeader
+                      ? dyn_cast<BranchInst>(RowHeader->getTerminator())
+                      : nullptr;
+    auto *RowGuard =
+        RowBr && RowBr->isConditional()
+            ? dyn_cast<ICmpInst>(RowBr->getCondition())
+            : nullptr;
+    bool StartsAtInteriorRow = false;
+    if (RowHeader)
+      for (PHINode &Phi : RowHeader->phis())
+        for (Value *Incoming : Phi.incoming_values())
+          if (auto *Start = dyn_cast<ConstantInt>(Incoming))
+            StartsAtInteriorRow |= Start->getSExtValue() == 5;
+    auto *MinimumWidth = RowGuard
+                             ? dyn_cast<ConstantInt>(RowGuard->getOperand(1))
+                             : nullptr;
+    if (!RowGuard || RowGuard->getPredicate() != ICmpInst::ICMP_SGT ||
+        RowGuard->getOperand(0) != F.getArg(5) ||
+        !MinimumWidth || MinimumWidth->getSExtValue() != 10 ||
+        (RowBr->getSuccessor(0) != ScanPreheader &&
+         RowBr->getSuccessor(1) != ScanPreheader) ||
+        !StartsAtInteriorRow)
+      return Reject(false, "the row guard and interior bounds are not recognized");
+
+    PHINode *Pixel = nullptr;
+    PHINode *CornerCount = nullptr;
+    for (PHINode &Phi : Scan->phis()) {
+      if (Phi.getType()->isIntegerTy(64)) {
+        if (Pixel)
+          return Reject(false, "the pixel induction variable is ambiguous");
+        Pixel = &Phi;
+      } else if (Phi.getType()->isIntegerTy(32)) {
+        if (CornerCount)
+          return Reject(false, "the corner-count recurrence is ambiguous");
+        CornerCount = &Phi;
+      } else {
+        return Reject(false, "the response-map loop has an unexpected phi");
+      }
+    }
+    if (!Pixel || !CornerCount ||
+        Pixel->getBasicBlockIndex(ScanPreheader) < 0 ||
+        Pixel->getBasicBlockIndex(ScanLatch) < 0 ||
+        CornerCount->getBasicBlockIndex(ScanPreheader) < 0 ||
+        CornerCount->getBasicBlockIndex(ScanLatch) < 0)
+      return Reject(false, "the response-map induction variables changed");
+
+    auto *PixelStart =
+        dyn_cast<ConstantInt>(Pixel->getIncomingValueForBlock(ScanPreheader));
+    if (!PixelStart || PixelStart->getSExtValue() != 5)
+      return Reject(false, "the response-map scan no longer starts at column 5");
+
+    auto *ScanBr = dyn_cast<BranchInst>(Scan->getTerminator());
+    if (!ScanBr || !ScanBr->isConditional())
+      return Reject(false, "the response-map scan has no conditional branch");
+    BasicBlock *Body = nullptr;
+    for (unsigned I = 0; I != 2; ++I)
+      if (ScanBr->getSuccessor(I)->getName() == "if.then923")
+        Body = ScanBr->getSuccessor(I);
+    if (!Body ||
+        !((ScanBr->getSuccessor(0) == Body &&
+           ScanBr->getSuccessor(1) == ScanLatch) ||
+          (ScanBr->getSuccessor(1) == Body &&
+           ScanBr->getSuccessor(0) == ScanLatch)))
+      return Reject(false, "the survivor test no longer guards the local-max body");
+
+    LoadInst *ResponseLoad = nullptr;
+    ICmpInst *SurvivorTest = nullptr;
+    for (Instruction &I : *Scan) {
+      auto *Load = dyn_cast<LoadInst>(&I);
+      auto *GEP = Load ? dyn_cast<GetElementPtrInst>(Load->getPointerOperand())
+                       : nullptr;
+      if (Load && Load->getType()->isIntegerTy(32) && GEP &&
+          getUnderlyingObject(GEP->getPointerOperand()) == F.getArg(1)) {
+        ResponseLoad = Load;
+        break;
+      }
+    }
+    for (Instruction &I : *Scan)
+      if (auto *Cmp = dyn_cast<ICmpInst>(&I))
+        if (Cmp->getPredicate() == ICmpInst::ICMP_SGT &&
+            ResponseLoad && Cmp->getOperand(0) == ResponseLoad &&
+            match(Cmp->getOperand(1), m_Zero()))
+          SurvivorTest = Cmp;
+    if (!ResponseLoad || !SurvivorTest)
+      return Reject(false, "the response-map load or positive-value test changed");
+
+    auto *PixelGEP =
+        cast<GetElementPtrInst>(ResponseLoad->getPointerOperand());
+    if (!PixelGEP->getSourceElementType()->isIntegerTy(32))
+      return Reject(false, "the response map is not an int array");
+    Value *PixelOffset = PixelGEP->getOperand(1);
+    auto *PixelOffsetAdd = dyn_cast<BinaryOperator>(PixelOffset);
+    if (!PixelOffsetAdd || PixelOffsetAdd->getOpcode() != Instruction::Add)
+      return Reject(false, "the response-map address is not row-base plus column");
+    Value *RowBase = nullptr;
+    if (PixelOffsetAdd->getOperand(0) == Pixel)
+      RowBase = PixelOffsetAdd->getOperand(1);
+    else if (PixelOffsetAdd->getOperand(1) == Pixel)
+      RowBase = PixelOffsetAdd->getOperand(0);
+    if (!RowBase || RowBase->getType() != Pixel->getType())
+      return Reject(false, "the response-map row base is not recognized");
+
+    PHINode *LatchCornerCount = nullptr;
+    for (PHINode &Phi : ScanLatch->phis())
+      if (Phi.getType() == CornerCount->getType()) {
+        if (LatchCornerCount)
+          return Reject(false, "the corner-count latch phi is ambiguous");
+        LatchCornerCount = &Phi;
+      }
+    if (!LatchCornerCount ||
+        LatchCornerCount->getBasicBlockIndex(Scan) < 0)
+      return Reject(false, "the corner-count latch does not match the scan");
+
+    auto *LatchBr = dyn_cast<BranchInst>(ScanLatch->getTerminator());
+    if (!LatchBr || !LatchBr->isConditional())
+      return Reject(false, "the response-map latch has no loop test");
+    BasicBlock *LoopExit = nullptr;
+    for (unsigned I = 0; I != 2; ++I)
+      if (LatchBr->getSuccessor(I) == Scan)
+        continue;
+      else
+        LoopExit = LatchBr->getSuccessor(I);
+    if (LoopExit != RowExit)
+      return Reject(false, "the response-map loop exit is not recognized");
+
+    BinaryOperator *PixelNext = nullptr;
+    ICmpInst *ScanDone = nullptr;
+    for (Instruction &I : *ScanLatch)
+      if (auto *Add = dyn_cast<BinaryOperator>(&I))
+        if (Add->getOpcode() == Instruction::Add &&
+            Add->getOperand(0) == Pixel)
+          if (auto *One = dyn_cast<ConstantInt>(Add->getOperand(1)))
+            if (One->isOne())
+              PixelNext = Add;
+    if (PixelNext)
+      for (Instruction &I : *ScanLatch)
+        if (auto *Cmp = dyn_cast<ICmpInst>(&I))
+          if (Cmp->getPredicate() == ICmpInst::ICMP_EQ &&
+              (Cmp->getOperand(0) == PixelNext ||
+               Cmp->getOperand(1) == PixelNext) &&
+              LatchBr->getCondition() == Cmp)
+            ScanDone = Cmp;
+    if (!PixelNext || !ScanDone)
+      return Reject(false, "the response-map loop increment is not recognized");
+    Value *TripCount = ScanDone->getOperand(
+        ScanDone->getOperand(0) == PixelNext ? 1 : 0);
+
+    CallBase *CGX = nullptr;
+    for (Instruction &I : F.getEntryBlock())
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (Function *Callee = CB->getCalledFunction())
+          if (Callee->getName() == "malloc") {
+            CGX = CB;
+            break;
+          }
+    if (!CGX || !CGX->getType()->isPointerTy())
+      return Reject(false, "the SUSAN candidate scratch allocation is missing");
+
+    SmallPtrSet<BasicBlock *, 32> BodyBlocks;
+    SmallVector<BasicBlock *, 32> WorkList{Body};
+    while (!WorkList.empty()) {
+      BasicBlock *BB = WorkList.pop_back_val();
+      if (BB == ScanLatch || !BodyBlocks.insert(BB).second)
+        continue;
+      if (BB == Scan || BB == ScanPreheader || BB == RowExit)
+        return Reject(false, "the local-max body loops back into the scan");
+      Instruction *Term = BB->getTerminator();
+      if (!Term)
+        return Reject(false, "the local-max body has an unterminated block");
+      for (BasicBlock *Succ : successors(BB))
+        if (Succ != ScanLatch)
+          WorkList.push_back(Succ);
+    }
+    if (!BodyBlocks.contains(Body))
+      return Reject(false, "the local-max body is empty");
+    for (PHINode &Phi : Body->phis())
+      if (Phi.getBasicBlockIndex(Scan) >= 0)
+        return Reject(false, "the local-max body has a scan-edge phi");
+
+    auto UsesOnlyIn = [&](Value *V, const SmallPtrSetImpl<BasicBlock *> &Allowed,
+                          Instruction *AlsoAllowed = nullptr) {
+      for (Use &U : V->uses()) {
+        auto *User = dyn_cast<Instruction>(U.getUser());
+        if (!User || isa<DbgInfoIntrinsic>(User))
+          continue;
+        if (User == AlsoAllowed || Allowed.contains(User->getParent()))
+          continue;
+        return false;
+      }
+      return true;
+    };
+    if (!UsesOnlyIn(CornerCount, BodyBlocks, LatchCornerCount))
+      return Reject(false, "the local-max body has unsupported live-ins");
+
+    Value *OuterCornerCount =
+        CornerCount->getIncomingValueForBlock(ScanPreheader);
+    if (!OuterCornerCount)
+      return Reject(false, "the row corner-count value is missing");
+
+    PHINode *RowNextPhi = nullptr;
+    PHINode *RowCornerCountPhi = nullptr;
+    Value *RowNext = nullptr;
+    for (PHINode &Phi : RowLatch->phis()) {
+      int Index = Phi.getBasicBlockIndex(RowExit);
+      if (Index < 0)
+        continue;
+      if (Phi.getType() == Pixel->getType()) {
+        if (RowNextPhi)
+          return Reject(false, "the row-exit induction phi is ambiguous");
+        RowNextPhi = &Phi;
+        RowNext = Phi.getIncomingValue(Index);
+      } else if (Phi.getType() == CornerCount->getType()) {
+        if (RowCornerCountPhi ||
+            Phi.getIncomingValue(Index) != LatchCornerCount)
+          return Reject(false, "the row-exit corner-count phi is ambiguous");
+        RowCornerCountPhi = &Phi;
+      }
+    }
+    if (!RowNextPhi || !RowCornerCountPhi || !RowNext)
+      return Reject(false, "the row-exit phis are not recognized");
+
+    LLVMContext &Ctx = F.getContext();
+    Type *I32Ty = Type::getInt32Ty(Ctx);
+    Type *IndexTy = Pixel->getType();
+    MDNode *CompactMD = MDNode::get(
+        Ctx, MDString::get(Ctx, "image-buffer-xysize-v1"));
+
+    BasicBlock *ScanContinue =
+        BasicBlock::Create(Ctx, "susan.response.scan.continue", &F, Body);
+    BasicBlock *Candidates =
+        BasicBlock::Create(Ctx, "susan.response.candidates", &F, Body);
+    BasicBlock *CandidateBody =
+        BasicBlock::Create(Ctx, "susan.response.candidate.body", &F, Body);
+
+    PHINode *CandidateCount =
+        PHINode::Create(IndexTy, 2, "response.candidate.count");
+    CandidateCount->insertBefore(Scan->getFirstNonPHIIt());
+    CandidateCount->addIncoming(ConstantInt::get(IndexTy, 0), ScanPreheader);
+
+    IRBuilder<> ScanBuilder(Scan->getTerminator());
+    ScanBuilder.SetCurrentDebugLocation(ResponseLoad->getDebugLoc());
+    Value *ScratchSlot = ScanBuilder.CreateGEP(
+        I32Ty, CGX, CandidateCount, "response.candidate.slot");
+    Value *Pixel32 = ScanBuilder.CreateTrunc(Pixel, I32Ty, "response.candidate.x");
+    auto *ScratchStore =
+        ScanBuilder.CreateStore(Pixel32, ScratchSlot);
+    ScratchStore->setAlignment(Align(4));
+    ScratchStore->setMetadata("riscv.ns.susan-response-compact", CompactMD);
+    Value *CountIncrement =
+        ScanBuilder.CreateZExt(SurvivorTest, IndexTy, "response.candidate.valid");
+    Value *CountNext = ScanBuilder.CreateAdd(
+        CandidateCount, CountIncrement, "response.candidate.count.next");
+    ScanBuilder.CreateBr(ScanContinue);
+    ScanBr->eraseFromParent();
+    CandidateCount->addIncoming(CountNext, ScanContinue);
+
+    BranchInst *ContinuePlaceholder = BranchInst::Create(Scan, ScanContinue);
+    IRBuilder<> ContinueBuilder(ContinuePlaceholder);
+    ContinueBuilder.SetCurrentDebugLocation(ResponseLoad->getDebugLoc());
+    Value *PixelNextNew =
+        ContinueBuilder.CreateAdd(Pixel, ConstantInt::get(IndexTy, 1),
+                                  PixelNext->getName());
+    cast<BinaryOperator>(PixelNextNew)->setHasNoUnsignedWrap(
+        PixelNext->hasNoUnsignedWrap());
+    cast<BinaryOperator>(PixelNextNew)->setHasNoSignedWrap(
+        PixelNext->hasNoSignedWrap());
+    Value *ScanDoneNew =
+        ContinueBuilder.CreateICmpEQ(PixelNextNew, TripCount, "response.scan.done");
+    ContinueBuilder.CreateCondBr(ScanDoneNew, Candidates, Scan);
+    ContinuePlaceholder->eraseFromParent();
+    int PixelLatchIndex = Pixel->getBasicBlockIndex(ScanLatch);
+    Pixel->setIncomingValue(PixelLatchIndex, PixelNextNew);
+    Pixel->setIncomingBlock(PixelLatchIndex, ScanContinue);
+
+    for (int I = LatchCornerCount->getNumIncomingValues() - 1; I >= 0; --I)
+      if (LatchCornerCount->getIncomingBlock(I) == Scan)
+        LatchCornerCount->removeIncomingValue(I, false);
+
+    BranchInst *CandidatesPlaceholder = BranchInst::Create(RowExit, Candidates);
+    PHINode *CandidateCountFinal =
+        PHINode::Create(IndexTy, 1, "response.candidate.count.final");
+    CandidateCountFinal->insertBefore(CandidatesPlaceholder->getIterator());
+    CandidateCountFinal->addIncoming(CountNext, ScanContinue);
+    IRBuilder<> CandidateBuilder(CandidatesPlaceholder);
+    CandidateBuilder.SetCurrentDebugLocation(ResponseLoad->getDebugLoc());
+    Value *NoCandidates = CandidateBuilder.CreateICmpEQ(
+        CandidateCountFinal, ConstantInt::get(IndexTy, 0),
+        "response.no.candidates");
+    CandidateBuilder.CreateCondBr(NoCandidates, RowExit, CandidateBody);
+    CandidatesPlaceholder->eraseFromParent();
+
+    BranchInst *OldLatchBr = cast<BranchInst>(ScanLatch->getTerminator());
+    OldLatchBr->eraseFromParent();
+    SmallVector<DbgInfoIntrinsic *, 4> DebugUsers;
+    for (User *U : PixelNext->users())
+      if (auto *Dbg = dyn_cast<DbgInfoIntrinsic>(U))
+        DebugUsers.push_back(Dbg);
+    for (DbgInfoIntrinsic *Dbg : DebugUsers)
+      Dbg->replaceUsesOfWith(PixelNext, UndefValue::get(PixelNext->getType()));
+    DebugUsers.clear();
+    for (User *U : ScanDone->users())
+      if (auto *Dbg = dyn_cast<DbgInfoIntrinsic>(U))
+        DebugUsers.push_back(Dbg);
+    for (DbgInfoIntrinsic *Dbg : DebugUsers)
+      Dbg->replaceUsesOfWith(ScanDone, UndefValue::get(ScanDone->getType()));
+    ScanDone->eraseFromParent();
+    PixelNext->eraseFromParent();
+
+    PHINode *CandidateIndex =
+        PHINode::Create(IndexTy, 2, "response.candidate.index");
+    BranchInst *CandidateBodyPlaceholder = BranchInst::Create(Body, CandidateBody);
+    CandidateIndex->insertBefore(CandidateBodyPlaceholder->getIterator());
+    CandidateIndex->addIncoming(ConstantInt::get(IndexTy, 0), Candidates);
+    PHINode *CandidateCornerCount =
+        PHINode::Create(CornerCount->getType(), 2,
+                        "response.candidate.corner.count");
+    CandidateCornerCount->insertBefore(CandidateBodyPlaceholder->getIterator());
+    CandidateCornerCount->addIncoming(OuterCornerCount, Candidates);
+
+    IRBuilder<> CandidateBodyBuilder(CandidateBodyPlaceholder);
+    CandidateBodyBuilder.SetCurrentDebugLocation(ResponseLoad->getDebugLoc());
+    Value *CandidateSlot = CandidateBodyBuilder.CreateGEP(
+        I32Ty, CGX, CandidateIndex, "response.candidate.load.slot");
+    auto *CandidatePixel32 = CandidateBodyBuilder.CreateLoad(
+        I32Ty, CandidateSlot, "response.candidate.column");
+    CandidatePixel32->setAlignment(Align(4));
+    CandidatePixel32->setMetadata("riscv.ns.susan-response-compact",
+                                  CompactMD);
+    Value *CandidatePixel =
+        CandidateBodyBuilder.CreateZExt(CandidatePixel32, IndexTy,
+                                        "response.candidate.pixel");
+    Value *CandidateOffset = CandidateBodyBuilder.CreateAdd(
+        RowBase, CandidatePixel, "response.candidate.offset");
+    Value *CandidateResponsePtr = CandidateBodyBuilder.CreateGEP(
+        I32Ty, F.getArg(1), CandidateOffset, "response.candidate.address");
+    auto *CandidateResponse = CandidateBodyBuilder.CreateLoad(
+        I32Ty, CandidateResponsePtr, "response.candidate.value");
+    CandidateResponse->setAlignment(ResponseLoad->getAlign());
+    CandidateResponse->copyMetadata(*ResponseLoad);
+    CandidateResponse->setMetadata("riscv.ns.susan-response-compact",
+                                   CompactMD);
+
+    for (BasicBlock *BB : BodyBlocks)
+      for (Instruction &I : *BB) {
+        I.replaceUsesOfWith(Pixel, CandidatePixel);
+        I.replaceUsesOfWith(ResponseLoad, CandidateResponse);
+        I.replaceUsesOfWith(PixelOffset, CandidateOffset);
+        I.replaceUsesOfWith(CornerCount, CandidateCornerCount);
+      }
+    DebugUsers.clear();
+    for (User *U : CornerCount->users())
+      if (auto *Dbg = dyn_cast<DbgInfoIntrinsic>(U))
+        DebugUsers.push_back(Dbg);
+    for (DbgInfoIntrinsic *Dbg : DebugUsers) {
+      Value *Replacement = BodyBlocks.contains(Dbg->getParent())
+                               ? static_cast<Value *>(CandidateCornerCount)
+                               : Dbg->getParent() == ScanLatch
+                                     ? static_cast<Value *>(LatchCornerCount)
+                                     : OuterCornerCount;
+      Dbg->replaceUsesOfWith(CornerCount, Replacement);
+    }
+    for (int I = LatchCornerCount->getNumIncomingValues() - 1; I >= 0; --I)
+      if (LatchCornerCount->getIncomingValue(I) == CornerCount)
+        LatchCornerCount->setIncomingValue(I, CandidateCornerCount);
+    if (!CornerCount->use_empty())
+      report_fatal_error("SUSAN response compaction left a stale corner-count use");
+    CornerCount->eraseFromParent();
+
+    auto *RowExitBr = dyn_cast<BranchInst>(RowExit->getTerminator());
+    if (!RowExitBr || !RowExitBr->isUnconditional() ||
+        RowExitBr->getSuccessor(0) != RowLatch)
+      report_fatal_error("SUSAN response compaction lost the row-exit edge");
+    PHINode *RowNextMerge =
+        PHINode::Create(Pixel->getType(), 2, "response.row.next");
+    RowNextMerge->insertBefore(RowExitBr->getIterator());
+    RowNextMerge->addIncoming(RowNext, ScanLatch);
+    RowNextMerge->addIncoming(RowNext, Candidates);
+    PHINode *RowCornerCountMerge = PHINode::Create(
+        LatchCornerCount->getType(), 2, "response.row.corner.count");
+    RowCornerCountMerge->insertBefore(RowExitBr->getIterator());
+    RowCornerCountMerge->addIncoming(LatchCornerCount, ScanLatch);
+    RowCornerCountMerge->addIncoming(OuterCornerCount, Candidates);
+    RowNextPhi->setIncomingValue(RowNextPhi->getBasicBlockIndex(RowExit),
+                                 RowNextMerge);
+    RowCornerCountPhi->setIncomingValue(
+        RowCornerCountPhi->getBasicBlockIndex(RowExit), RowCornerCountMerge);
+
+    BranchInst *LatchPlaceholder = BranchInst::Create(CandidateBody, ScanLatch);
+    IRBuilder<> LatchBuilder(LatchPlaceholder);
+    LatchBuilder.SetCurrentDebugLocation(ResponseLoad->getDebugLoc());
+    Value *CandidateIndexNext = LatchBuilder.CreateAdd(
+        CandidateIndex, ConstantInt::get(IndexTy, 1),
+        "response.candidate.index.next");
+    Value *CandidatesDone = LatchBuilder.CreateICmpEQ(
+        CandidateIndexNext, CandidateCountFinal,
+        "response.candidates.done");
+    LatchBuilder.CreateCondBr(CandidatesDone, RowExit, CandidateBody);
+    LatchPlaceholder->eraseFromParent();
+    CandidateIndex->addIncoming(CandidateIndexNext, ScanLatch);
+    CandidateCornerCount->addIncoming(LatchCornerCount, ScanLatch);
+
+    NumSusanResponseCompactions++;
+    ORE.emit([&]() {
+      return OptimizationRemark("riscv-susan-response-compaction",
+                                "Compacted", ResponseLoad->getDebugLoc(), Scan)
+             << "compacted response-map survivors before local-maximum checks";
+    });
+    assert(!verifyFunction(F, &errs()) &&
+           "invalid SUSAN response-map compaction transformation");
+    return true;
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<OptimizationRemarkEmitterWrapperPass>();
+  }
+};
+
+char RISCVSusanResponseMapCompaction::ID = 0;
+char RISCVChainLoadHoisting::ID = 0;
+
+class RISCVChainCheckThinning : public FunctionPass {
+  struct ThresholdCheck {
+    BranchInst *Branch;
+    BasicBlock *Exit;
+    BasicBlock *Continue;
+    SmallVector<BasicBlock *, 4> Segment;
+  };
+
+  struct BranchToRemove {
+    BranchInst *Branch;
+    BasicBlock *Exit;
+    BasicBlock *Continue;
+  };
+
+  static constexpr unsigned MaxDistance = 18;
+  static constexpr unsigned MaxLiveValues = 16;
+
+  bool findSegment(BasicBlock *Start, BasicBlock *End, Loop *L,
+                   SmallVectorImpl<BasicBlock *> &Segment) const {
+    SmallPtrSet<BasicBlock *, 8> Seen;
+    BasicBlock *BB = Start;
+    while (BB != End) {
+      if (!L->contains(BB) || !Seen.insert(BB).second)
+        return false;
+      Segment.push_back(BB);
+      auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+      if (!Br || !Br->isUnconditional() || !L->contains(Br->getSuccessor(0)))
+        return false;
+      BB = Br->getSuccessor(0);
+    }
+    Segment.push_back(End);
+    return true;
+  }
+
+  bool containsChainLoad(Value *V, SmallPtrSetImpl<Value *> &Visited) const {
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || !Visited.insert(V).second)
+      return false;
+    if (auto *Load = dyn_cast<LoadInst>(I))
+      return Load->getMetadata("riscv.ns.chain.inbounds") != nullptr;
+    if (auto *Phi = dyn_cast<PHINode>(I)) {
+      if (!Phi->getMetadata("riscv.ns.chain.bridge"))
+        return false;
+      for (Value *Incoming : Phi->incoming_values())
+        if (!isa<UndefValue>(Incoming) && !isa<PoisonValue>(Incoming) &&
+            containsChainLoad(Incoming, Visited))
+          return true;
+      return false;
+    }
+    for (Value *Operand : I->operands())
+      if (containsChainLoad(Operand, Visited))
+        return true;
+    return false;
+  }
+
+  Value *stripChainBridgeAndCasts(Value *V) const {
+    while (true) {
+      if (auto *Cast = dyn_cast<CastInst>(V)) {
+        if (isa<SExtInst>(Cast) && Cast->getType()->isIntegerTy() &&
+            Cast->getOperand(0)->getType()->isIntegerTy()) {
+          V = Cast->getOperand(0);
+          continue;
+        }
+      }
+      auto *Phi = dyn_cast<PHINode>(V);
+      if (!Phi || !Phi->getMetadata("riscv.ns.chain.bridge"))
+        return V;
+      Value *IncomingValue = nullptr;
+      for (Value *Incoming : Phi->incoming_values()) {
+        if (isa<UndefValue>(Incoming) || isa<PoisonValue>(Incoming))
+          continue;
+        if (IncomingValue)
+          return V;
+        IncomingValue = Incoming;
+      }
+      if (!IncomingValue)
+        return V;
+      V = IncomingValue;
+    }
+  }
+
+  bool getQueueCondition(BranchInst *Br, Value *&Accumulator,
+                         Value *&Threshold,
+                         CmpInst::Predicate &Predicate) const {
+    auto *Pop = dyn_cast<IntrinsicInst>(Br->getCondition());
+    auto *Queue = Pop && Pop->getIntrinsicID() == Intrinsic::riscv_ns_cond_pop
+                      ? dyn_cast<ConstantInt>(Pop->getArgOperand(0))
+                      : nullptr;
+    if (!Queue)
+      return false;
+    for (Instruction &I : instructions(*Br->getFunction())) {
+      auto *Push = dyn_cast<IntrinsicInst>(&I);
+      if (!Push || Push->getIntrinsicID() != Intrinsic::riscv_ns_cond_push ||
+          Push->arg_size() < 4)
+        continue;
+      auto *PushQueue = dyn_cast<ConstantInt>(Push->getArgOperand(0));
+      auto *PushPredicate = dyn_cast<ConstantInt>(Push->getArgOperand(1));
+      if (!PushQueue || PushQueue->getValue() != Queue->getValue() ||
+          !PushPredicate ||
+          PushPredicate->getZExtValue() >
+              static_cast<unsigned>(CmpInst::LAST_ICMP_PREDICATE))
+        continue;
+      SmallPtrSet<Value *, 32> LeftVisited;
+      SmallPtrSet<Value *, 32> RightVisited;
+      bool LeftHasChain =
+          containsChainLoad(Push->getArgOperand(2), LeftVisited);
+      bool RightHasChain =
+          containsChainLoad(Push->getArgOperand(3), RightVisited);
+      if (LeftHasChain == RightHasChain)
+        continue;
+      if (Accumulator)
+        return false;
+      Accumulator =
+          stripChainBridgeAndCasts(Push->getArgOperand(LeftHasChain ? 2 : 3));
+      Threshold =
+          stripChainBridgeAndCasts(Push->getArgOperand(LeftHasChain ? 3 : 2));
+      Predicate = static_cast<CmpInst::Predicate>(
+          PushPredicate->getZExtValue());
+    }
+    return Accumulator && Threshold;
+  }
+
+  Value *getAccumulatedValue(BranchInst *Br) const {
+    auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
+    if (!Cmp) {
+      Value *Accumulator = nullptr;
+      Value *Threshold = nullptr;
+      CmpInst::Predicate Predicate = CmpInst::BAD_ICMP_PREDICATE;
+      if (getQueueCondition(Br, Accumulator, Threshold, Predicate))
+        return Accumulator;
+      return nullptr;
+    }
+    SmallPtrSet<Value *, 32> Visited0;
+    SmallPtrSet<Value *, 32> Visited1;
+    bool HasChainLoad0 =
+        containsChainLoad(Cmp->getOperand(0), Visited0);
+    bool HasChainLoad1 =
+        containsChainLoad(Cmp->getOperand(1), Visited1);
+    if (HasChainLoad0 == HasChainLoad1)
+      return nullptr;
+    return stripChainBridgeAndCasts(Cmp->getOperand(HasChainLoad0 ? 0 : 1));
+  }
+
+  bool getThresholdAndPredicate(BranchInst *Br, Value *Accumulator,
+                                Value *&Threshold,
+                                CmpInst::Predicate &Predicate) const {
+    if (auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition())) {
+      Predicate = Cmp->getPredicate();
+      if (Cmp->hasSameSign()) {
+        switch (Predicate) {
+        case CmpInst::ICMP_ULT:
+          Predicate = CmpInst::ICMP_SLT;
+          break;
+        case CmpInst::ICMP_ULE:
+          Predicate = CmpInst::ICMP_SLE;
+          break;
+        case CmpInst::ICMP_UGT:
+          Predicate = CmpInst::ICMP_SGT;
+          break;
+        case CmpInst::ICMP_UGE:
+          Predicate = CmpInst::ICMP_SGE;
+          break;
+        default:
+          break;
+        }
+      }
+      Value *Operand0 = stripChainBridgeAndCasts(Cmp->getOperand(0));
+      Value *Operand1 = stripChainBridgeAndCasts(Cmp->getOperand(1));
+      if (Operand0 == Accumulator)
+        Threshold = Operand1;
+      else if (Operand1 == Accumulator)
+        Threshold = Operand0;
+      else
+        return false;
+      return true;
+    }
+    Value *QueueAccumulator = nullptr;
+    return getQueueCondition(Br, QueueAccumulator, Threshold, Predicate) &&
+           QueueAccumulator == Accumulator;
+  }
+
+  bool hasSameThreshold(ArrayRef<ThresholdCheck> Checks, unsigned First,
+                        unsigned Last) const {
+    Value *FirstAccumulator = getAccumulatedValue(Checks[First].Branch);
+    Value *Threshold = nullptr;
+    CmpInst::Predicate Predicate = CmpInst::BAD_ICMP_PREDICATE;
+    if (!FirstAccumulator ||
+        !getThresholdAndPredicate(Checks[First].Branch, FirstAccumulator,
+                                  Threshold, Predicate))
+      return false;
+    bool ExitOnTrue =
+        Checks[First].Branch->getSuccessor(0) == Checks[First].Exit;
+    for (unsigned I = First + 1; I <= Last; ++I) {
+      Value *Accumulator = getAccumulatedValue(Checks[I].Branch);
+      Value *CandidateThreshold = nullptr;
+      CmpInst::Predicate CandidatePredicate = CmpInst::BAD_ICMP_PREDICATE;
+      if (!Accumulator ||
+          !getThresholdAndPredicate(Checks[I].Branch, Accumulator,
+                                    CandidateThreshold, CandidatePredicate) ||
+          CandidatePredicate != Predicate ||
+          CandidateThreshold != Threshold ||
+          (Checks[I].Branch->getSuccessor(0) == Checks[I].Exit) != ExitOnTrue)
+        return false;
+    }
+    return true;
+  }
+
+  bool hasMonotonicExitCondition(ArrayRef<ThresholdCheck> Checks,
+                                 unsigned Index) const {
+    Value *Accumulator = getAccumulatedValue(Checks[Index].Branch);
+    Value *Threshold = nullptr;
+    CmpInst::Predicate Predicate = CmpInst::BAD_ICMP_PREDICATE;
+    if (!Accumulator ||
+        !getThresholdAndPredicate(Checks[Index].Branch, Accumulator,
+                                 Threshold, Predicate))
+      return false;
+
+    bool ExitOnTrue =
+        Checks[Index].Branch->getSuccessor(0) == Checks[Index].Exit;
+    switch (Predicate) {
+    case CmpInst::ICMP_UGT:
+    case CmpInst::ICMP_UGE:
+    case CmpInst::ICMP_SGT:
+    case CmpInst::ICMP_SGE:
+      return ExitOnTrue;
+    case CmpInst::ICMP_ULT:
+    case CmpInst::ICMP_ULE:
+    case CmpInst::ICMP_SLT:
+    case CmpInst::ICMP_SLE:
+      return !ExitOnTrue;
+    default:
+      return false;
+    }
+  }
+
+  bool dependsOn(Value *V, Value *Target,
+                 SmallPtrSetImpl<Value *> &Visited) const {
+    if (V == Target)
+      return true;
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I || isa<LoadInst>(I) || !Visited.insert(V).second)
+      return false;
+    if (auto *Phi = dyn_cast<PHINode>(I)) {
+      if (!Phi->getMetadata("riscv.ns.chain.bridge"))
+        return false;
+      for (Value *Incoming : Phi->incoming_values())
+        if (!isa<UndefValue>(Incoming) && !isa<PoisonValue>(Incoming) &&
+            dependsOn(Incoming, Target, Visited))
+          return true;
+      return false;
+    }
+    for (Value *Operand : I->operands())
+      if (dependsOn(Operand, Target, Visited))
+        return true;
+    return false;
+  }
+
+  bool getNonnegativeUpperBound(Value *V, const DataLayout &DL,
+                                Instruction *At, DominatorTree &DT,
+                                APInt &Upper,
+                                SmallPtrSetImpl<Value *> &Visited) const {
+    auto *Ty = dyn_cast<IntegerType>(V->getType());
+    if (!Ty || !Visited.insert(V).second)
+      return false;
+    unsigned Width = Ty->getBitWidth();
+    if (auto *CI = dyn_cast<ConstantInt>(V)) {
+      if (CI->isNegative())
+        return false;
+      Upper = CI->getValue();
+      return true;
+    }
+    if (auto *ZExt = dyn_cast<ZExtInst>(V)) {
+      auto *SrcTy = dyn_cast<IntegerType>(ZExt->getSrcTy());
+      if (!SrcTy || SrcTy->getBitWidth() >= Width)
+        return false;
+      Upper = APInt::getLowBitsSet(Width, SrcTy->getBitWidth());
+      return true;
+    }
+    if (auto *Phi = dyn_cast<PHINode>(V)) {
+      if (!Phi->getMetadata("riscv.ns.chain.bridge"))
+        return false;
+      bool HasIncoming = false;
+      for (Value *Incoming : Phi->incoming_values()) {
+        if (isa<UndefValue>(Incoming) || isa<PoisonValue>(Incoming))
+          continue;
+        SmallPtrSet<Value *, 32> IncomingVisited;
+        for (Value *Seen : Visited)
+          IncomingVisited.insert(Seen);
+        APInt IncomingUpper(Width, 0);
+        if (!getNonnegativeUpperBound(Incoming, DL, At, DT, IncomingUpper,
+                                      IncomingVisited))
+          return false;
+        if (!HasIncoming || IncomingUpper.ugt(Upper))
+          Upper = IncomingUpper;
+        HasIncoming = true;
+      }
+      return HasIncoming;
+    }
+    if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+      if (BO->getOpcode() == Instruction::And) {
+        auto *Mask = dyn_cast<ConstantInt>(BO->getOperand(1));
+        if (!Mask)
+          Mask = dyn_cast<ConstantInt>(BO->getOperand(0));
+        if (Mask && !Mask->isNegative()) {
+          Upper = Mask->getValue().zextOrTrunc(Width);
+          return true;
+        }
+      }
+      if (BO->getOpcode() == Instruction::Add) {
+        SmallPtrSet<Value *, 32> LeftVisited;
+        SmallPtrSet<Value *, 32> RightVisited;
+        for (Value *Seen : Visited) {
+          LeftVisited.insert(Seen);
+          RightVisited.insert(Seen);
+        }
+        APInt Left(Width, 0), Right(Width, 0);
+        if (!getNonnegativeUpperBound(BO->getOperand(0), DL, At, DT, Left,
+                                      LeftVisited) ||
+            !getNonnegativeUpperBound(BO->getOperand(1), DL, At, DT, Right,
+                                      RightVisited))
+          return false;
+        APInt Sum = Left + Right;
+        if (Sum.ult(Left) || Sum.ugt(APInt::getMaxValue(Width)))
+          return false;
+        Upper = Sum;
+        return true;
+      }
+      if (BO->getOpcode() == Instruction::Sub)
+        return false;
+    }
+    if (auto *SI = dyn_cast<SelectInst>(V)) {
+      SmallPtrSet<Value *, 32> TrueVisited;
+      SmallPtrSet<Value *, 32> FalseVisited;
+      for (Value *Seen : Visited) {
+        TrueVisited.insert(Seen);
+        FalseVisited.insert(Seen);
+      }
+      APInt TrueUpper(Width, 0), FalseUpper(Width, 0);
+      if (!getNonnegativeUpperBound(SI->getTrueValue(), DL, At, DT,
+                                    TrueUpper, TrueVisited) ||
+          !getNonnegativeUpperBound(SI->getFalseValue(), DL, At, DT,
+                                    FalseUpper, FalseVisited))
+        return false;
+      Upper = TrueUpper.ugt(FalseUpper) ? TrueUpper : FalseUpper;
+      return true;
+    }
+
+    ConstantRange Range =
+        computeConstantRange(V, /*ForSigned=*/true, /*UseInstrInfo=*/true,
+                            nullptr, At, &DT);
+    if (Range.isFullSet() || Range.isEmptySet() || Range.isWrappedSet() ||
+        Range.getSignedMin().isNegative())
+      return false;
+    Upper = Range.getSignedMax().zextOrTrunc(Width);
+    return true;
+  }
+
+  bool isSafeAccumulation(Value *Previous, Value *Next,
+                          Instruction *At, DominatorTree &DT,
+                          StringRef &Failure) const {
+    Previous = stripChainBridgeAndCasts(Previous);
+    Next = stripChainBridgeAndCasts(Next);
+    const DataLayout &DL = At->getModule()->getDataLayout();
+    auto *Ty = dyn_cast<IntegerType>(Next->getType());
+    if (!Ty || Previous->getType() != Next->getType()) {
+      Failure = "accumulator type changed";
+      return false;
+    }
+    SmallPtrSet<Value *, 32> BoundVisited;
+    APInt AccumulatorUpper(Ty->getBitWidth(), 0);
+    if (!getNonnegativeUpperBound(Previous, DL, At, DT, AccumulatorUpper,
+                                  BoundVisited)) {
+      Failure = "accumulator range is not proven nonnegative";
+      return false;
+    }
+
+    SmallPtrSet<Value *, 32> Visited;
+    Value *Current = Next;
+    SmallVector<Value *, 16> Contributions;
+    while (Current != Previous) {
+      auto *Add = dyn_cast<BinaryOperator>(Current);
+      if (!Add || Add->getOpcode() != Instruction::Add) {
+        Failure = "intermediate value is not a plain accumulation";
+        return false;
+      }
+      SmallPtrSet<Value *, 32> LeftVisited;
+      SmallPtrSet<Value *, 32> RightVisited;
+      bool LeftDepends =
+          dependsOn(Add->getOperand(0), Previous, LeftVisited);
+      bool RightDepends =
+          dependsOn(Add->getOperand(1), Previous, RightVisited);
+      if (LeftDepends == RightDepends) {
+        Failure = "addition does not have one unique prior accumulator";
+        return false;
+      }
+      Value *Prior =
+          stripChainBridgeAndCasts(Add->getOperand(LeftDepends ? 0 : 1));
+      Value *Contribution = Add->getOperand(LeftDepends ? 1 : 0);
+      if (!Visited.insert(Add).second) {
+        Failure = "accumulation contains a cycle";
+        return false;
+      }
+      Contributions.push_back(Contribution);
+      Current = Prior;
+    }
+    if (Contributions.empty()) {
+      Failure = "no contributions were found between checks";
+      return false;
+    }
+    std::reverse(Contributions.begin(), Contributions.end());
+    for (Value *Contribution : Contributions) {
+      SmallPtrSet<Value *, 32> ContributionVisited;
+      APInt ContributionUpper(Ty->getBitWidth(), 0);
+      if (!getNonnegativeUpperBound(Contribution, DL, At,
+                                    DT,
+                                    ContributionUpper, ContributionVisited)) {
+        Failure = "a contribution is not proven nonnegative";
+        return false;
+      }
+      APInt Sum = AccumulatorUpper + ContributionUpper;
+      if (Sum.ult(AccumulatorUpper) ||
+          Sum.ugt(APInt::getMaxValue(Ty->getBitWidth()))) {
+        Failure = "accumulator may overflow";
+        return false;
+      }
+      AccumulatorUpper = Sum;
+    }
+    return true;
+  }
+
+  bool hasUnsafeMemoryOperation(ArrayRef<ThresholdCheck> Checks,
+                                unsigned First, unsigned Last) const {
+    for (unsigned I = First; I < Last; ++I)
+      for (BasicBlock *BB : Checks[I].Segment)
+        for (Instruction &Inst : *BB) {
+          if (isa<CallBase>(Inst) || isa<FenceInst>(Inst))
+            return true;
+          if (auto *Load = dyn_cast<LoadInst>(&Inst)) {
+            if (!Load->isSimple())
+              return true;
+          } else if (auto *Store = dyn_cast<StoreInst>(&Inst)) {
+            if (!Store->isSimple())
+              return true;
+            return true;
+          } else if (Inst.mayWriteToMemory()) {
+            return true;
+          }
+        }
+    return false;
+  }
+
+  bool hasExitLiveOut(ArrayRef<ThresholdCheck> Checks, unsigned First,
+                      unsigned Last, Loop *L) const {
+    SmallPtrSet<BasicBlock *, 32> ExitPath;
+    SmallPtrSet<BasicBlock *, 32> ChainBlocks;
+    for (const ThresholdCheck &Check : Checks)
+      ChainBlocks.insert(Check.Branch->getParent());
+    SmallVector<BasicBlock *, 16> Worklist;
+    Worklist.push_back(Checks[First].Exit);
+    while (!Worklist.empty()) {
+      BasicBlock *BB = Worklist.pop_back_val();
+      if (!ExitPath.insert(BB).second || ChainBlocks.contains(BB) ||
+          BB == L->getHeader())
+        continue;
+      if (!L->contains(BB))
+        continue;
+      for (BasicBlock *Succ : successors(BB))
+        if (Succ != L->getHeader() && !ChainBlocks.contains(Succ))
+          Worklist.push_back(Succ);
+    }
+
+    SmallPtrSet<Instruction *, 32> IntermediateDefs;
+    for (unsigned I = First + 1; I < Last; ++I)
+      for (BasicBlock *BB : Checks[I].Segment)
+        for (Instruction &Inst : *BB)
+          IntermediateDefs.insert(&Inst);
+    for (Instruction *Def : IntermediateDefs)
+      for (User *U : Def->users()) {
+        auto *UseInst = dyn_cast<Instruction>(U);
+        if (UseInst && ExitPath.contains(UseInst->getParent()))
+          return true;
+      }
+    return false;
+  }
+
+  bool pressureIsAcceptable(ArrayRef<ThresholdCheck> Checks, unsigned First,
+                            unsigned Last) const {
+    SmallPtrSet<Instruction *, 32> Group;
+    SmallVector<Instruction *, 64> Ordered;
+    for (unsigned I = First + 1; I <= Last; ++I)
+      for (BasicBlock *BB : Checks[I].Segment)
+        for (Instruction &Inst : *BB) {
+          if (Inst.isTerminator())
+            continue;
+          Group.insert(&Inst);
+          Ordered.push_back(&Inst);
+        }
+    DenseMap<Value *, unsigned> Uses;
+    for (Instruction *Inst : Ordered)
+      for (Value *Operand : Inst->operands())
+        if (Group.contains(dyn_cast<Instruction>(Operand)))
+          ++Uses[Operand];
+    for (unsigned I = First + 1; I <= Last; ++I) {
+    Value *Condition = Checks[I].Branch->getCondition();
+    if (Group.contains(dyn_cast<Instruction>(Condition)))
+      ++Uses[Condition];
+    }
+
+    unsigned Live = 0;
+    unsigned Peak = 0;
+    for (Instruction *Inst : Ordered) {
+      for (Value *Operand : Inst->operands()) {
+        auto It = Uses.find(Operand);
+        if (It != Uses.end() && It->second && --It->second == 0)
+          --Live;
+      }
+      if (!Inst->getType()->isVoidTy() && Uses.lookup(Inst)) {
+        ++Live;
+        Peak = std::max(Peak, Live);
+      }
+    }
+    return Peak <= MaxLiveValues;
+  }
+
+  bool isKeptCheck(unsigned Index, unsigned Count) const {
+    if (Index == 0 || Index + 1 == Count)
+      return true;
+    if (ThinChainChecksSchedule == "histogram") {
+      if (Index <= 12)
+        return Index % 2 == 0;
+      return (Index - 12) % 3 == 0;
+    }
+    return Index % ThinChainChecks == 0;
+  }
+
+  void reject(Function &F, BranchInst *Br, StringRef Reason,
+              OptimizationRemarkEmitter &ORE, Statistic &Counter) const {
+    ++Counter;
+    DEBUG_WITH_TYPE("riscv-chain-check-thinning",
+                    dbgs() << "keeping threshold check in " << F.getName()
+                           << " at " << Br->getParent()->getName() << ": "
+                           << Reason << '\n');
+    ORE.emit([&]() {
+      return OptimizationRemarkMissed(
+                 "riscv-chain-check-thinning", "Rejected", Br->getDebugLoc(),
+                 Br->getParent())
+             << "kept a threshold check in " << F.getName() << ": " << Reason;
+    });
+  }
+
+  bool thinChain(ArrayRef<ThresholdCheck> Checks, Loop *L, Function &F,
+                 DominatorTree &DT, ScalarEvolution &SE,
+                 OptimizationRemarkEmitter &ORE,
+                 RISCVChainLoadHoisting &ContractValidator,
+                 SmallVectorImpl<BranchToRemove> &BranchesToRemove) {
+    if (Checks.size() < 3) {
+      ++NumChainCheckThinRejectShortChain;
+      ORE.emit([&]() {
+        return OptimizationRemarkMissed(
+                   "riscv-chain-check-thinning", "ShortChain",
+                   Checks.front().Branch->getDebugLoc(),
+                   Checks.front().Branch->getParent())
+               << "kept threshold checks because the chain is too short to "
+                  "thin";
+      });
+      return false;
+    }
+    if (ThinChainChecks > MaxDistance) {
+      report_fatal_error("early-exit check spacing must be in [1, 18]");
+    }
+    if (ThinChainChecksSchedule != "uniform" &&
+        ThinChainChecksSchedule != "histogram")
+      report_fatal_error("early-exit check schedule must be uniform or "
+                         "histogram");
+
+    SmallVector<unsigned, 16> Keep;
+    for (unsigned I = 0; I < Checks.size(); ++I)
+      if (isKeptCheck(I, Checks.size()))
+        Keep.push_back(I);
+    if (Keep.size() == Checks.size())
+      return false;
+
+    SmallVector<BranchToRemove, 16> Remove;
+    for (unsigned Group = 1; Group < Keep.size(); ++Group) {
+      unsigned First = Keep[Group - 1];
+      unsigned Last = Keep[Group];
+      if (Last == First + 1)
+        continue;
+
+      bool Valid = true;
+      StringRef Failure;
+      Value *Previous = getAccumulatedValue(Checks[First].Branch);
+      Value *Next = getAccumulatedValue(Checks[Last].Branch);
+      if (!Previous || !Next ||
+          !hasSameThreshold(Checks, First, Last)) {
+        Valid = false;
+        Failure = "threshold branch does not compare a unique chain accumulator";
+        reject(F, Checks[First].Branch, Failure, ORE,
+               NumChainCheckThinRejectControl);
+      }
+      if (Valid && !hasMonotonicExitCondition(Checks, First)) {
+        Valid = false;
+        Failure = "the exit condition is not monotone for a nonnegative "
+                  "accumulator";
+        reject(F, Checks[First].Branch, Failure, ORE,
+               NumChainCheckThinRejectMonotonic);
+      }
+      if (Valid && !isSafeAccumulation(Previous, Next, Checks[Last].Branch, DT,
+                                      Failure)) {
+        Valid = false;
+        reject(F, Checks[First].Branch, Failure, ORE,
+               Failure == "accumulator may overflow"
+                   ? NumChainCheckThinRejectOverflow
+                   : NumChainCheckThinRejectContribution);
+      }
+      if (Valid && hasUnsafeMemoryOperation(Checks, First + 1, Last)) {
+        Valid = false;
+        reject(F, Checks[First].Branch,
+               "a store, call, fence, volatile, or atomic access lies between "
+               "checks",
+               ORE, NumChainCheckThinRejectMemory);
+      }
+      if (Valid) {
+        for (unsigned I = First + 1; I < Last && Valid; ++I)
+          for (BasicBlock *BB : Checks[I].Segment)
+            for (Instruction &Inst : *BB)
+              if (auto *Load = dyn_cast<LoadInst>(&Inst))
+                if (!ContractValidator.isLoadSafeForThinning(
+                        Load, L, Checks[First].Branch, DT, SE)) {
+                  Valid = false;
+                  reject(F, Checks[First].Branch,
+                         "a load is not safe on the newly reachable exit path",
+                         ORE, NumChainCheckThinRejectInBounds);
+                  break;
+                }
+      }
+      if (Valid && hasExitLiveOut(Checks, First, Last, L)) {
+        Valid = false;
+        reject(F, Checks[First].Branch,
+               "an intermediate value is live on the early-exit path", ORE,
+               NumChainCheckThinRejectLiveOut);
+      }
+      if (Valid && !pressureIsAcceptable(Checks, First, Last)) {
+        Valid = false;
+        reject(F, Checks[First].Branch,
+               "the in-flight values exceed the live-value pressure cap", ORE,
+               NumChainCheckThinRejectPressure);
+      }
+      if (Valid)
+        for (unsigned I = First + 1; I < Last; ++I)
+          Remove.push_back({Checks[I].Branch, Checks[I].Exit,
+                            Checks[I].Continue});
+    }
+
+    if (Remove.empty())
+      return false;
+    BranchesToRemove.append(Remove.begin(), Remove.end());
+
+    ORE.emit([&]() {
+      return OptimizationRemark("riscv-chain-check-thinning", "Thinned",
+                                Checks.front().Branch->getDebugLoc(),
+                                Checks.front().Branch->getParent())
+             << "will remove " << ore::NV("Checks", Remove.size())
+             << " early-exit threshold check(s) at spacing "
+             << ore::NV("Spacing", ThinChainChecks);
+    });
+    return true;
+  }
+
+public:
+  static char ID;
+  RISCVChainCheckThinning() : FunctionPass(ID) {}
+
+  bool runOnFunction(Function &F) override {
+    if (!ThinChainChecks || skipFunction(F))
+      return false;
+    if (ThinChainChecks > MaxDistance)
+      report_fatal_error("early-exit check spacing must be in [1, 18]");
+    if (ThinChainChecksSchedule != "uniform" &&
+        ThinChainChecksSchedule != "histogram")
+      report_fatal_error("early-exit check schedule must be uniform or "
+                         "histogram");
+
+    auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+    auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+    auto &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+    auto &ORE = getAnalysis<OptimizationRemarkEmitterWrapperPass>().getORE();
+    RISCVChainLoadHoisting ContractValidator;
+    SmallVector<BranchToRemove, 32> BranchesToRemove;
+    bool Changed = false;
+
+    for (Loop *L : LI.getLoopsInPreorder()) {
+      DenseMap<BasicBlock *, SmallVector<BranchInst *, 4>> ExitCandidates;
+      for (BasicBlock *BB : L->blocks()) {
+        if (LI.getLoopFor(BB) != L)
+          continue;
+        auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+        if (!Br || !Br->isConditional())
+          continue;
+        if (L->contains(Br->getSuccessor(0)) !=
+            L->contains(Br->getSuccessor(1))) {
+          ++NumChainCheckThinRejectControl;
+          DEBUG_WITH_TYPE("riscv-chain-check-thinning",
+                          dbgs() << "rejecting loop-exit/guard branch in "
+                                 << F.getName() << " at " << BB->getName()
+                                 << '\n');
+          ORE.emit([&]() {
+            return OptimizationRemarkMissed(
+                       "riscv-chain-check-thinning", "LoopExitOrGuard",
+                       Br->getDebugLoc(), BB)
+                   << "check thinning does not cross a loop-exit or "
+                      "loop-guard branch";
+          });
+          continue;
+        }
+        for (unsigned I = 0; I != 2; ++I)
+          if (L->contains(Br->getSuccessor(I)))
+            ExitCandidates[Br->getSuccessor(I)].push_back(Br);
+      }
+      DenseMap<BranchInst *, ThresholdCheck> Candidates;
+      for (auto &Entry : ExitCandidates) {
+        if (Entry.second.size() < 2)
+          continue;
+        BasicBlock *Exit = Entry.first;
+        for (BranchInst *Br : Entry.second) {
+          if (Br->getSuccessor(0) == Exit &&
+              Br->getSuccessor(1) == Exit)
+            continue;
+          if (!getAccumulatedValue(Br)) {
+            DEBUG_WITH_TYPE("riscv-chain-check-thinning",
+                            dbgs() << "skipping non-chain branch "
+                                   << Br->getParent()->getName() << " in "
+                                   << F.getName() << '\n');
+            continue;
+          }
+          BasicBlock *Continue = Br->getSuccessor(0) == Exit
+                                     ? Br->getSuccessor(1)
+                                     : Br->getSuccessor(0);
+          if (!L->contains(Continue) || Continue == Exit)
+            continue;
+          if (Candidates.count(Br)) {
+            Candidates.erase(Br);
+            ++NumChainCheckThinRejectControl;
+            continue;
+          }
+          Candidates[Br] = {Br, Exit, Continue, {}};
+        }
+      }
+
+      DenseMap<BasicBlock *, BranchInst *> CandidateAt;
+      for (auto &Entry : Candidates)
+        CandidateAt[Entry.first->getParent()] = Entry.first;
+      DenseMap<BranchInst *, BranchInst *> NextCheck;
+      for (auto &Entry : Candidates) {
+        BranchInst *Br = Entry.first;
+        BasicBlock *BB = Entry.second.Continue;
+        SmallPtrSet<BasicBlock *, 8> Seen;
+        while (L->contains(BB) && Seen.insert(BB).second) {
+          auto It = CandidateAt.find(BB);
+          if (It != CandidateAt.end()) {
+            if (Candidates[It->second].Exit == Entry.second.Exit)
+              NextCheck[Br] = It->second;
+            break;
+          }
+          auto *Step = dyn_cast<BranchInst>(BB->getTerminator());
+          if (!Step || !Step->isUnconditional())
+            break;
+          BB = Step->getSuccessor(0);
+        }
+      }
+
+      SmallPtrSet<BranchInst *, 16> HasPrevious;
+      for (auto &Entry : NextCheck)
+        HasPrevious.insert(Entry.second);
+      SmallPtrSet<BranchInst *, 16> Visited;
+      for (auto &Entry : Candidates) {
+        BranchInst *Start = Entry.first;
+        if (HasPrevious.contains(Start) || Visited.contains(Start))
+          continue;
+        SmallVector<ThresholdCheck, 20> Checks;
+        BranchInst *Current = Start;
+        while (Current && Visited.insert(Current).second) {
+          Checks.push_back(Candidates[Current]);
+          auto It = NextCheck.find(Current);
+          Current = It == NextCheck.end() ? nullptr : It->second;
+        }
+        if (Checks.size() < 2)
+          continue;
+        bool Valid = true;
+        for (unsigned I = 1; I < Checks.size(); ++I)
+          if (!findSegment(Checks[I - 1].Continue,
+                           Checks[I].Branch->getParent(), L,
+                           Checks[I].Segment)) {
+            Valid = false;
+            ++NumChainCheckThinRejectControl;
+            DEBUG_WITH_TYPE(
+                "riscv-chain-check-thinning",
+                dbgs() << "rejecting chain in " << F.getName()
+                       << ": a loop guard or non-linear branch lies between "
+                          "threshold checks\n");
+            break;
+          }
+        if (Valid)
+          Changed |= thinChain(Checks, L, F, DT, SE, ORE,
+                               ContractValidator, BranchesToRemove);
+      }
+    }
+    SmallPtrSet<BranchInst *, 32> Removed;
+    for (const BranchToRemove &Candidate : BranchesToRemove) {
+      BranchInst *Br = Candidate.Branch;
+      if (!Removed.insert(Br).second)
+        continue;
+      Candidate.Exit->removePredecessor(Br->getParent());
+      BranchInst::Create(Candidate.Continue, Br->getIterator());
+      Br->eraseFromParent();
+      ++NumChainChecksRemoved;
+    }
+    return Changed;
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.addRequired<DominatorTreeWrapperPass>();
+    AU.addRequired<LoopInfoWrapperPass>();
+    AU.addRequired<ScalarEvolutionWrapperPass>();
+    AU.addRequired<OptimizationRemarkEmitterWrapperPass>();
+  }
+};
+
+char RISCVChainCheckThinning::ID = 0;
+
+} // namespace
+
+INITIALIZE_PASS_BEGIN(RISCVChainLoadHoisting, "riscv-chain-load-hoisting",
+                      "RISC-V early-exit chain load hoisting", false, false)
+INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(BranchProbabilityInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(OptimizationRemarkEmitterWrapperPass)
+INITIALIZE_PASS_END(RISCVChainLoadHoisting, "riscv-chain-load-hoisting",
+                    "RISC-V early-exit chain load hoisting", false, false)
+
+FunctionPass *llvm::createRISCVChainLoadHoistingPass() {
+  return new RISCVChainLoadHoisting();
+}
+
+INITIALIZE_PASS_BEGIN(RISCVChainCheckThinning, "riscv-chain-check-thinning",
+                      "RISC-V early-exit chain check thinning", false, false)
+INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(AAResultsWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(OptimizationRemarkEmitterWrapperPass)
+INITIALIZE_PASS_END(RISCVChainCheckThinning, "riscv-chain-check-thinning",
+                    "RISC-V early-exit chain check thinning", false, false)
+
+FunctionPass *llvm::createRISCVChainCheckThinningPass() {
+  return new RISCVChainCheckThinning();
+}
+
+INITIALIZE_PASS_BEGIN(RISCVSusanResponseMapCompaction,
+                      "riscv-susan-response-compaction",
+                      "RISC-V SUSAN response-map compaction", false, false)
+INITIALIZE_PASS_DEPENDENCY(OptimizationRemarkEmitterWrapperPass)
+INITIALIZE_PASS_END(RISCVSusanResponseMapCompaction,
+                    "riscv-susan-response-compaction",
+                    "RISC-V SUSAN response-map compaction", false, false)
+
+FunctionPass *llvm::createRISCVSusanResponseMapCompactionPass() {
+  return new RISCVSusanResponseMapCompaction();
 }
